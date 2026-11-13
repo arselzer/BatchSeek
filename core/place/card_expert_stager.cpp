@@ -92,6 +92,20 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         return false;
     }
     r.lend_audit = as == 1;
+    const char* tiled = get(ds41p1::kTiledEnv);
+    const int ts = ds41p1::env_state(tiled);
+    if (ts < 0) {
+        if (why) *why = std::string(ds41p1::kTiledEnv) + "=" + tiled + ": 1 is on, 0 / unset / empty off";
+        return false;
+    }
+    r.tiled = ts == 1;
+    const char* once = get(ds41p1::kTailOnceEnv);
+    const int os = ds41p1::env_state(once);
+    if (os < 0) {
+        if (why) *why = std::string(ds41p1::kTailOnceEnv) + "=" + once + ": 1 is on, 0 / unset / empty off";
+        return false;
+    }
+    r.tail_once = os == 1;
     *t = r;
     return true;
 }
@@ -916,6 +930,12 @@ int CardExpertPath::init(Mover* mover, const Tunables& t, int rank, PlanesGet pl
     reader_ = std::thread(&CardExpertPath::reader_loop, this);
     packer_ = std::thread(&CardExpertPath::packer_loop, this);
     on_ = true;
+    if (t_.tail_once)
+        RAD_INFO("%s %d (%s=1): the wave relaunches of gate_up and down skip the tail fill (%s=0); the layer's own "
+                 "launches fill it", ds41p1::kLogTailOnce, rank_, ds41p1::kTailOnceEnv, ds41p1::kTailParam);
+    if (t_.tiled)
+        RAD_INFO("%s %d (%s=1): every P1 twin call of this rank on %s, each output the decode band's sum "
+                 "operation for operation", ds41p1::kLogTiled, rank_, ds41p1::kTiledEnv, ds41p1::kTiledMark);
     if (t_.swiglu_span)
         RAD_INFO("ds41 p1: rank %d's wave SwiGLU spans on (%s=1; known stateless row and synchronized counts, "
                  "full replay otherwise)", rank_, kSwigluSpanEnv);
@@ -976,6 +996,18 @@ int CardExpertPath::wave(int parity, int w, const void* const* gu_tab, const voi
         a.t = t.data();
         a.p = c.p.empty() ? nullptr : c.p.data();
         std::vector<RadParam> p;
+        /* ds41p1::kTailOnceEnv: the twin's tail fill was done by the layer's own launch (see ds41_p1.h). */
+        if (k != 1 && t_.tail_once) {
+            p.assign(c.p.begin(), c.p.end());
+            RadParam q{};
+            q.key = ds41p1::kTailParam;
+            q.kind = RAD_P_INT;
+            q.ival = 0;
+            p.push_back(q);
+            a.p = p.data();
+            a.n_p = (int)p.size();
+            ++c_.tail_skipped;
+        }
         if (k == 1 && t_.swiglu_span) {
             SwigluSpan span;
             if (c.t.size() >= 2 && c.t[1].shape[0] > 0) c_.swiglu_full_rows += (uint64_t)c.t[1].shape[0];
@@ -1987,6 +2019,10 @@ std::string CardExpertPath::stats_line(int rank) const {
         std::snprintf(buf, sizeof buf, "; wave SwiGLU spans %" PRIu64 ", rows %" PRIu64 " of %" PRIu64
                       ", full-replay fallbacks %" PRIu64, c_.swiglu_spans, c_.swiglu_rows,
                       c_.swiglu_full_rows, c_.swiglu_fallbacks);
+        line += buf;
+    }
+    if (t_.tail_once) {
+        std::snprintf(buf, sizeof buf, "; wave tail fills skipped %" PRIu64, c_.tail_skipped);
         line += buf;
     }
     if (lending()) {

@@ -548,6 +548,34 @@ TEST(p1_swiglu_span_switch_is_default_off_and_accepts_only_zero_or_one) {
     }
 }
 
+/* The register-tiled twin (ds41p1::kTiledEnv) and the tail filled once (ds41p1::kTailOnceEnv): default off, 0 / 1
+ * / empty only, each independent of the other. */
+TEST(p1_tiled_and_tail_once_switches_are_default_off_and_accept_only_zero_or_one) {
+    for (const char* env : { ds41p1::kTiledEnv, ds41p1::kTailOnceEnv }) {
+        std::string value;
+        bool set = false;
+        auto get = [&](const char* k) -> const char* { return set && !std::strcmp(k, env) ? value.c_str() : nullptr; };
+        const bool tiled = !std::strcmp(env, ds41p1::kTiledEnv);
+        Tunables t;
+        std::string why;
+        REQUIRE(parse_tunables(get, &t, &why));
+        CHECK(!t.tiled);
+        CHECK(!t.tail_once);
+        set = true;
+        for (const char* v : { "", "0", "1" }) {
+            value = v;
+            REQUIRE(parse_tunables(get, &t, &why));
+            CHECK_EQ(tiled ? t.tiled : t.tail_once, value == "1");
+            CHECK(!(tiled ? t.tail_once : t.tiled));
+        }
+        for (const char* v : { "2", "01", "yes", "-1", "1 " }) {
+            value = v;
+            CHECK(!parse_tunables(get, &t, &why));
+            CHECK(why.find(env) != std::string::npos);
+        }
+    }
+}
+
 TEST(p1_swiglu_span_launch_guard_keeps_unknown_stateful_and_scratch_rows_full) {
     RadKernelInfo row{};
     row.name = "swiglu_clamped_bf16"; row.op = "swiglu_clamped"; row.domain = RAD_DOMAIN_DEVICE;

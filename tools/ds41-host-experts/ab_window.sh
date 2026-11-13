@@ -173,6 +173,18 @@
 # file, none by default); an Lc2048 arm needs LCP_CHECK_C=2048 as before. The window log takes each P1 arm's
 # "ds41 p1 stats, rank" and "ds41 p1 chunk:" lines; a P1 arm whose stats lines count a lease held at a pass
 # end, or (Qv) a host-verified expert-row that differs from the card's, is not measured.
+# Qt: the register-tiled P1 twin (RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1; ds41_p1.h kTiledEnv; every other arm
+# states 0): the P1 twin's calls on libr4d's mx_p1t_kernel (each weight block decoded once for 8 rows), same bytes
+# as the twin and the decode band by construction. Needs P1; refused beside an Axr part (the aux worker's taller
+# passes run the P1 twin too, and `auxtall` has not been run on the tiled form). A Qt arm runs only on the
+# libr4d.so (sha256) on which `p1tiled` in DEVICE_CHECKS passed (ds41_mxfp4_device_check TALL_LIBR4D p1tiled
+# P1_CHECK_M P1_ROUTES on card 0, "p1tiled: PASS" its last line; devcheck-p1tiled.log), and is measured only if
+# every rank logs "ds41 p1: register-tiled twin on, rank R" once at startup (and any other arm only without it).
+# Qz: the tail filled once a layer (RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=1; ds41_p1.h kTailOnceEnv; every other
+# arm states 0): the stager's wave relaunches of gate_up and down skip the twin's fill of the other ranks' slots,
+# which the layer's own launches did; same bytes. Needs P1 and the `p1` oracle's "also with the tail filled once"
+# PASS line (and, with Qt, the `p1tiled` one's); measured only if every rank logs "ds41 p1: tail filled once a
+# layer, rank R" once at startup and at exit counts "wave tail fills skipped N", N > 0 (any other arm neither).
 # QdN: decode passes on the cards (..._P1_DECODE_ROWS=N, 17 to N_Lc; every other arm states 0): a pure
 # decode pass of N rows or more (decode rows only, no draft, speculation or cut) arms the card path for its
 # routed layers as a prefill pass of the threshold's rows does, and takes the lent slots back as one does;
@@ -679,7 +691,9 @@ kld_finish() {   # name; the run is SERVER_PID
   fi
   local extra_why
   if ! extra_why=$(vp_server_gate "$OUT/$name.server.log" "${ARM_VP:-}" "$([[ " ${ARGS[*]} " == *" --draft-bank "* ]] && echo 1)") ||
-     ! extra_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" exit); then
+     ! extra_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" exit) ||
+     ! extra_why=$(qt_gate "$OUT/$name.server.log" "${ARM_QT:-}") ||
+     ! extra_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" exit); then
     log "arm $name: $extra_why; Kld not measured"; return 1
   fi
   if [[ -z "$KLD_REF" ]]; then
@@ -830,6 +844,35 @@ qsp_gate() {   # log, requested switch, start/exit
     if [[ $count != 1 || -z "$full" ]] || (( spans == 0 || rows >= full )); then
       echo "Qsp, but rank $rank has no demonstrated work reduction (${line:-no counters})"; return 1
     fi
+  done
+  return 0
+}
+
+qz_gate() {   # log, requested switch, start/exit: the tail-once marker on every rank (and skipped fills at exit)
+  local f=$1 on=$2 stage=${3:-start} rank count n
+  if [[ -z "$on" ]]; then
+    if grep -q 'ds41 p1: tail filled once a layer' "$f"; then echo 'no Qz part, but the tail is filled once a layer'; return 1; fi
+    return 0
+  fi
+  for rank in 0 1 2 3; do
+    count=$(grep -cE "ds41 p1: tail filled once a layer, rank $rank \\(RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=1\\)" "$f")
+    if [[ $count != 1 ]]; then echo "Qz, but rank $rank lacks one 'ds41 p1: tail filled once a layer' startup marker"; return 1; fi
+    [[ "$stage" == exit ]] || continue
+    n=$(sed -nE "s/.*ds41 p1 stats, rank $rank: .*; wave tail fills skipped ([0-9]+).*/\\1/p" "$f" | tail -1)
+    if [[ -z "$n" ]] || (( n == 0 )); then echo "Qz, but rank $rank skipped no wave tail fill (${n:-no counter})"; return 1; fi
+  done
+  return 0
+}
+
+qt_gate() {   # log, requested switch: the register-tiled twin's startup marker on every rank, or on none
+  local f=$1 on=$2 rank count
+  if [[ -z "$on" ]]; then
+    if grep -q 'ds41 p1: register-tiled twin on' "$f"; then echo 'no Qt part, but the register-tiled twin is on'; return 1; fi
+    return 0
+  fi
+  for rank in 0 1 2 3; do
+    count=$(grep -cE "ds41 p1: register-tiled twin on, rank $rank \\(RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1\\)" "$f")
+    if [[ $count != 1 ]]; then echo "Qt, but rank $rank lacks one 'ds41 p1: register-tiled twin on' startup marker"; return 1; fi
   done
   return 0
 }
@@ -1132,6 +1175,10 @@ EOF2
   if ! qsp_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" start); then
     log "arm $name: $qsp_why; not measured"; stop_server; return 1
   fi
+  if ! qsp_why=$(qt_gate "$OUT/$name.server.log" "${ARM_QT:-}") ||
+     ! qsp_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" start); then
+    log "arm $name: $qsp_why; not measured"; stop_server; return 1
+  fi
   # In / Is (RADIANCE_EXPERIMENTAL_DS41_INSERT_NT / _SLICE_KIB) and Ph (_HOST_EXPERTS_LEAN_TILES):
   # rank 0 names what it took at startup. An arm whose line is missing or says otherwise (a radiance
   # without the switch, a cache that is not packed), or a plain arm with one, is not measured.
@@ -1408,7 +1455,8 @@ EOF2
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
   local qsp_exit_why
-  if ! qsp_exit_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" exit); then
+  if ! qsp_exit_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" exit) ||
+     ! qsp_exit_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" exit); then
     log "arm $name: $qsp_exit_why; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
@@ -1778,6 +1826,42 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" p1 "* ]]; then
     else
       P1_WHY="the prefill Phase 1 device check did not pass on $TL:$p1_bad"
       log "$P1_WHY no P1 arm is measured"
+    fi
+  fi
+fi
+# The Qt arms' gate (RADIANCE_EXPERIMENTAL_DS41_P1_TILED), like P1's: a Qt arm runs only on the libr4d.so (sha256)
+# on which ds41_mxfp4_device_check `p1tiled` passed in this window (every `p1` check with the register-tiled twin
+# served, and both forms forced equal byte for byte; the check sets LCP=2048, P1=1 and the switch itself).
+P1T_OK="" P1T_LIB="" P1T_SUM=""
+P1T_WHY="no register-tiled P1 twin device check in this window (DEVICE_CHECKS=p1tiled with TALL_CHECK and TALL_LIBR4D)"
+if [[ " ${DEVICE_CHECKS:-1} " == *" p1tiled "* ]]; then
+  TL=${TALL_LIBR4D:-} TC=${TALL_CHECK:-} PM=${P1_CHECK_M:-4096} PR=${P1_ROUTES:-}
+  if [[ ! -x "$TC" || ! -f "$TL" ]]; then
+    P1T_WHY="TALL_CHECK=$TC is not an executable or TALL_LIBR4D=$TL is not a file"
+    log "register-tiled P1 twin device check: $P1T_WHY; no Qt arm is measured"
+  elif ! [[ $PM =~ ^[0-9]+$ ]] || (( 10#$PM < 17 || 10#$PM > 4096 )); then
+    P1T_WHY="P1_CHECK_M=$PM is not in 17..4096"
+    log "register-tiled P1 twin device check: $P1T_WHY; no Qt arm is measured"
+  elif [[ -n "$PR" && ! -f "$PR" ]]; then
+    P1T_WHY="P1_ROUTES=$PR is not a file"
+    log "register-tiled P1 twin device check: $P1T_WHY; no Qt arm is measured"
+  else
+    log "register-tiled P1 twin device check on card 0 with $TL ($TC), M up to $PM${PR:+, routes $PR}"
+    ( export HIP_VISIBLE_DEVICES=0
+      unset RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_P1_TILED
+      timeout 2400 "$TC" "$TL" p1tiled $((10#$PM)) $PR >"$OUT/devcheck-p1tiled.log" 2>&1
+      echo "p1tiled exit $?" >>"$OUT/devcheck-p1tiled.log" )
+    grep -E '^p1tiled:|^p1 time( wave| tiled grid)?:|exit' "$OUT/devcheck-p1tiled.log" | tail -24 | tee -a "$OUT/window.log"
+    p1t_bad=""
+    grep -qx "p1tiled exit 0" "$OUT/devcheck-p1tiled.log" || p1t_bad+=" p1tiled exited non-zero;"
+    [[ "$(grep -E '^p1tiled: (PASS|FAIL)' "$OUT/devcheck-p1tiled.log" | tail -1)" == "p1tiled: PASS"* ]] || p1t_bad+=" its last p1tiled line is not PASS;"
+    grep -qE '^PASS: row table: .*served form: the register-tiled P1 twin' "$OUT/devcheck-p1tiled.log" || p1t_bad+=" its row table did not name the register-tiled twin;"
+    if [[ -z "$p1t_bad" ]]; then
+      P1T_OK=1 P1T_LIB=$TL P1T_SUM=$(sha256sum "$TL" 2>/dev/null | cut -d' ' -f1)
+      log "register-tiled P1 twin device check passed on $TL, sha256 ${P1T_SUM:0:16}: Qt arms on it are measured"
+    else
+      P1T_WHY="the register-tiled P1 twin device check did not pass on $TL:$p1t_bad"
+      log "$P1T_WHY no Qt arm is measured"
     fi
   fi
 fi
@@ -3024,7 +3108,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" sg="" pcn=""
-  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qsp="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qsp="" qt="" qz="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows=""
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
   axr=""   # AxrN: the worker's passes up to N rows (RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS)
@@ -3220,6 +3304,8 @@ for a in $ARMS; do
                else log "arm $a: $p: a chunk is a multiple of 16 in 64..4096; the arm is skipped"; skip=1; fi ;;
       P1)      p1=1 ;;                                                  # prefill Phase 1: card experts in large chunks (needs Lc)
       Qsp)     qsp=1 ;;                                                 # each P1 wave's covering sorted-slot SwiGLU span
+      Qt)      qt=1 ;;                                                  # the register-tiled P1 twin (..._P1_TILED=1)
+      Qz)      qz=1 ;;                                                  # the twin's tail filled once a layer (..._P1_TAIL_ONCE=1)
       Qw[0-9]*|Qi[0-9]*|Qr[0-9]*|Qa[0-9]*|Qv[0-9]*|Qm[0-9]*|Ql[0-9]*|Qh[0-9]*|Qe[0-9]*|Qd[0-9]*)   # ...wave / in flight / ready / read-ahead / verify / threshold / lent slots / its hold / lent arena slots / decode passes
                qn=${p:2}
                case ${p:0:2} in
@@ -3742,6 +3828,32 @@ for a in $ARMS; do
       log "arm $a: Qsp needs the full/span SwiGLU card oracle; the arm is skipped"; skip=1
     fi
   fi
+  # Qt: the register-tiled P1 twin, stated in every arm (0 off); with P1, on the libr4d.so `p1tiled` passed on.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_P1_TILED=${qt:-0})
+  if [[ -n "$qt" ]]; then
+    [[ -n "$p1" ]] || { log "arm $a: Qt needs P1; the arm is skipped"; skip=1; }
+    [[ -z "$axr" ]] || { log "arm $a: Qt beside Axr$axr: the aux worker's taller passes would run the tiled twin, which no auxtall check covers; the arm is skipped"; skip=1; }
+    if [[ -z "$skip" ]]; then
+      IFS=: read -r -a homes <<< "$ARM_HOME"
+      lib=""
+      for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { lib=$h/kernels/libr4d.so; break; }; done
+      if [[ -z "$P1T_OK" ]]; then
+        log "arm $a: Qt refused: $P1T_WHY"; skip=1
+      elif [[ -z "$lib" || "$(sha256sum "$lib" 2>/dev/null | cut -d' ' -f1)" != "$P1T_SUM" ]]; then
+        log "arm $a: Qt refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the p1tiled check passed on ($P1T_LIB, sha256 ${P1T_SUM:0:16})"; skip=1
+      fi
+    fi
+  fi
+  # Qz: the tail filled once a layer, stated in every arm (0 off); with P1 and the oracle's tail-once waves.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=${qz:-0})
+  if [[ -n "$qz" ]]; then
+    [[ -n "$p1" ]] || { log "arm $a: Qz needs P1; the arm is skipped"; skip=1; }
+    if ! grep -qE '^p1: PASS: .*also with the tail filled once' "$OUT/devcheck-p1.log" 2>/dev/null; then
+      log "arm $a: Qz needs the p1 oracle's tail-once waves (devcheck-p1.log); the arm is skipped"; skip=1
+    elif [[ -n "$qt" ]] && ! grep -qE '^p1tiled: PASS: .*also with the tail filled once' "$OUT/devcheck-p1tiled.log" 2>/dev/null; then
+      log "arm $a: Qz with Qt needs the p1tiled oracle's tail-once waves (devcheck-p1tiled.log); the arm is skipped"; skip=1
+    fi
+  fi
   # P1 (RADIANCE_EXPERIMENTAL_DS41_P1): with Lc, on the libr4d.so the `p1` device check passed on; every
   # other arm states the switch 0 and the Q knobs empty, so a window's VAR=val cannot turn them on.
   if [[ -n "$p1" ]]; then
@@ -3936,7 +4048,7 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
   if [[ -n "$ARM_TIMEOUT" ]] && ! [[ $ARM_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]]; then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QSP=$qsp ARM_LH=$lh
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QSP=$qsp ARM_QT=$qt ARM_QZ=$qz ARM_LH=$lh
   ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr
   # Ax / AxN / Axv / AxvN / Ax0 / AxfN (RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS, core/place/aux_expert_worker.h): the
   # extra card appended last to the window's mask of the four rank cards (ranks 0-3 stay the XTs), the worker on it

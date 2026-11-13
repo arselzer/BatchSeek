@@ -96,13 +96,15 @@ struct Tunables {
     int  decode_rows = 0;                                       /* decode passes on the cards from N rows (0 off) */
     bool align_end = true;
     bool swiglu_span = false;
+    bool tiled = false;                                         /* ds41p1::kTiledEnv: the register-tiled twin */
+    bool tail_once = false;                                     /* ds41p1::kTailOnceEnv: waves skip the tail fill */
 };
 /* The tunables from `get` (getenv for the engine): each a whole number in its range (wave 1-16,
  * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, lend_arena 0-64,
  * grace_ms 0-60000, lend_heat 0-8, lend_heat_half 1-100000000 (unset: 100, or 2000 with lend_slab),
  * lend_heat_margin 100-1000, lend_heat_prior 0-100000000 (unset: the half-life), lend_slab 0-256, lend_rest_ms 0-600000 (unset: 5000 with lend_heat or lend_slab, else
- * 0), decode_rows 0 or 17-4096), align "end" or "start", swiglu_span and lend_audit 0/off or
- * 1/on (default off). False with the reason on anything else. */
+ * 0), decode_rows 0 or 17-4096), align "end" or "start", swiglu_span, lend_audit, tiled and tail_once
+ * 0/off or 1/on (default off). False with the reason on anything else. */
 bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables* t, std::string* why);
 
 /* The wave's live sorted slots, from ALL local experts' synchronized counts (their exclusive
@@ -795,6 +797,7 @@ public:
         uint64_t admitted = 0, leases_at_end = 0;
         uint64_t verified = 0, differ = 0, verify_skipped = 0;   /* FileStager::p1_verify's */
         uint64_t swiglu_spans = 0, swiglu_rows = 0, swiglu_full_rows = 0, swiglu_fallbacks = 0;
+        uint64_t tail_skipped = 0;                              /* wave launches without the tail fill */
         /* The lent ring's reloads: from the RAM cache (its lease the copy's source where it holds the
          * card's block form; relaid from the packed form into a reload buffer where it is packed, and the
          * reload thread's time in those), read from the drive (and the reload thread's time in them),

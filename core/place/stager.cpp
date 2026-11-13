@@ -1701,6 +1701,18 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
                                     : "Load a libr4d.so with the P1 row");
                         return RAD_E_INVAL;
                     }
+                    /* The register-tiled twin (ds41p1::kTiledEnv): the row must say it takes that form. */
+                    if (high && ds41p1::tiled_state() == 1) {
+                        const KernelRow* row = b.dom[RAD_DOMAIN_DEVICE].row;
+                        const char* says = row && row->info ? row->info->computes : nullptr;
+                        if (!says || !std::strstr(says, ds41p1::kTiledMark)) {
+                            RAD_ERR("%s=1 refused: op %zu's %s does not run %s (its row does not name it): load a "
+                                    "libr4d.so built with the register-tiled twin, with %s=1 and %s=1 in its "
+                                    "environment", ds41p1::kTiledEnv, h, ds41p1::kTwinRow, ds41p1::kTiledMark,
+                                    ds41p1::kEnv, ds41p1::kTiledEnv);
+                            return RAD_E_INVAL;
+                        }
+                    }
                     if (high) {
                         ++n_twin;
                         const int64_t r = row_m_bound(b.dom[RAD_DOMAIN_DEVICE].row);
@@ -4875,7 +4887,15 @@ int FileStager::p1_init(const Program& prog) {
     const char* v = std::getenv(ds41p1::kEnv);
     const int st = ds41p1::env_state(v);
     p1_state_ = st;
-    if (st == 0) return RAD_OK;
+    if (st == 0) {
+        /* The register-tiled twin is the P1 row's form: nothing to act on without P1. */
+        if (const char* tv = std::getenv(ds41p1::kTiledEnv); ds41p1::env_state(tv) != 0) {
+            RAD_ERR("%s=%s refused: it chooses the P1 twin's kernel, and %s is not on", ds41p1::kTiledEnv, tv,
+                    ds41p1::kEnv);
+            return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
     auto refuse = [&](const std::string& why) {
         RAD_ERR("%s=%s (prefill Phase 1, card experts) refused: %s", ds41p1::kEnv, v ? v : "", why.c_str());
         return RAD_E_INVAL;

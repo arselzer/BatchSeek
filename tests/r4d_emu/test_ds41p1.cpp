@@ -51,6 +51,7 @@
 #include <vector>
 
 extern const char* emu_last_kernel;
+extern const char* emu_prev_kernel;
 extern int emu_grids;
 
 /* libr4d restates the contract's constants (r4d_ds41_tall.h); they must agree with the shared header. */
@@ -270,6 +271,8 @@ struct Split {
 };
 
 /* One moe_gemm_ggml call into y (not cleared here): x [AR, K], the table, the pass's routing. */
+/* `no_tail`: the stager's wave relaunch under ds41p1::kTailOnceEnv (ds41p1::kTailParam = 0: no tail fill). */
+bool g_no_tail = false;
 int moe(Launch f, const Split* sp, const uint16_t* x, int AR, int K, const std::vector<const void*>& table, int N,
         const Pass& p, bool sorted_order, uint16_t* y) {
     const int T = (int)p.sorted.size();
@@ -279,6 +282,28 @@ int moe(Launch f, const Split* sp, const uint16_t* x, int AR, int K, const std::
                        ten(so.data(), RAD_I32, { T }), ten(of.data(), RAD_I32, { kNe + 1 }),
                        ten(y, RAD_BF16, { T, N }) };
     t[1].stride[0] = 0;   /* a table of expert pointers */
+    RadParam pr[7] = { pstr("type", "mxfp4"), pint("N", N), pint("K", K), pint("n_expert", kNe), pint("top_k", kTop),
+                       pstr("a_order", sorted_order ? "sorted" : "token"), pint(ds41p1::kTailParam, 0) };
+    RadArgs a{};
+    a.t = t;
+    a.n_t = 5;
+    a.p = pr;
+    a.n_p = g_no_tail ? 7 : 6;
+    if (sp && !sp->served())
+        return r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_opts(&a, nullptr, sp->grid, sp->item_kib, sp->fill, sp->lds_kib);
+    return f(&a, nullptr);
+}
+/* The P1 twin in form `form` (r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_form: 0 the twin's kernel, 1 the register-tiled
+ * kernel) on `grid` blocks (0 the launcher's), whatever RADIANCE_EXPERIMENTAL_DS41_P1_TILED says. */
+int moe_form(int form, int grid, const uint16_t* x, int AR, int K, const std::vector<const void*>& table, int N,
+             const Pass& p, bool sorted_order, uint16_t* y) {
+    const int T = (int)p.sorted.size();
+    std::vector<const void*> tab = table;
+    std::vector<int32_t> so = p.sorted, of = p.off;
+    RadTensor t[5] = { ten((void*)x, RAD_BF16, { AR, K }), ten(tab.data(), RAD_U8, { kNe, N, K / 32 * 17 }),
+                       ten(so.data(), RAD_I32, { T }), ten(of.data(), RAD_I32, { kNe + 1 }),
+                       ten(y, RAD_BF16, { T, N }) };
+    t[1].stride[0] = 0;
     RadParam pr[6] = { pstr("type", "mxfp4"), pint("N", N), pint("K", K), pint("n_expert", kNe), pint("top_k", kTop),
                        pstr("a_order", sorted_order ? "sorted" : "token") };
     RadArgs a{};
@@ -286,20 +311,32 @@ int moe(Launch f, const Split* sp, const uint16_t* x, int AR, int K, const std::
     a.n_t = 5;
     a.p = pr;
     a.n_p = 6;
-    if (sp && !sp->served())
-        return r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_opts(&a, nullptr, sp->grid, sp->item_kib, sp->fill, sp->lds_kib);
-    return f(&a, nullptr);
+    return r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_form(&a, nullptr, form, grid);
 }
+/* The served twin's kernel: the register-tiled one under RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1 (beside P1 and LCP in
+ * the environment), else mx_vp2_kernel; a forced split (`_opts`) always the latter. */
+bool g_tiled = false;
 int p1(const Split* sp, const uint16_t* x, int AR, int K, const std::vector<const void*>& table, int N, const Pass& p,
-       bool sorted_order, uint16_t* y, std::string* why) {
+       bool sorted_order, uint16_t* y, std::string* why, int form = -1, int grid = 0) {
     const int g0 = emu_grids;
-    const int rc = moe(r4d_rad_moe_gemm_mxfp4_gemv_tall_p1, sp, x, AR, K, table, N, p, sorted_order, y);
+    const char* const want = form == 1 || (form < 0 && g_tiled && (!sp || sp->served())) ? "mx_p1t_kernel" : "mx_vp2_kernel";
+    const int rc = form >= 0 ? moe_form(form, grid, x, AR, K, table, N, p, sorted_order, y)
+                             : moe(r4d_rad_moe_gemm_mxfp4_gemv_tall_p1, sp, x, AR, K, table, N, p, sorted_order, y);
     const int n = emu_grids - g0;
     const std::string last = emu_last_kernel ? emu_last_kernel : "?";
+    const std::string prev = emu_prev_kernel ? emu_prev_kernel : "?";
     if (rc != RAD_OK) { *why = "refused (" + std::to_string(rc) + ")"; return 1; }
-    /* gemv_vp's kernel, then the tail's zero fill: two launches, the fill last. */
-    if (n != 2 || last.find("mx_zero_tail_kernel") == std::string::npos) {
-        *why = std::to_string(n) + " launches, the last " + last;
+    /* Without the tail fill (a wave under ds41p1::kTailOnceEnv): the form's kernel alone. */
+    if (g_no_tail && form < 0) {
+        if (n != 1 || last.find(want) == std::string::npos) {
+            *why = std::to_string(n) + " launches, the last " + last + " (wanted " + want + " alone)";
+            return 1;
+        }
+        return 0;
+    }
+    /* The form's kernel, then the tail's zero fill: two launches, the fill last. */
+    if (n != 2 || last.find("mx_zero_tail_kernel") == std::string::npos || prev.find(want) == std::string::npos) {
+        *why = std::to_string(n) + " launches, " + prev + " then " + last + " (wanted " + want + " first)";
         return 1;
     }
     return 0;
@@ -329,6 +366,7 @@ std::vector<uint16_t> make_x(int rows, int K, std::mt19937_64& rng) {
     return x;
 }
 
+bool g_forms = false;   /* `tiled`: the forced forms in every rows case */
 int g_fails = 0, g_cases = 0;
 long long g_rows = 0;
 void fail(const std::string& s) {
@@ -467,8 +505,28 @@ void rows_case(const Bank& b, const Shape& sh, int M, int kind, uint32_t seed, b
                      " KiB gives other bytes");
         }
     }
-    std::printf("  %s: %d local slots (%d skipped, %d packed), %d splits, %.1f s\n", label.c_str(), full.local,
-                skipped_rows, packed_rows, nsplit,
+    /* `tiled`: both forms forced (the twin's kernel and the register-tiled one, the latter on other grids too)
+     * give the served call's bytes. */
+    int nform = 0;
+    if (g_forms) {
+        const int fg[][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 1, 3 }, { 1, 50 } };
+        for (const auto& f : fg) {
+            std::vector<uint16_t> y2((size_t)T * N, 0xAAAAu);
+            if (p1(nullptr, xin.data(), AR, K, tab, N, full, sh.sorted, y2.data(), &why, f[0], f[1])) {
+                fail(label + ": form " + std::to_string(f[0]) + ": " + why);
+                continue;
+            }
+            ++nform;
+            if (std::memcmp(y.data(), y2.data(), y.size() * 2) != 0) {
+                size_t d = 0;
+                for (size_t i = 0; i < y.size(); ++i) d += y[i] != y2[i];
+                fail(label + ": form " + std::to_string(f[0]) + " on grid " + std::to_string(f[1]) + ": " +
+                     std::to_string(d) + " values differ from the served call's");
+            }
+        }
+    }
+    std::printf("  %s: %d local slots (%d skipped, %d packed), %d splits, %d forced forms, %.1f s\n", label.c_str(),
+                full.local, skipped_rows, packed_rows, nsplit, nform,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0c).count());
     std::fflush(stdout);
 }
@@ -512,6 +570,11 @@ void waves_case(const Bank& gu, const Bank& dn, int M, int kind, uint32_t seed) 
         }
     }
     std::shuffle(sub.begin(), sub.end(), rng);
+    int waves = 0;
+    /* The waves as the stager relaunches them, then again with their tail fill skipped (ds41p1::kTailOnceEnv: the
+     * main launch fills it; poison anywhere it did not reach shows). */
+    for (int once = 0; once < 2; ++once) {
+    waves = 0;
     std::vector<uint16_t> G2((size_t)T * 2 * n, 0xAAAAu), S2((size_t)T * n, 0xAAAAu), D2((size_t)T * dn.N, 0xAAAAu);
     std::vector<const void*> mgu = fgu, mdn = fdn;
     for (int e : sub) mgu[(size_t)e] = mdn[(size_t)e] = skip_entry();
@@ -521,29 +584,33 @@ void waves_case(const Bank& gu, const Bank& dn, int M, int kind, uint32_t seed) 
         fail(label + ": the main launch: " + why);
         return;
     }
-    int waves = 0;
     for (size_t w0 = 0, sz = 1; w0 < sub.size(); w0 += sz, sz = sz % 3 + 1) {
         std::vector<const void*> wgu((size_t)kNe, skip_entry()), wdn((size_t)kNe, skip_entry());
         for (size_t j = w0; j < std::min(sub.size(), w0 + sz); ++j) {
             wgu[(size_t)sub[j]] = fgu[(size_t)sub[j]];
             wdn[(size_t)sub[j]] = fdn[(size_t)sub[j]];
         }
-        if (p1(nullptr, x.data(), M, E, wgu, gu.N, p, false, G2.data(), &why) ||
-            swiglu(G2.data(), S2.data(), T, n) != RAD_OK ||
-            p1(nullptr, S2.data(), T, n, wdn, dn.N, p, true, D2.data(), &why)) {
-            fail(label + ": wave " + std::to_string(waves) + ": " + why);
+        g_no_tail = once == 1;
+        const bool bad = p1(nullptr, x.data(), M, E, wgu, gu.N, p, false, G2.data(), &why) ||
+                         swiglu(G2.data(), S2.data(), T, n) != RAD_OK ||
+                         p1(nullptr, S2.data(), T, n, wdn, dn.N, p, true, D2.data(), &why);
+        g_no_tail = false;
+        if (bad) {
+            fail(label + ": wave " + std::to_string(waves) + (once ? " (tail once)" : "") + ": " + why);
             return;
         }
         ++waves;
     }
+    const std::string tag = once ? " (tail once)" : "";
     auto cmp = [&](const std::vector<uint16_t>& a, const std::vector<uint16_t>& b2, const char* what) {
         size_t d = 0;
         for (size_t i = 0; i < a.size(); ++i) d += !same16(a[i], b2[i]);
-        if (d) fail(label + ": " + what + ": " + std::to_string(d) + " values differ from one launch");
+        if (d) fail(label + tag + ": " + what + ": " + std::to_string(d) + " values differ from one launch");
     };
     cmp(G, G2, "gate_up");
     cmp(S, S2, "swiglu");
     cmp(D, D2, "down");
+    }
     std::printf("  %s: %d local slots, %zu experts in %d waves, %.1f s\n", label.c_str(), p.local, sub.size(), waves,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0c).count());
     std::fflush(stdout);
@@ -710,8 +777,26 @@ void cut_case(const Bank& gu, const Bank& dn, const Padded& pgu, const Padded& p
 }  // namespace
 
 int main(int argc, char** argv) {
-    /* `quick`: the smaller heights only (a sanitiser or a slow host). */
-    const bool quick = argc > 1 && !std::strcmp(argv[1], "quick");
+    /* `quick`: the smaller heights only (a sanitiser or a slow host). `tiled`: the register-tiled form
+     * (RADIANCE_EXPERIMENTAL_DS41_P1_TILED): the small heights and 100 (tiles cut short), a shape whose last K chunk
+     * is one block and whose last wave has weight rows past N, both forms forced in every rows case; with the switch
+     * in the environment (beside P1 and LCP) the served twin must be the tiled one, which every case then holds to
+     * the 16-token gemv. */
+    const bool tiled_mode = argc > 1 && !std::strcmp(argv[1], "tiled");
+    const bool quick = (argc > 1 && !std::strcmp(argv[1], "quick")) || tiled_mode;
+    g_forms = tiled_mode;
+    {
+        const char* e = std::getenv(kR4dDs41P1TiledEnv);
+        const bool asked = e && !std::strcmp(e, "1");
+        g_tiled = r4d_ds41_p1_tiled_on() != 0;
+        std::printf("served P1 twin: %s (%s %s)\n", g_tiled ? "the register-tiled kernel" : "mx_vp2_kernel",
+                    kR4dDs41P1TiledEnv, asked ? "=1" : "unset");
+        if (asked && !g_tiled) {
+            std::printf("FAIL: %s=1, but the served twin is not the tiled one (P1 and LCP in the environment?)\n",
+                        kR4dDs41P1TiledEnv);
+            return 1;
+        }
+    }
     void* page = mmap(nullptr, 1 << 16, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (page == MAP_FAILED) { std::printf("mmap failed\n"); return 2; }
     g_noread = page;
@@ -721,18 +806,22 @@ int main(int argc, char** argv) {
         { "gate_up K 5120", 32, 5120, false },
         { "down K 2304", 48, 2304, true },
         { "K 512, two weight rows a wave", 1024, 512, false },
+        { "K 1056, N 37", 37, 1056, false },
     };
     const Bank b0(shapes[0].N, shapes[0].K, 101), b1(shapes[1].N, shapes[1].K, 202), b2(shapes[2].N, shapes[2].K, 303);
-    const Bank* banks[] = { &b0, &b1, &b2 };
-    for (int si = 0; si < 3; ++si) {
+    std::unique_ptr<Bank> b3;
+    if (tiled_mode) b3.reset(new Bank(shapes[3].N, shapes[3].K, 808));
+    const Bank* banks[] = { &b0, &b1, &b2, b3.get() };
+    for (int si = 0; si < (tiled_mode ? 4 : 3); ++si) {
         std::vector<int> Ms = si == 2 ? std::vector<int>{ 17, 64 } : std::vector<int>{ 17, 64, 256, 1024 };
         if (quick) Ms = { 17, 64 };
+        if (tiled_mode && si != 2) Ms.push_back(100);
         for (int M : Ms)
             for (int k = 0; k < kKinds; ++k) {
                 if (k == kReal && !real) continue;
                 /* The tallest height: the routings that differ most (real, skewed, hot). */
                 if (M >= 1024 && k != kReal && k != kSkewed && k != kHot) continue;
-                const bool splits = M <= 256 || k == kReal;
+                const bool splits = tiled_mode ? M == 64 && k == kReal : M <= 256 || k == kReal;
                 rows_case(*banks[si], shapes[si], M, k, 9001u * (uint32_t)M + 77u * (uint32_t)k + (uint32_t)si,
                           splits);
             }
@@ -755,10 +844,10 @@ int main(int argc, char** argv) {
                     cut_case(wg0, wd0, pg0, pd0, M, R, k, 271u * (uint32_t)M + 13u * (uint32_t)R + (uint32_t)k);
                 }
     }
-    std::printf("%s: %d cases, %lld (token, slot) rows held to the 16-token gemv, %.0f s; P1 twin %s (M <= %d)\n",
+    std::printf("%s: %d cases, %lld (token, slot) rows held to the 16-token gemv, %.0f s; P1 twin %s (M <= %d)%s\n",
                 g_fails ? "FAIL" : "PASS", g_cases, g_rows,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), kR4dDs41P1Row,
-                kR4dDs41P1MaxRows);
+                kR4dDs41P1MaxRows, g_tiled ? ", served on the register-tiled kernel" : "");
     munmap(page, 1 << 16);
     return g_fails ? 1 : 0;
 }

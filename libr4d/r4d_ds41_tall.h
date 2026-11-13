@@ -89,6 +89,23 @@ inline bool r4d_ds41_p1() {
     return on;
 }
 
+/* RADIANCE_EXPERIMENTAL_DS41_P1_TILED (tools/ds41-host-experts/ds41_p1.h kTiledEnv): "1" beside P1 puts the P1 twin's
+ * calls on the register-tiled kernel (r4d_ds41_mxfp4.hip, mx_p1t_kernel: an expert's weights decoded once for 8
+ * activation rows, K in chunks), whose every output is the same sum, operation for operation, as the twin's and
+ * the decode band's. The row keeps its name; its `computes` names the form (kR4dDs41P1TiledMark), which the core
+ * requires when it is asked for, and the row table says so once on stderr. Anything else, or "1" without P1, is
+ * off here (the core refuses an invalid value and the switch without P1). Read once. */
+constexpr const char* kR4dDs41P1TiledEnv  = "RADIANCE_EXPERIMENTAL_DS41_P1_TILED";
+constexpr const char* kR4dDs41P1TiledMark = "the register-tiled P1 twin";
+
+inline bool r4d_ds41_p1_tiled() {
+    static const bool on = [] {
+        const char* e = std::getenv(kR4dDs41P1TiledEnv);
+        return e && e[0] == '1' && e[1] == '\0' && r4d_ds41_p1();
+    }();
+    return on;
+}
+
 /* The twin's bound on M: kR4dDs41P1MaxRows under P1, kR4dDs41LcpMax under LCP, kR4dDs41TallRows under EXACT_TALL
  * alone. */
 inline int r4d_ds41_tall_rows() {

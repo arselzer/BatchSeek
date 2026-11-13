@@ -319,6 +319,7 @@ static void lds_reserve(size_t bytes) {
 int emu_grids = 0;
 int emu_last_block = 0;
 const char* emu_last_kernel = "";
+const char* emu_prev_kernel = "";
 void emu_run_grid(dim3 grid, dim3 block, void (*body)(void*), void* ctx, size_t dyn_lds) {
     ++emu_grids;
     const int n = (int)(block.x * block.y * block.z);
