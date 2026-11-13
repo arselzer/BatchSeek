@@ -2906,7 +2906,10 @@ void p1_rows(P1Ctx& c, const P1Routing& r, int M, std::mt19937_64& rng, bool spl
                 HC(hipStreamSynchronize(c.s));
                 std::vector<uint16_t> y2((size_t)T * N);
                 d_y.get(y2.data());
-                fdiff += count_diff(y.data(), y2.data(), y.size());   /* bit for bit, NaN payloads too */
+                /* The served form's own runs bit for bit; the twin's kernel a NaN equal to any NaN (two kernels may
+                 * carry different NaN payloads, as against the 16-token passes). */
+                fdiff += f[0] == 1 ? count_diff(y.data(), y2.data(), y.size())
+                                   : p1_diff(y.data(), y2.data(), y.size(), &c.nan_pairs);
                 ++nform;
             }
             c.form_rows += (size_t)full.local;

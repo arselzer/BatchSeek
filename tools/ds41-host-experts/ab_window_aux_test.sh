@@ -700,7 +700,7 @@ kld() {   # name, ARM_AX, ARM_AXV, ARM_AXF, server log, KLD_REF ("" none), a com
   ( set +u; log() { echo "LOG: $*"; }; eval "$FUNCS"; eval "$KF"
     kill() { return 1; }; wait() { return 0; }; python3() { echo "COMPARED $*"; return 0; }
     n128_server_gate() { return 0; }; xt_check() { return 0; }; lcp_check() { return 0; }
-    vp_server_gate() { return 0; }; qsp_gate() { return 0; }
+    vp_server_gate() { return 0; }; qsp_gate() { return 0; }; qt_gate() { return 0; }; qz_gate() { return 0; }
     OUT=$T/kout; mkdir -p "$OUT"; HERE=$T; ARGS=()
     AUX_SYSFS=$CS AUX_PROC=$CP AUX_GPUID=$XGID AUX_DRM=$CS/class/drm/card5/device AUX_KFD_WAIT_DS=0
     aux_clients > "$OUT/$1.aux-clients"

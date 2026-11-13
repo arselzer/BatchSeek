@@ -366,6 +366,16 @@ std::vector<uint16_t> make_x(int rows, int K, std::mt19937_64& rng) {
     return x;
 }
 
+/* Values that differ, a NaN equal to any NaN (the pairs of two different NaNs counted in *nans). */
+size_t differ_nan_equal(const std::vector<uint16_t>& a, const std::vector<uint16_t>& b, size_t* nans) {
+    size_t d = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i] != b[i]) {
+            if (nan16(a[i]) && nan16(b[i])) ++*nans;
+            else ++d;
+        }
+    return d;
+}
 bool g_forms = false;   /* `tiled`: the forced forms in every rows case */
 int g_fails = 0, g_cases = 0;
 long long g_rows = 0;
@@ -489,6 +499,7 @@ void rows_case(const Bank& b, const Shape& sh, int M, int kind, uint32_t seed, b
     if (tail_bad) fail(label + ": " + std::to_string(tail_bad) + " values past the live end are not zero");
     /* Other work splits: the same bytes. */
     int nsplit = 0;
+    size_t nan_pairs = 0;
     if (splits) {
         const Split sps[] = { { 5, 1, 1, 0 }, { 64, 4, 64, 0 }, { 300, 1000, 2, 0 }, { 0, 0, 0, 36 }, { 0, 0, 0, 56 } };
         for (const Split& s2 : sps) {
@@ -499,10 +510,13 @@ void rows_case(const Bank& b, const Shape& sh, int M, int kind, uint32_t seed, b
                 continue;
             }
             ++nsplit;
-            if (std::memcmp(y.data(), y2.data(), y.size() * 2) != 0)
+            /* Bytes, a NaN equal to any NaN: under the tiled switch the splits run the twin's kernel, and two
+             * kernels may carry different NaN payloads (the 16-token comparisons above hold NaNs the same way). */
+            const size_t d = differ_nan_equal(y, y2, &nan_pairs);
+            if (d)
                 fail(label + ": split grid " + std::to_string(s2.grid) + " item " + std::to_string(s2.item_kib) +
                      " KiB fill " + std::to_string(s2.fill) + " lds " + std::to_string(s2.lds_kib) +
-                     " KiB gives other bytes");
+                     " KiB gives other bytes (" + std::to_string(d) + " values, NaN pairs apart)");
         }
     }
     /* `tiled`: both forms forced (the twin's kernel and the register-tiled one, the latter on other grids too)
@@ -517,16 +531,20 @@ void rows_case(const Bank& b, const Shape& sh, int M, int kind, uint32_t seed, b
                 continue;
             }
             ++nform;
-            if (std::memcmp(y.data(), y2.data(), y.size() * 2) != 0) {
-                size_t d = 0;
+            /* Within one form every byte, NaN payloads too; across forms a NaN equal to any NaN. */
+            size_t d = 0;
+            if (f[0] == (g_tiled ? 1 : 0)) {
                 for (size_t i = 0; i < y.size(); ++i) d += y[i] != y2[i];
+            } else {
+                d = differ_nan_equal(y, y2, &nan_pairs);
+            }
+            if (d)
                 fail(label + ": form " + std::to_string(f[0]) + " on grid " + std::to_string(f[1]) + ": " +
                      std::to_string(d) + " values differ from the served call's");
-            }
         }
     }
-    std::printf("  %s: %d local slots (%d skipped, %d packed), %d splits, %d forced forms, %.1f s\n", label.c_str(),
-                full.local, skipped_rows, packed_rows, nsplit, nform,
+    std::printf("  %s: %d local slots (%d skipped, %d packed), %d splits, %d forced forms (%zu NaN-payload pairs), "
+                "%.1f s\n", label.c_str(), full.local, skipped_rows, packed_rows, nsplit, nform, nan_pairs,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0c).count());
     std::fflush(stdout);
 }
