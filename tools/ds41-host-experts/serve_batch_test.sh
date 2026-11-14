@@ -88,7 +88,15 @@ grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=0' <<< "$d0h" && [[ $d0h == *
   ok "--hybrid 0: off (an arm without Qy); --max-seq-len 4096: SlN's flag" || bad "--hybrid 0 / --max-seq-len"
 [[ $dh != *--max-seq-len* ]] && ok "no --max-seq-len by default" || bad "a --max-seq-len by default"
 
+dq=$("$SB" --model M --silu-table S --tiled 1 --tail-once 1 --swiglu-span 1 --dry-run)
+grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TILED=0' <<< "$dh" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=0' <<< "$dh" &&
+  grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN=0' <<< "$dh" && ok "Qt, Qz, Qsp off by default" || bad "the Qt/Qz/Qsp defaults"
+grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1' <<< "$dq" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=1' <<< "$dq" &&
+  grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN=1' <<< "$dq" && ok "--tiled 1 --tail-once 1 --swiglu-span 1: Qt, Qz, Qsp" ||
+  bad "--tiled / --tail-once / --swiglu-span"
+
 # ---- 3. refusals
+"$SB" --model M --silu-table S --tiled 2 --dry-run > /dev/null 2>&1 && bad "--tiled 2 accepted" || ok "--tiled 2 refused"
 "$SB" --model M --silu-table S --hybrid 401 --dry-run > /dev/null 2>&1 && bad "--hybrid 401 accepted" || ok "--hybrid above 400 refused"
 "$SB" --model M --dry-run > /dev/null 2>&1 && bad "no --silu-table accepted" || ok "no --silu-table refused"
 "$SB" --silu-table S --dry-run > /dev/null 2>&1 && bad "no --model accepted" || ok "no --model refused"

@@ -54,7 +54,7 @@ tools/ds41-host-experts/serve-batch.sh --model /models/ds41.rad --silu-table sil
   --streams 256 --port 8000 [--profile decode-profile.json] [--mirror DIR] [--reserve-mib 10240]
 ```
 
-`serve-batch.sh` sets exactly the measured arm's 133 environment variables and flags (checked against the window
+`serve-batch.sh` sets exactly the measured arm's 135 environment variables and flags (checked against the window
 harness by `serve_batch_test.sh`; `--dry-run` prints them). In a window, an arm's `Sb` part starts its server through
 the launcher (skipped unless `serve-batch.sh --dry-run` gives the arm's whole launch, `serve_batch_match.py`; the
 scripts from `SB_TOOLS`, default the harness's directory) and afterwards sends the receipt's first 8 prompts through
@@ -78,6 +78,8 @@ scripts from `SB_TOOLS`, default the harness's directory) and afterwards sends t
   +28% decode at 256 streams (window ab-20261113T014719Z); `--hybrid 0` turns it off.
 - `--max-seq-len N` (off): one sequence's bound below the KV pool (part `SlN`); 4096 is the candidate for batches of
   short prompts, not yet measured.
+- `--tiled`, `--tail-once`, `--swiglu-span` (0): Phase 1 twin variants (parts `Qt`, `Qz`, `Qsp`), off until a
+  window measures them with hybrid decode.
 
 **Send a batch.** `batch_client.py` reads a JSONL of `{"prompt": ..., "system": ...}` lines and sends them N at a
 time to the server's `/v1/completions`, framed in token ids as the measured runs framed them (DeepSeek's non-thinking

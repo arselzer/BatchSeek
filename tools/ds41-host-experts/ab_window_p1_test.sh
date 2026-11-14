@@ -396,8 +396,7 @@ run_loop() {   # actual balance-oracle bound; every model action remains stubbed
   log() { echo "LOG: $*"; }
   power_set() { :; }; power_restore() { :; }
   vpack_gate() { return 0; }
-  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; echo "  ARM_QD: ${ARM_QD:-}"; echo "  ARM_QY: ${ARM_QY:-}"; echo "  ARM_QYF: ${ARM_QYF:-}"; }
-  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; echo "  ARM_QD: ${ARM_QD:-}"; echo "  ARM_QT: ${ARM_QT:-}"; }
+  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; echo "  ARM_QD: ${ARM_QD:-}"; echo "  ARM_QY: ${ARM_QY:-}"; echo "  ARM_QYF: ${ARM_QYF:-}"; echo "  ARM_QT: ${ARM_QT:-}"; }
   HX_THREADS=16 SILU=/dev/null RHOME=$H RADIANCE_HOME_DIR2=$H MIRROR=$T
   PROMPTS=$T/prompts.json
   unset RADIANCE_TUNE
@@ -609,7 +608,7 @@ qdskip "$CTP0" "Ctp0: CtpN takes a positive N.*skipped"
 if pyout=$(python3 -I "$(dirname "$W")/chain_report.py" --selftest 2>&1) && grep -q "^selftest ran" <<< "$pyout"; then
   ok "chain_report.py --selftest (the --split classes of a prefill pass)"
 else bad "chain_report.py --selftest: $(tail -5 <<< "$pyout")"; fi
-# ---- 5c. Qt in the arm loop: on the fast arm (and beside Qsp) the switch at 1 and every other switch as the fast
+# ---- 8a. Qt in the arm loop: on the fast arm (and beside Qsp) the switch at 1 and every other switch as the fast
 # arm; every arm without the part states it 0; Qt without P1 skipped; with no p1tiled receipt every Qt arm refused.
 for a in "$QT" "$QTQSP"; do
   sec=$(section "$a")
@@ -632,7 +631,7 @@ elif grep -qF "arm $QT: Qt refused: no p1tiled check (test)" <<< "$nop1t_out"; t
 else bad "no p1tiled refusal for arm $QT: $(grep -m1 "arm $QT: " <<< "$nop1t_out")"; fi
 grep -qxF "ARM $FAST" <<< "$nop1t_out" && ok 'the fast arm runs without a p1tiled receipt' || bad 'the fast arm needed a p1tiled receipt'
 
-# ---- 5d. Qz in the arm loop: alone and with Qsp-Qt on the fast arm, the switch at 1 (Qt's too in the second);
+# ---- 8b. Qz in the arm loop: alone and with Qsp-Qt on the fast arm, the switch at 1 (Qt's too in the second);
 # every arm without the part states it 0; Qz without P1 skipped; without the oracle's tail-once line refused.
 for a in "$QZ" "$QTQZ"; do
   sec=$(section "$a")
