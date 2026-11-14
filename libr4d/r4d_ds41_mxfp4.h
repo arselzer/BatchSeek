@@ -30,10 +30,17 @@ int r4d_rad_moe_gemm_mxfp4_gemv_tall(const RadArgs*, RadStream);
  * with the slots past off[n_expert] written as zeros, the work spread by row passes. A stacked weight is served as
  * r4d_rad_moe_gemm_mxfp4_gemv_tall serves it. */
 int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1(const RadArgs*, RadStream);
-/* Checker-only: the same with its work split forced for the call (0 or less: the launcher's own choice): `grid`
+/* Checker-only: the same on the twin's own kernel (whatever RADIANCE_EXPERIMENTAL_DS41_P1_TILED says) with its work
+ * split forced for the call (0 or less: the launcher's own choice): `grid`
  * blocks, at most `item_kib` KiB of weight rows a work item, `fill` work items a block on average, `lds_kib` KiB
  * of staged activation rows (by default 36, or two whole rows where 36 holds one: gate_up; at most 56). Same bits. */
 int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_opts(const RadArgs*, RadStream, int grid, int item_kib, int fill, int lds_kib);
+/* Checker-only: the P1 twin in form `form` for the call whatever RADIANCE_EXPERIMENTAL_DS41_P1_TILED says (0 the
+ * twin's kernel, 1 the register-tiled kernel), on `grid` blocks (0: the launcher's choice). Same bits. */
+int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_form(const RadArgs*, RadStream, int form, int grid);
+/* Checker-only: 1 when the served P1 twin takes the register-tiled kernel (RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1
+ * beside P1, read once), else 0. */
+int r4d_ds41_p1_tiled_on(void);
 /* Checker-only: the gemv row (`tall` 0) or the twin (1) with RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE forced off
  * (`bal` 0) or on (1) for the call: work items by row passes, dropped passes without weight reads, same bits. */
 int r4d_rad_moe_gemm_mxfp4_gemv_bal(const RadArgs*, RadStream, int tall, int bal);

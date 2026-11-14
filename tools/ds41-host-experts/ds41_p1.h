@@ -69,7 +69,8 @@ inline int state() {
  *   T4 ranges  Expert e < n_expert owns the sorted slots [off[e], off[e+1]) (the live-tail ranges;
  *              off[n_expert] is the end of the rank's local slots). The slots [off[n_expert], T),
  *              which are routed to other ranks, are written as zeros by every call, whatever the
- *              marks. No weight pass is spent on them.
+ *              marks (but a call with kTailParam = 0, below, which leaves them as they are). No
+ *              weight pass is spent on them.
  *   T5 work    Work is spread over the grid by row passes, not by experts (lcpfast's balance), so
  *              one expert with 2,000 rows does not serialise a launch.
  *   T6 stream  The call only enqueues on the given stream. It reads the table and the offsets on the
@@ -303,6 +304,38 @@ inline int lend_slab_asked(const char* p1, const char* slab) {
 /* The same from the environment, read at each call (the planner's, once a plan). */
 inline int lend_slab_asked() { return lend_slab_asked(std::getenv(kEnv), std::getenv(kLendSlabEnv)); }
 
+/* ---- the register-tiled twin -------------------------------------------------------------------
+ *
+ * kTiledEnv: "1" beside kEnv puts the twin row's calls on libr4d's register-tiled kernel (r4d_ds41_mxfp4.hip,
+ * mx_p1t_kernel: a work item is 8 x 4 weight rows of one expert by a tile of 8 of its rows, K in chunks of 1024
+ * staged once a tile, so each weight block is decoded once for 8 rows instead of once for 2 or 3). Every output
+ * is the same sum, operation for operation, as the twin's and the decode band's (T1 unchanged; T2-T6 are the
+ * launcher's, unchanged). Unset, empty or "0": off (the twin's own kernel). The row keeps kTwinRow; libr4d names
+ * the form in the row's `computes` (kTiledMark), the core refuses the switch without P1, an invalid value, or a
+ * libr4d whose P1 row does not name it, and each rank says kLogTiled at startup. The window measures a Qt arm only
+ * on the libr4d.so its device check (kTiledCheckMode) passed on. */
+constexpr const char* kTiledEnv       = "RADIANCE_EXPERIMENTAL_DS41_P1_TILED";
+constexpr const char* kTiledMark      = "the register-tiled P1 twin";
+constexpr const char* kLogTiled       = "ds41 p1: register-tiled twin on, rank";   /* each rank, at startup */
+constexpr const char* kTiledCheckMode = "p1tiled";
+inline int tiled_state() {
+    static const int s = env_state(std::getenv(kTiledEnv));
+    return s;
+}
+
+/* ---- the tail filled once a layer --------------------------------------------------------------
+ *
+ * kTailOnceEnv: "1" beside kEnv makes the stager's wave relaunches of gate_up and down pass the twin's parameter
+ * kTailParam = 0, so they skip T4's tail fill ([off[n_expert], T) written as zeros, a launch of its own over the
+ * whole tail of other ranks' slots, every wave). The layer's own launch of each op (residents, every
+ * non-resident skipped) still fills it, earlier on the same stream into the same output over the same offsets,
+ * and no launch of the twin writes a slot at or past off[n_expert] (T3/T4), so the slots keep its zeros: the
+ * bytes after the layer are the same. Unset, empty or "0": off. Each rank says kLogTailOnce at startup and counts
+ * the fills skipped in its stats line. */
+constexpr const char* kTailOnceEnv  = "RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE";
+constexpr const char* kTailParam    = "p1_tail";
+constexpr const char* kLogTailOnce  = "ds41 p1: tail filled once a layer, rank";   /* each rank, at startup */
+
 /* ---- the device check (package K) --------------------------------------------------------------
  *
  *   HIP_VISIBLE_DEVICES=0 ds41_mxfp4_device_check LIBR4D.so p1 [MMAX] [ROUTES]
@@ -317,5 +350,12 @@ inline int lend_slab_asked() { return lend_slab_asked(std::getenv(kEnv), std::ge
  * and it exits 0 only on PASS. It also prints "p1 time:" lines (us an expert-row at M 256 / 1024 /
  * 2048, real routing, each form) for the window's log. */
 constexpr const char* kCheckMode = "p1";
+/*
+ *   HIP_VISIBLE_DEVICES=0 ds41_mxfp4_device_check LIBR4D.so p1tiled [MMAX] [ROUTES]
+ *
+ * The same with kTiledEnv=1 set too (the served twin the register-tiled kernel; the row table must name it): every
+ * check above on it, and both forms forced (r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_form) equal to the served call's
+ * bytes on every rows case, block, packed and skipped entries, at every M up to MMAX (4096). Its "p1 time:" lines
+ * time both forms. The last line is "p1tiled: PASS ..." or "p1tiled: FAIL ...". */
 
 }  /* namespace ds41p1 */

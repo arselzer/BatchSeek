@@ -37,6 +37,10 @@
 #      prefill pass in 4 into chain-<arm>, with Qd64 Ct16 Ctp2 both traces at their N into the same files;
 #      Ctp without P1 and Ctp0 are skipped with the reason; arms without the part do not set it; and
 #      chain_report.py's selftest (the --split classes on a synthetic prefill pass, old files as decode).
+#   8. Qt (the register-tiled P1 twin, ..._P1_TILED): qt_gate on synthetic logs (every rank's startup marker once
+#      with the part, none without it); in the arm loop the fast arm with Qt (and with Qsp-Qt) is launched with
+#      the switch at 1 and every other switch as the fast arm, every arm without the part states it 0, Qt without
+#      P1 is skipped, and without a passing p1tiled receipt every Qt arm is refused while the fast arm still runs.
 # Exit 0 when every check passes.
 set -u
 W=${1:-$(dirname "$0")/ab_window.sh}
@@ -242,6 +246,51 @@ qexpect 1 'Qsp no reduced work' "$T/qsp-full.log" 1 exit
 qexpect 1 'Qsp unrequested activation' "$T/qsp-good.log" '' start
 qexpect 0 'Qsp explicitly off' "$T/qsp-off.log" '' exit
 
+# Qt's startup gate: every rank's register-tiled marker once with the part, none without it.
+eval "$(sed -n '/^qt_gate() {/,/^}/p' "$W")"
+declare -F qt_gate >/dev/null || { echo "FAIL no qt_gate in $W"; exit 1; }
+: > "$T/qt-good.log"
+for rank in 0 1 2 3; do
+  echo "I[$rank] ds41 p1: register-tiled twin on, rank $rank (RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1): every P1 twin call of this rank on the register-tiled P1 twin, ..." >> "$T/qt-good.log"
+done
+sed '/rank 2 (/d' "$T/qt-good.log" > "$T/qt-missing.log"
+cat "$T/qt-good.log" "$T/qt-good.log" > "$T/qt-twice.log"
+: > "$T/qt-off.log"
+texpect() {
+  local want=$1 label=$2 rc; shift 2
+  qt_gate "$@" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$label"; else bad "$label: exit $rc, want $want"; fi
+}
+texpect 0 'Qt every-rank startup marker' "$T/qt-good.log" 1
+texpect 1 'Qt missing rank' "$T/qt-missing.log" 1
+texpect 1 'Qt marker twice a rank' "$T/qt-twice.log" 1
+texpect 1 'Qt unrequested activation' "$T/qt-good.log" ''
+texpect 0 'Qt explicitly off' "$T/qt-off.log" ''
+texpect 1 'Qt asked, no marker' "$T/qt-off.log" 1
+
+# Qz's gates: every rank's tail-once marker at startup, and at exit every rank's skipped wave fills above 0.
+eval "$(sed -n '/^qz_gate() {/,/^}/p' "$W")"
+declare -F qz_gate >/dev/null || { echo "FAIL no qz_gate in $W"; exit 1; }
+: > "$T/qz-good.log"
+for rank in 0 1 2 3; do
+  echo "I[$rank] ds41 p1: tail filled once a layer, rank $rank (RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=1): ..." >> "$T/qz-good.log"
+  echo "I[$rank] ds41 p1 stats, rank $rank: passes 3; wave tail fills skipped 412" >> "$T/qz-good.log"
+done
+sed '/rank 1 (/d' "$T/qz-good.log" > "$T/qz-missing.log"
+sed 's/skipped 412/skipped 0/' "$T/qz-good.log" > "$T/qz-idle.log"
+zexpect() {
+  local want=$1 label=$2 rc; shift 2
+  qz_gate "$@" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$label"; else bad "$label: exit $rc, want $want"; fi
+}
+zexpect 0 'Qz every-rank startup' "$T/qz-good.log" 1 start
+zexpect 0 'Qz every-rank skipped fills' "$T/qz-good.log" 1 exit
+zexpect 1 'Qz missing rank' "$T/qz-missing.log" 1 start
+zexpect 0 'Qz idle at startup' "$T/qz-idle.log" 1 start
+zexpect 1 'Qz no fill skipped' "$T/qz-idle.log" 1 exit
+zexpect 1 'Qz unrequested activation' "$T/qz-good.log" '' start
+zexpect 0 'Qz explicitly off' "$T/qt-off.log" '' exit
+
 # ---- the balance receipt: an old generic PASS is not requested-height evidence
 eval "$(sed -n '/^bal_receipt_bound() {/,/^}/p' "$W")"
 declare -F bal_receipt_bound >/dev/null || { echo "FAIL no bal_receipt_bound in $W"; exit 1; }
@@ -334,6 +383,13 @@ ARMS="$ARMS $FAST $SG8 $SGA8 $SG15 $SG16 $N2SG7 $N2SG8 $N8SG2 $SG0"
 ARMS="$ARMS $QD200 $QD4096 $QD16 $QDTB $QDNOP"
 ARMS="$ARMS $QY25 $QYF30 $QYNOQD $QYSG $QYV $QYAX $QY0 $QYTWO $QYNOP"
 ARMS="$ARMS $CTP $CTP2 $CTPNOP $CTP0"
+QT=$FAST-Qt
+QTQSP=$FAST-Qsp-Qt
+QTNOP=$REF-Qt
+QZ=$FAST-Qz
+QTQZ=$FAST-Qsp-Qt-Qz
+QZNOP=$REF-Qz
+ARMS="$ARMS $QT $QTQSP $QTNOP $QZ $QTQZ $QZNOP"
 run_loop() {   # actual balance-oracle bound; every model action remains stubbed
  (
   set +u
@@ -341,6 +397,7 @@ run_loop() {   # actual balance-oracle bound; every model action remains stubbed
   power_set() { :; }; power_restore() { :; }
   vpack_gate() { return 0; }
   arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; echo "  ARM_QD: ${ARM_QD:-}"; echo "  ARM_QY: ${ARM_QY:-}"; echo "  ARM_QYF: ${ARM_QYF:-}"; }
+  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; echo "  ARM_QD: ${ARM_QD:-}"; echo "  ARM_QT: ${ARM_QT:-}"; }
   HX_THREADS=16 SILU=/dev/null RHOME=$H RADIANCE_HOME_DIR2=$H MIRROR=$T
   PROMPTS=$T/prompts.json
   unset RADIANCE_TUNE
@@ -348,6 +405,8 @@ run_loop() {   # actual balance-oracle bound; every model action remains stubbed
   TALL_OK=1 TALL_WHY=test TALL_SUM=$SUM TALL_LIB=$LIB DK_OK=1 DK_WHY=test DK_SUM=$SUM DK_LIB=$LIB
   RB_OK=1 RB_WHY=test RB_SUM=$SUM RB_LIB=$LIB LCP_OK=1 LCP_WHY=test LCP_SUM=$SUM LCP_LIB=$LIB LCP_C=4096
   BAL_OK=1 BAL_WHY=test BAL_SUM=$SUM BAL_LIB=$LIB BAL_MAX_M=$1 P1_OK=1 P1_WHY=test P1_SUM=$SUM P1_LIB=$LIB
+  if [[ ${2:-} == no-p1t ]]; then P1T_OK="" P1T_WHY="no p1tiled check (test)" P1T_SUM="" P1T_LIB=""
+  else P1T_OK=1 P1T_WHY=test P1T_SUM=$SUM P1T_LIB=$LIB; fi
   OUT=$T/out; mkdir -p "$OUT"; CANCEL_FILE=/nonexistent/cancel; CANCEL=$CANCEL_FILE
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
@@ -356,6 +415,10 @@ run_loop() {   # actual balance-oracle bound; every model action remains stubbed
   eval "$(sed -n "${s},${e}p" "$W")"
 ) 2>&1
 }
+# Qsp's oracle line, as a passing `p1` device check writes it (the Qsp+Qt arm needs it).
+mkdir -p "$T/out"
+echo 'p1: PASS: moe_gemm_ggml_mxfp4_gemv_tall_p1 at M 17..4096: ... splits and full/span SwiGLU waves of 1-3 equal to one launch, also with the tail filled once (52 cases)' > "$T/out/devcheck-p1.log"
+echo 'p1tiled: PASS: moe_gemm_ggml_mxfp4_gemv_tall_p1 served on the register-tiled P1 twin at M 17..4096: ... equal to one launch, also with the tail filled once (54 cases)' > "$T/out/devcheck-p1tiled.log"
 out=$(run_loop 4096)
 echo "$out" > "$T/loop.txt"
 section() { awk -v a="ARM $1" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt"; }
@@ -546,6 +609,51 @@ qdskip "$CTP0" "Ctp0: CtpN takes a positive N.*skipped"
 if pyout=$(python3 -I "$(dirname "$W")/chain_report.py" --selftest 2>&1) && grep -q "^selftest ran" <<< "$pyout"; then
   ok "chain_report.py --selftest (the --split classes of a prefill pass)"
 else bad "chain_report.py --selftest: $(tail -5 <<< "$pyout")"; fi
+# ---- 5c. Qt in the arm loop: on the fast arm (and beside Qsp) the switch at 1 and every other switch as the fast
+# arm; every arm without the part states it 0; Qt without P1 skipped; with no p1tiled receipt every Qt arm refused.
+for a in "$QT" "$QTQSP"; do
+  sec=$(section "$a")
+  if [[ -z "$sec" ]]; then bad "the Qt arm $a was not launched: $(grep -m3 "arm $a" "$T/loop.txt")"; continue; fi
+  has "Qt" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_TILED 1
+  grep -qx "  ARM_QT: 1" <<< "$sec" && ok "Qt: the arm is gated on its startup markers (ARM_QT=1)" || bad "Qt: ARM_QT is '$(grep '  ARM_QT:' <<< "$sec")'"
+  for v in RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA \
+           RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS; do
+    has "Qt as the fast arm" "$sec" "$v" "$(val "$fast" "$v")"
+  done
+done
+has "Qsp+Qt" "$(section "$QTQSP")" RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN 1
+for a in "$REF" "$NEW" "$BIG" "$FAST" "$SG8" "$QD200"; do
+  has "no Qt part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_P1_TILED 0
+done
+qdskip "$QTNOP" "Qt needs P1; the arm is skipped"
+nop1t_out=$(run_loop 4096 no-p1t)
+if grep -qxF "ARM $QT" <<< "$nop1t_out"; then bad "a Qt arm launched without a p1tiled receipt"
+elif grep -qF "arm $QT: Qt refused: no p1tiled check (test)" <<< "$nop1t_out"; then ok 'Qt refused without a p1tiled receipt'
+else bad "no p1tiled refusal for arm $QT: $(grep -m1 "arm $QT: " <<< "$nop1t_out")"; fi
+grep -qxF "ARM $FAST" <<< "$nop1t_out" && ok 'the fast arm runs without a p1tiled receipt' || bad 'the fast arm needed a p1tiled receipt'
+
+# ---- 5d. Qz in the arm loop: alone and with Qsp-Qt on the fast arm, the switch at 1 (Qt's too in the second);
+# every arm without the part states it 0; Qz without P1 skipped; without the oracle's tail-once line refused.
+for a in "$QZ" "$QTQZ"; do
+  sec=$(section "$a")
+  if [[ -z "$sec" ]]; then bad "the Qz arm $a was not launched: $(grep -m3 "arm $a" "$T/loop.txt")"; continue; fi
+  has "Qz" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE 1
+  for v in RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA; do
+    has "Qz as the fast arm" "$sec" "$v" "$(val "$fast" "$v")"
+  done
+done
+has "Qsp+Qt+Qz" "$(section "$QTQZ")" RADIANCE_EXPERIMENTAL_DS41_P1_TILED 1
+has "Qsp+Qt+Qz" "$(section "$QTQZ")" RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN 1
+has "Qz alone" "$(section "$QZ")" RADIANCE_EXPERIMENTAL_DS41_P1_TILED 0
+for a in "$REF" "$FAST" "$QT" "$QD200"; do
+  has "no Qz part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE 0
+done
+qdskip "$QZNOP" "Qz needs P1; the arm is skipped"
+sed -i 's/, also with the tail filled once//' "$T/out/devcheck-p1.log"
+noz_out=$(run_loop 4096)
+if grep -qxF "ARM $QZ" <<< "$noz_out"; then bad "a Qz arm launched without the oracle's tail-once waves"
+elif grep -qF "arm $QZ: Qz needs the p1 oracle's tail-once waves" <<< "$noz_out"; then ok 'Qz refused without the tail-once oracle line'
+else bad "no tail-once refusal for arm $QZ: $(grep -m1 "arm $QZ: " <<< "$noz_out")"; fi
 
 short_out=$(run_loop 2048)
 for a in "$COLD4K" "$PC4K"; do

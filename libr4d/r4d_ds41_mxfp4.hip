@@ -1445,6 +1445,149 @@ __global__ __launch_bounds__(kMxThreads) void mx_vp2_kernel(MxGemvArgs A) {
     mx_vp2_body<RPW, MC, UF, FL>(A);
 }
 
+/* ================================================================== P1's register-tiled twin (p1t)
+ *
+ * RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1 beside P1 (r4d_ds41_tall.h): the P1 twin's calls on this kernel instead
+ * of mx_vp2_kernel's kVpP1 form. The twin decodes an expert's weights once for every pass of the rows whose whole
+ * K its LDS holds (two of gate_up's, three of down's), so at prefill heights it spends most of its time decoding
+ * the same weights again. Here a work item is (live expert, 8 RN of its weight rows, RM of its rows: a tile), a
+ * wave holds RN x RM sums in registers, and K goes in chunks of kP1tKc values (32 blocks, one a lane) staged once
+ * a chunk for the tile's RM rows: each weight block is decoded once for RM activation rows.
+ *
+ * Each output is the same sum as the decode band's, operation for operation: a chunk is one call of mx_vp2_rows
+ * (UF 1, the first form), the twin's own loads, decode and mx_vp2_unit arithmetic -- lane L's blocks L, L + 32, ...
+ * in increasing order (chunk c holds blocks 32c .. 32c + 31, so lane L's block of chunk c is 32c + L, after its
+ * blocks of the chunks before), a block's four groups of eight values in order, w = kv[nibble] * 2^(e - 128) from
+ * the same table and the same scale (block_mxfp4's byte, or the packed form's code or raw round), one rounded
+ * product and one rounded sum a value (-ffp-contract=off), then the same r4d_wave_sum, and lane 0's sum rounded
+ * once to bf16. RN and RM only choose which sums a wave carries at once; no sum is split, regrouped or reordered.
+ * A dropped slot stores 0.0f, a tile of dropped slots only stores its zeros (as kVpZero), and a marked entry whose
+ * header is not a packed [N, K] weight's gives NaN sums (mx_vp2_rows), as in every other form. The skip mark, the
+ * live-tail ranges and the T4 tail fill are the twin's (mx_moe's p1 branch). */
+constexpr int kP1tRn = 4, kP1tRm = 8;   /* weight rows a wave, activation rows a tile */
+constexpr int kP1tKc = 1024;            /* values a K chunk */
+constexpr int kP1tGrid = 1024;          /* blocks a call at most (the items are spread over them) */
+
+template <int RN, int RM>
+__device__ __forceinline__ void mx_p1t_body(const MxGemvArgs& A) {
+    static_assert(RN * RM == 32, "a wave's sums are stored one a lane");
+    R4D_DYN_LDS(r4d_u32x4, mx_lds);
+    __shared__ __attribute__((aligned(16))) float s_kv[16];   /* kMxValues: static, at a constant address */
+    __shared__ int s_nlive_v;
+    uint8_t* const mx_smem = (uint8_t*)mx_lds;
+    const int tid = (int)threadIdx.x, lane = tid & 31, wave = mx_uni(tid >> 5);
+    if (tid < 16) s_kv[tid] = kMxValues[tid];
+    const float* tab = s_kv;
+    int* const live_e = (int*)(mx_smem + A.live_off);
+    int* const live_s = live_e + A.n_expert;
+    int* const live_t = live_s + A.n_expert;
+    int* const tpre = (int*)(mx_smem + A.bal_off);   /* the live experts' tiles, a prefix (n_expert + 1 ints) */
+    float* const xs = (float*)(mx_smem + A.x_off);
+    /* The experts with rows, ascending, as mx_vp2_body's kVpP1 form finds them: an entry with the skip mark has
+     * none (no item, no store, no byte of it read past the entry itself). */
+    if (wave == 0) {
+        int cnt = 0;
+        for (int e0 = 0; e0 < A.n_expert; e0 += 128) {
+            int s[4], t[4];
+            bool sk[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int e = e0 + 32 * j + lane;
+                const int ec = e < A.n_expert ? e : A.n_expert - 1;
+                mx_vp2_range(A, ec, &s[j], &t[j]);
+                sk[j] = ((uintptr_t)A.wtab[ec] & 2u) != 0;
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int e = e0 + 32 * j + lane;
+                const bool nz = e < A.n_expert && t[j] > s[j] && !sk[j];
+                const uint32_t bal = __builtin_amdgcn_ballot_w32(nz);
+                if (nz) {
+                    const int at = cnt + __builtin_popcount(bal & ((1u << lane) - 1u));
+                    live_e[at] = e;
+                    live_s[at] = s[j];
+                    live_t[at] = t[j];
+                }
+                cnt += __builtin_popcount(bal);
+            }
+        }
+        if (lane == 0) s_nlive_v = cnt;
+    }
+    __syncthreads();
+    const int nlive = s_nlive_v;
+    if (tid == 0) {
+        tpre[0] = 0;
+        for (int j = 0; j < nlive; ++j) tpre[j + 1] = tpre[j] + (live_t[j] - live_s[j] + RM - 1) / RM;
+    }
+    __syncthreads();
+    constexpr int RG = kMxWaves * RN;   /* weight rows an item */
+    const int ncg = (A.N + RG - 1) / RG;
+    const int XRC = A.KC + A.KC / 8;
+    const int n_items = tpre[nlive] * ncg;
+    /* Item it: expert j's items are [tpre[j] ncg, tpre[j + 1] ncg), its groups of weight rows in turn and each
+     * group's tiles in turn, so the blocks launched together share weight rows and the expert's activation rows. */
+    for (int it = (int)blockIdx.x; it < n_items; it += (int)gridDim.x) {
+        const int g = it / ncg;
+        int lo = 0, hi = nlive;   /* the live expert whose tiles hold g: tpre[lo] <= g < tpre[lo + 1] */
+        while (hi - lo > 1) {
+            const int mid = (lo + hi) >> 1;
+            if (tpre[mid] <= g) lo = mid; else hi = mid;
+        }
+        const int li = lo, nt = tpre[li + 1] - tpre[li];
+        const int loc = it - tpre[li] * ncg, cg = loc / nt, tile = loc - cg * nt;
+        const int e = mx_uni(live_e[li]), rs = mx_uni(live_s[li]), re = mx_uni(live_t[li]);
+        /* Bit 0 of the entry marks a packed weight (block-uniform: one expert an item). */
+        const uint8_t* wb = mx_uni_ptr(A.wtab[e]);
+        const bool pk = ((uintptr_t)wb & 1u) != 0;
+        wb = (const uint8_t*)((uintptr_t)wb & ~(uintptr_t)1);
+        MxPk2 pv{};
+        if (pk) pv = mx_pk2_open(wb, A.N, A.K);
+        const int p0 = rs + tile * RM, mc = min(RM, re - p0);
+        const int n0 = cg * RG + wave * RN;
+        const int sr = lane % RN, sm = lane / RN;   /* the sum this lane stores: weight row n0 + sr, row p0 + sm */
+        uint32_t livem = 0;                          /* the tile's live rows (a dropped slot writes zeros) */
+        for (int m = 0; m < mc; ++m)
+            if (mx_vp2_tok(A, p0 + m) >= 0) livem |= 1u << m;
+        if (livem == 0) {   /* block-uniform: only dropped slots, whose rows are zeros in every form */
+            if (sm < mc && n0 + sr < A.N) mx_put(A.y + (long long)(p0 + sm) * A.y_ld + n0 + sr, 0.0f);
+            continue;
+        }
+        float acc[RN][RM];
+#pragma unroll
+        for (int r = 0; r < RN; ++r)
+#pragma unroll
+            for (int m = 0; m < RM; ++m) acc[r][m] = 0.0f;
+        for (int k0 = 0; k0 < A.K; k0 += A.KC) {   /* every wave takes part in the barriers */
+            const int k1 = min(k0 + A.KC, A.K);
+            lds_barrier();
+            mx_vp2_stage<RM>(A, xs, p0, mc, k0, k1, XRC, tid);
+            lds_barrier();
+            if (n0 < A.N)
+                mx_vp2_rows<RN, RM, 1, 0>(A, wb, pk, pv, xs, XRC, k0, k0 / 32, k1 / 32, n0, mc, lane, tab, acc);
+        }
+        if (n0 >= A.N) continue;   /* wave-uniform */
+        /* Every sum's butterfly, then lane 0's value of sum (r, m) stored by lane r + RN m (the decode band stores
+         * lane 0's). */
+        float mine = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RN; ++r)
+#pragma unroll
+            for (int m = 0; m < RM; ++m) {
+                if (m >= mc) continue;   /* wave-uniform */
+                const float v = r4d_wave_sum(acc[r][m]);
+                const float v0 = __uint_as_float((uint32_t)__builtin_amdgcn_readfirstlane((int)__float_as_uint(v)));
+                if (lane == r + RN * m) mine = v0;
+            }
+        if (sm < mc && n0 + sr < A.N)
+            mx_put(A.y + (long long)(p0 + sm) * A.y_ld + n0 + sr, ((livem >> sm) & 1u) ? mine : 0.0f);
+    }
+}
+
+template <int RN, int RM>
+__global__ __launch_bounds__(kMxThreads) void mx_p1t_kernel(MxGemvArgs A) {
+    mx_p1t_body<RN, RM>(A);
+}
+
 /* ================================================================== tiled (prefill) */
 constexpr int kTN = 128, kTP = 132;   /* tile columns (weight rows), LDS row floats of Ws */
 
@@ -1926,8 +2069,13 @@ constexpr int kP1Fill = 8;        /* items a block on average: a tail of small i
  * a block; item size and fill within 1.5% of each other from 96 KiB and 2 a block up). */
 constexpr int kP1Grid = 512;
 
+/* RADIANCE_EXPERIMENTAL_DS41_P1_TILED (r4d_ds41_tall.h): the P1 twin's served calls on mx_p1t_kernel. Read once (the
+ * row table states it at startup, r4d_rows.cpp). */
+bool mx_p1_tiled() { return r4d_ds41_p1_tiled(); }
+
 int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned long long* probe=nullptr,int force=-1,
-           bool vp=false, bool tall=false, int vpvar=-1, int balf=-1, bool p1=false, const MxP1Opts* po=nullptr) {
+           bool vp=false, bool tall=false, int vpvar=-1, int balf=-1, bool p1=false, const MxP1Opts* po=nullptr,
+           int p1t=-1) {
     if (!a || a->n_t < 5) return R4D_NO(RAD_E_INVAL);
     const RadTensor *A_ = r4d_opt(a, 0), *W = r4d_opt(a, 1), *so = r4d_opt(a, 2), *of = r4d_opt(a, 3),
                     *Y = r4d_opt(a, 4);
@@ -2009,6 +2157,13 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
     if (p1 && gemv && table && ty == MX_FP4) {
         if (probe || force >= 0) return R4D_NO(RAD_E_UNSUPPORTED);
         const MxP1Opts o = po ? *po : MxP1Opts{};
+        /* `p1t`: a checker's form for the call (0 the twin's kernel, 1 the register-tiled one); else the switch. */
+        const bool tiled = p1t >= 0 ? p1t == 1 : mx_p1_tiled();
+        /* `p1_tail` 0 (the card expert stager's wave relaunches under RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE): no
+         * tail fill this call. The layer's own launch of the same op, earlier on the stream into the same output
+         * over the same offsets, filled [off[n_expert], T) with zeros, and no call writes those slots (each writes
+         * only its experts' ranges, below off[n_expert]), so they still hold its zeros. Any other value: T4. */
+        const bool tail_fill = r4d_geti_or(a, "p1_tail", 1) != 0;
         MxGemvArgs A{};
         A.x = (const uint16_t*)A_->data; A.x_ld = x_ld;
         A.w = nullptr;
@@ -2017,6 +2172,27 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
         A.y = (uint16_t*)Y->data; A.y_ld = y_ld;
         A.sorted = (const int32_t*)so->data; A.off = (const int32_t*)of->data;
         A.M = (int)T; A.N = (int)N; A.K = (int)K;
+        if (tiled) {
+            /* mx_p1t_kernel: tiles of kP1tRm rows, K in chunks of kP1tKc staged for a tile's rows (no whole row is
+             * staged), 8 kP1tRn weight rows an item, the items spread over at most kP1tGrid blocks (`grid` a
+             * checker's count). Dynamic LDS: the live experts' records, the tile prefix, then a chunk's rows. */
+            A.XM = kP1tRm; A.XLM = 0; A.KC = kP1tKc; A.XR = 0;
+            A.n_expert = (int)ne; A.top_k = (int)top_k; A.a_sorted = a_sorted ? 1 : 0; A.AR = (int)AR;
+            A.live_end = 1;
+            A.x_al = mx_al16(A_->data, x_ld) ? 1 : 0;
+            A.live_off = kMxVp2Live;
+            A.bal_off = (int)(kMxVp2Live + mx_r16(12LL * ne));
+            A.x_off = (int)(A.bal_off + mx_r16(4LL * (ne + 1)));
+            const long long lds = A.x_off + (long long)kP1tRm * (kP1tKc + kP1tKc / 8) * 4;
+            const long long ncg = (N + kMxWaves * kP1tRn - 1) / (kMxWaves * kP1tRn);
+            const long long items = ((T + kP1tRm - 1) / kP1tRm + L) * ncg;   /* at least the live tiles' items */
+            const unsigned grid = o.grid > 0 ? (unsigned)(o.grid < 65535 ? o.grid : 65535)
+                                             : (unsigned)(items < kP1tGrid ? items : kP1tGrid);
+            const int rc = R4D_EMIT(s, (mx_p1t_kernel<kP1tRn, kP1tRm>), dim3(grid), dim3(kMxThreads), (unsigned)lds, A);
+            if (rc != RAD_OK || !tail_fill) return rc;
+            /* T4: the slots routed to other ranks, [off[ne], T), are zeros after every call. */
+            return mx_tail_zero(s, A.y, A.y_ld, A.off, A.n_expert, A.M, A.N, nullptr);
+        }
         A.XM = (int)(tokens < kMxXM ? (tokens < 1 ? 1 : tokens) : kMxXM);
         /* The staged rows' budget: the gemv's 36 KiB, except that where that holds a single whole row (gate_up's
          * K 5120) it holds two, so a pass decodes each weight block once for two activation rows (gate_up 26% less
@@ -2049,7 +2225,7 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
         const long long ub = A.XLM >= 1 ? K / 32 : A.KC / 32;   /* blocks of a row pass (whole, or a chunk) */
         const int uf = ub > 96 ? 5 : 3;
         const int rc = mx_launch_vp2_t<kVpSraw | kVpRoll | kVpZero | kVpP1>(s, mcx, uf, A, grid, (unsigned)lds);
-        if (rc != RAD_OK) return rc;
+        if (rc != RAD_OK || !tail_fill) return rc;
         /* T4: the slots routed to other ranks, [off[ne], T), are zeros after every call. */
         return mx_tail_zero(s, A.y, A.y_ld, A.off, A.n_expert, A.M, A.N, nullptr);
     }
@@ -2163,12 +2339,24 @@ extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_tall(const RadArgs* a, RadStream s) {
 extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1(const RadArgs* a, RadStream s) {
     return mx_moe(a, s, true, false, nullptr, -1, false, true, -1, -1, true);
 }
-/* Checker-only: the same with its work split forced for the call (r4d_ds41_mxfp4.h). */
+/* Checker-only: the P1 twin in form `form` for the call whatever RADIANCE_EXPERIMENTAL_DS41_P1_TILED says (0 the
+ * twin's kernel, mx_vp2_kernel's kVpP1 form; 1 the register-tiled mx_p1t_kernel), on `grid` blocks (0 the
+ * launcher's choice), so a check holds the two to each other and to the decode band byte for byte and times both. */
+extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_form(const RadArgs* a, RadStream s, int form, int grid) {
+    if (form < 0 || form > 1 || grid < 0) return RAD_E_INVAL;
+    MxP1Opts o;
+    o.grid = grid;
+    return mx_moe(a, s, true, false, nullptr, -1, false, true, -1, -1, true, &o, form);
+}
+/* Checker-only: 1 when the served P1 twin takes the register-tiled kernel (the switch, read once), else 0. */
+extern "C" int r4d_ds41_p1_tiled_on() { return mx_p1_tiled() ? 1 : 0; }
+/* Checker-only: the same with its work split forced for the call (r4d_ds41_mxfp4.h), always on the twin's own kernel
+ * (mx_vp2_kernel's kVpP1 form), whatever RADIANCE_EXPERIMENTAL_DS41_P1_TILED says. */
 extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_opts(const RadArgs* a, RadStream s, int grid, int item_kib,
                                                         int fill, int lds_kib) {
     MxP1Opts o;
     o.grid = grid; o.item_kib = item_kib; o.fill = fill; o.lds_kib = lds_kib;
-    return mx_moe(a, s, true, false, nullptr, -1, false, true, -1, -1, true, &o);
+    return mx_moe(a, s, true, false, nullptr, -1, false, true, -1, -1, true, &o, 0);   /* the twin's own kernel */
 }
 /* Checker-only: the gemv row (`tall` 0, up to 16 tokens) or the twin (`tall` 1) with
  * RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE forced off (`bal` 0) or on (1) for this call, whatever the
