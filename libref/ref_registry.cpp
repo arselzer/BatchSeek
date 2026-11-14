@@ -2699,7 +2699,7 @@ SIMPLE("ref_embed_lookup", "embed_lookup", "vocab", "embedding gather", DT_FLOAT
 SIMPLE("ref_embed_lookup_q", "embed_lookup_q", "vocab", "embedding gather, one scale for the table",
        DT_ANY, ref_embed_lookup_q),
 ROW_OWN("ref_embed_lookup_planes", "embed_lookup_planes", "vocab", "embedding gather from a table's affine planes in place",
-        "i8 u8 i4 u4 codes, any float scale and table, per operand", ref_embed_lookup_planes),
+        "i8 u8 i4 u4 fp8_e4m3 fp8_e5m2 codes, any float scale and table, per operand", ref_embed_lookup_planes),
 ROWL("ref_logits_gemm", "logits_gemm", "vocab", "the lm_head projection",
      DT_FLOAT ", or a head of E4M3 / int8 codes with a scale plane, joined",
      ref_check_dtypes, ref_logits_gemm, ref::ref_layout_head),
