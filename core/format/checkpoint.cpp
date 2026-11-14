@@ -246,6 +246,9 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
          * spelled `deepseek41` as llama.cpp's GGUF spells it, so one plugin serves the release
          * and a GGUF of it. */
         if (out->arch == "deepseekv41") out->arch = "deepseek41";
+        /* Gemma 4 12B (`gemma4_unified`): its text model is Gemma 4's, served by the gemma4
+         * plugins; `model_type` tells them apart. */
+        if (out->arch == "gemma4unified") out->arch = "gemma4";
     }
     if (const char* nm = gs("_name_or_path")) out->name = nm;
 

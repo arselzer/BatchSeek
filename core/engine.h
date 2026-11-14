@@ -214,6 +214,7 @@ private:
     std::vector<const char*> meta_kv_kp_, meta_kv_vp_;
 
     void (*arch_step_)(RadCtx*, const RadBatch*) = nullptr;
+    uint64_t (*arch_pass_key_)(RadCtx*, const RadBatch*, const int32_t*) = nullptr;
 
     int load_plugins();
     int read_metadata();
@@ -338,6 +339,11 @@ private:
      * copies are freed, because the holder that leaves last deletes the file. */
     std::vector<TableShare> table_shares_;
     std::vector<std::pair<const void*, void*>> table_copy_of_;
+    /* --ngram-placement disk=DIR: the table's own file, mapped read-only in place of the
+     * container's range (table_file_map); unmapped in ~Engine. */
+    std::vector<TableCopy> table_files_;
+    std::vector<const void*> table_file_src_;   /* the container address each of table_files_ replaces */
+    int table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** out, std::string* why);
     /* --expert-profile: the decode ranking loaded once, before any rank plans, and handed to every
      * rank's planner in place of the container's activation profile. */
     std::vector<RadFileProfile> expert_profile_;

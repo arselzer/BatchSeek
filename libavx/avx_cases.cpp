@@ -139,6 +139,7 @@ std::vector<Case> build_cases() {
     for (const char* dt : { "f32", "bf16" }) {
         add("hc_enter",  { HI("M", 5), HI("n", 128), HI("hc", 4), HS("dtype", dt) });
         add("swiglu_clamped", { HI("M", 5), HI("n", 259), HF("limit", 0.5), HS("dtype", dt) });
+        add("swiglu_step", { HI("M", 5), HI("n", 259), HF("limit", 0.5), HS("dtype", dt) });
         if (!std::strcmp(dt, "bf16"))
             add("dsa_pool", { HI("M", 7), HI("n", 128), HI("ratio", 4), HS("dtype", "bf16") });
         if (!std::strcmp(dt, "bf16"))
@@ -165,6 +166,13 @@ std::vector<Case> build_cases() {
               HF("hc_eps", 1e-6), HI("chunk", 129), HS("dtype", dt) });
         add("mhc_post", { HI("M", 3), HI("n", 129), HI("hc", 4), HS("dtype", dt) });
         add("mhc_contract", { HI("M", 3), HI("n", 129), HI("hc", 4), HS("dtype", dt) });
+        for (int norm : { 0, 1 })
+            add("router_sigmoid_group_topk",
+                { HI("M", 5), HI("n_expert", 512), HI("top_k", 8), HI("n_group", 8),
+                  HI("topk_group", 4), HI("norm", norm), HF("route_scale", 2.5), HS("dtype", dt) });
+        add("mla_attn_paged", { HI("M", 5), HI("heads", 3), HI("latent_dim", 64), HI("rope_dim", 16),
+                                HI("block_size", 4), HF("scale", 0.0721687836), HI("ctx", 23),
+                                HS("dtype", dt) });
         add("mla_attn", { HI("M", 3), HI("latent_dim", 32), HI("heads", 2), HI("blocks", 7),
                           HI("block_size", 4), HF("scale", 0.125), HS("dtype", dt) });
         for (const char* mode : { "prefill", "verify" })
@@ -372,6 +380,13 @@ std::vector<Case> build_cases() {
                                     HI("block_size", 16), HI("causal", 1), HI("window", window),
                                     HS("q_dtype", dt), HS("kv_dtype", dt), HF("scale", 0.125),
                                     HI("max_ctx", 128), HI("n_head", 8), HI("max_seqs", 2) });
+    /* One anchor a sequence (DSpark's drafter): a window of 8 measured from the first query row. */
+    for (const char* dt : { "f32", "bf16" })
+        for (int qlen : { 1, 17 })
+            add("attn_paged_anchor_window", { HI("q_len", qlen), HI("head_dim", 64), HI("gqa", 4),
+                                              HI("block_size", 16), HI("causal", 1), HI("window", 8),
+                                              HS("q_dtype", dt), HS("kv_dtype", dt), HF("scale", 0.125),
+                                              HI("max_ctx", 128), HI("n_head", 8), HI("max_seqs", 2) });
     /* The tree form over the same shapes (its described parents are ordinary rows, -2). */
     for (const char* dt : { "f32", "bf16" })
         for (int qlen : { 1, 17 })
@@ -783,6 +798,13 @@ std::vector<Case> build_cases() {
                            HI("n_vocab", 300), HI("anchor_stride", 1), HS("dtype", "bf16") });
     add("dflash_select", { HI("M", 5), HI("steps", 3), HI("top_k", 12), HI("rank", 37),
                            HI("n_vocab", 97), HI("anchor_stride", 2), HS("dtype", "bf16") });
+    /* DSpark's full-vocabulary walk: a ragged last tile (V % 64), rank 37 not whole vectors. */
+    for (const char* op : { "dflash_markov_greedy", "dflash_markov_greedy_f32" }) {
+        add(op, { HI("M", 3), HI("steps", 4), HI("rank", 64), HI("n_vocab", 300),
+                  HI("anchor_stride", 1), HS("dtype", "bf16") });
+        add(op, { HI("M", 2), HI("steps", 3), HI("rank", 37), HI("n_vocab", 97),
+                  HI("anchor_stride", 2), HS("dtype", "bf16") });
+    }
     /* The same lattices grown into trees: more nodes than steps, and fewer. */
     add("dflash_tree", { HI("M", 3), HI("steps", 4), HI("top_k", 8), HI("rank", 64),
                          HI("n_vocab", 300), HI("anchor_stride", 1), HI("nodes", 6),

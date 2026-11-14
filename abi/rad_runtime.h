@@ -68,8 +68,10 @@ typedef struct RadKVGroupBatch {
     int64_t     state_index_pitch;
     int64_t     block_size;
     int64_t     max_blocks;
-    /* Null unless this group streams (RadKVStream). Trailing and zero-defaulted. */
+    /* Null unless this group streams (RadKVStream). */
     const RadKVStream* stream;
+    /* ABI 35: host mirror of seqused, retained through this batch for exact sliced-launch bounds. */
+    const int32_t* seqused_h;
 } RadKVGroupBatch;
 
 typedef struct RadBatch {
@@ -330,6 +332,30 @@ typedef struct RadBatch {
     /* A shape generator's pass (rad_declare_shape_generator; `gen` is one of its
      * RAD_GEN_PASS_S*): its payload. Null on every other step. */
     const struct RadShapeGenBatch* sgen_b;
+
+    /* ---- appended in ABI 34: host-side max seqused per entry of kv[], for an architecture's
+     * optional recorded-pass geometry key. Null when the batch has no host summary. */
+    const int32_t* kv_used_max_h;
+    /* ABI 35: host mirror of positions, for a one-sequence prefill op whose exact KV bound is the
+     * position immediately after its first query piece. Valid through the batch's issue pass. */
+    const int32_t* positions_h;
+    /* ---- appended in ABI 35 (runs read both ways) */
+    /* The runs of a trunk pass whose rows attend to each other both ways
+     * (RadEncoderDecl::bidirectional): a picture's or a video frame's placeholders inside one
+     * sequence's chunk. The pass attends them causally like every other row; the plugin attends a
+     * run's rows again without the causal bound, over the keys before `bidi_used` (the position
+     * after the run's last token), in place of that result. The scheduler ends no chunk inside such
+     * a run, so its keys are this pass's or, after a prefix hit, the cache's; a run longer than any
+     * step is cut where its chunk ends, and that chunk's rows see the run up to the cut.
+     *
+     * host: n_bidi and, per run, its first row in this pass, its rows and the index of its sequence
+     * in the per-sequence arrays; device: [n_bidi] the keys a run's rows see. 0 runs on every other
+     * pass. */
+    int64_t        n_bidi;
+    const int32_t* bidi_row;           /* host */
+    const int32_t* bidi_n;             /* host */
+    const int32_t* bidi_seq;           /* host */
+    const int32_t* bidi_used;          /* device */
 
     /* ---- appended (private; RAD_ABI_VERSION does not move): the exact consumer-suffix skip
      * (rad_declare_consumer_suffix in rad_builder.h, core/sched/consumer_skip.h). Trailing and
@@ -935,6 +961,9 @@ int             rad_kv_stage_layer(RadCtx* c, rad_kvgroup group, const RadKVGrou
 int             rad_kv_stage_next(RadCtx* c, rad_kvgroup group, int layer);
 int             rad_rank(RadCtx* c);
 int             rad_world_size(RadCtx* c);
+/* Workgroups the current rank's card can run concurrently (HIP multiProcessorCount on RDNA;
+ * 32 on the host backend or when the backend has no positive count). */
+int             rad_ctx_wgp_count(RadCtx* c);
 RadStream       rad_stream(RadCtx* c);
 
 /* The routing result for a MoE layer, resolved on device against the current residency table.

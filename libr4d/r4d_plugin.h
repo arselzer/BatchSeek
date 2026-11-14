@@ -185,9 +185,22 @@ int     r4d_rad_attn_window_h512_gqa4_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h512_gqa4_fp8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h512_gqa8_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h512_gqa8_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h512_gqa16_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h512_gqa16_fp8 (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_window_h128_scratch(const RadArgs*);
 int64_t r4d_rad_attn_window_h256_scratch(const RadArgs*);
 int64_t r4d_rad_attn_window_h512_scratch(const RadArgs*);
+#define R4D_ATTN_ANCHOR_DECL(HD, G)                                                              \
+    int r4d_rad_attn_anchor_window_h##HD##_gqa##G##_bf16kv(const RadArgs*, RadStream);            \
+    int r4d_rad_attn_anchor_window_h##HD##_gqa##G##_fp8kv(const RadArgs*, RadStream);
+R4D_ATTN_ANCHOR_DECL(128, 1)
+R4D_ATTN_ANCHOR_DECL(256, 1) R4D_ATTN_ANCHOR_DECL(256, 2) R4D_ATTN_ANCHOR_DECL(256, 4)
+R4D_ATTN_ANCHOR_DECL(256, 8)
+R4D_ATTN_ANCHOR_DECL(512, 1) R4D_ATTN_ANCHOR_DECL(512, 2) R4D_ATTN_ANCHOR_DECL(512, 4)
+R4D_ATTN_ANCHOR_DECL(512, 8)
+#undef R4D_ATTN_ANCHOR_DECL
+int     r4d_rad_dflash_markov_greedy(const RadArgs*, RadStream);
+int     r4d_rad_dflash_markov_greedy_f32(const RadArgs*, RadStream);
 /* attn_paged_qrow_tree (docs/OPS.md): the h256/gqa2 split-KV decode and the windowed kernels with a
  * tree verify's mask from operand 8, `spec_parent`. */
 int     r4d_rad_attn_qrow_tree_decode_h256_gqa2_fp8 (const RadArgs*, RadStream);
@@ -198,6 +211,13 @@ int     r4d_rad_attn_qrow_tree_decode_h256_gqa2_bf16(const RadArgs*, RadStream);
 R4D_WIN_TREE_DECL(256, 1) R4D_WIN_TREE_DECL(256, 2) R4D_WIN_TREE_DECL(256, 4) R4D_WIN_TREE_DECL(256, 8)
 R4D_WIN_TREE_DECL(512, 1) R4D_WIN_TREE_DECL(512, 2) R4D_WIN_TREE_DECL(512, 4) R4D_WIN_TREE_DECL(512, 8)
 #undef R4D_WIN_TREE_DECL
+/* attn_paged_ahead and attn_paged_qrow_ahead (docs/OPS.md): the windowed kernels with a non-causal
+ * window that bounds the keys behind only. */
+#define R4D_WIN_AHEAD_DECL(HD, G)                                                                 \
+    int r4d_rad_attn_window_ahead_h##HD##_gqa##G##_bf16(const RadArgs*, RadStream);               \
+    int r4d_rad_attn_window_ahead_h##HD##_gqa##G##_fp8 (const RadArgs*, RadStream);
+R4D_WIN_AHEAD_DECL(256, 1) R4D_WIN_AHEAD_DECL(256, 2) R4D_WIN_AHEAD_DECL(256, 4) R4D_WIN_AHEAD_DECL(256, 8)
+#undef R4D_WIN_AHEAD_DECL
 /* dflash_tree (r4d_dflash_tree_bf16.hip): dflash_select's lattice grown best-first into a tree. */
 int     r4d_rad_dflash_tree(const RadArgs*, RadStream);
 /* The top-1 of a row of all-gathered (id, value) pairs, written one id a row: the vocab-sharded
@@ -421,6 +441,7 @@ int r4d_rad_gdn_recurrent_update(const RadArgs*, RadStream);
 /* gdn_conv_update folded into the recurrent update's prologue for the decode shape; q/k/v are
  * never written (r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip). */
 int r4d_rad_gdn_conv_recurrent_update(const RadArgs*, RadStream);
+int r4d_rad_gdn_conv_recurrent_update_had(const RadArgs*, RadStream);
 int r4d_rad_gdn_gated_rmsnorm   (const RadArgs*, RadStream);
 int r4d_rad_dflash_conv         (const RadArgs*, RadStream);
 int r4d_rad_dflash_select       (const RadArgs*, RadStream);
@@ -607,6 +628,9 @@ int r4d_rad_gemm_i8a8_m16  (const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_i8a8_m16_scratch(const RadArgs*);
 int r4d_rad_logits_gemm_i8(const RadArgs*, RadStream);
 int r4d_rad_logits_gemm_iqr(const RadArgs*, RadStream);
+/* `logits_gemm_vocab`: the head as width classes of the vocabulary's rows (r4d_logits_vocab.hip). */
+int r4d_rad_logits_gemm_vocab(const RadArgs*, RadStream);
+int64_t r4d_rad_logits_gemm_vocab_scratch(const RadArgs*);
 int r4d_rad_logit_rerank_iqr(const RadArgs*, RadStream);
 int r4d_rad_gemm_i8a8_tiled(const RadArgs*, RadStream);
 int r4d_rad_gemm_i8a8_rb8_tiled(const RadArgs*, RadStream);
@@ -614,6 +638,8 @@ int r4d_rad_gemm_i8a8_rb32_tiled(const RadArgs*, RadStream);
 /* The IQR weights, decoded from their codes where they are read (r4d_gemm_iqr.hip). */
 int r4d_rad_gemm_iqr_m64(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_iqr_m64_scratch(const RadArgs*);
+int r4d_rad_gemm_iqr_gated(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_iqr_gated_scratch(const RadArgs*);
 int r4d_rad_gemm_iqr_tiled(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_iqr_tiled_scratch(const RadArgs*);
 int r4d_rad_quant_act_i8g(const RadArgs*, RadStream);
@@ -627,6 +653,7 @@ int r4d_rad_gated_quant_fp8 (const RadArgs*, RadStream);
 int r4d_rad_gated_had_quant_fp8(const RadArgs*, RadStream);
 int r4d_rad_gated_had_quant_i8g(const RadArgs*, RadStream);
 int r4d_rad_gate_quant_fp8  (const RadArgs*, RadStream);
+int r4d_rad_gate_had_quant_i8g(const RadArgs*, RadStream);
 int r4d_rad_gram_accum      (const RadArgs*, RadStream);
 /* The same accumulator over a plain bf16 activation, no scale operand. */
 int r4d_rad_gram_accum_bf16 (const RadArgs*, RadStream);
@@ -660,6 +687,7 @@ R4D_HOOKS(fp8_block)
 R4D_HOOKS(i8_block)
 R4D_HOOKS(iqr)
 R4D_HOOKS(iqr_logits)
+R4D_HOOKS(iqr_vocab)
 R4D_HOOKS(fp8_logits)
 R4D_HOOKS(i8_logits)
 R4D_HOOKS(hc_e4m3)
@@ -823,6 +851,7 @@ int r4d_rad_logit_softcap   (const RadArgs*, RadStream);
 int r4d_rad_scale           (const RadArgs*, RadStream);
 int r4d_rad_silu_mul        (const RadArgs*, RadStream);
 int r4d_rad_swiglu_clamped(const RadArgs*, RadStream);
+int r4d_rad_swiglu_step(const RadArgs*, RadStream);
 int r4d_rad_swiglu_clamped_quant_fp8(const RadArgs*, RadStream);
 int r4d_rad_dsa_pool(const RadArgs*, RadStream);
 int r4d_shape_dsa_pool(const RadParam*, int, int, RadOpdDesc*);
@@ -841,12 +870,17 @@ int r4d_shape_mla_project(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_dsa_score(const RadArgs*, RadStream);
 int r4d_shape_dsa_score(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_mla_attn(const RadArgs*, RadStream);
+int r4d_rad_mla_attn_paged(const RadArgs*, RadStream);
+int r4d_shape_mla_attn_paged(const RadParam*, int, int, RadOpdDesc*);
 int64_t r4d_rad_mla_attn_scratch(const RadArgs*);
+int64_t r4d_rad_mla_attn_paged_scratch(const RadArgs*);
 int r4d_rad_mla_attn_matrix(const RadArgs*, RadStream);
 int64_t r4d_rad_mla_attn_matrix_scratch(const RadArgs*);
 int r4d_rad_mla_attn_rows(const RadArgs*, RadStream);
 int r4d_shape_mla_attn(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_router_sigmoid_topk(const RadArgs*, RadStream);
+int r4d_rad_router_sigmoid_group_topk(const RadArgs*, RadStream);
+int r4d_shape_router_sigmoid_group_topk(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_router_sigmoid_topk(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_router_sigmoid_topk_scatter(const RadArgs*, RadStream);
 int r4d_rad_moe_scatter_inv(const RadArgs*, RadStream);
@@ -1009,6 +1043,8 @@ int r4d_shape_qsa_work           (const RadParam*, int, int operand, RadOpdDesc*
 int r4d_shape_dflash_conv    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_dflash_select  (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_dflash_observe (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_dflash_markov  (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_dflash_markov_f32(const RadParam*, int, int operand, RadOpdDesc*);
 
 /* -- declared fusions (r4d_fuse.cpp, pure host) --
  *
@@ -1030,6 +1066,7 @@ int r4d_fuse_router_sigmoid_topk_scatter(const RadParam*, int, uint64_t, int, Ra
 int r4d_fuse_gate_quant_fp8      (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gemm_nt_q_gated     (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gemm_nt_q_gated_mx  (const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_gemm_nt_q_gated_iqr (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gdn_conv_recurrent_update(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qk_norm_rope_gate_kv_store(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qkv_norm_rope_kv_store(const RadParam*, int, uint64_t, int, RadFuseStep*);

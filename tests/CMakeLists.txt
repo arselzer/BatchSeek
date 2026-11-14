@@ -30,7 +30,7 @@ set(RAD_TESTS_NO_CORE kv_growth_test arch_test glm5next_test nemotron35_test map
                       ds41_prefetch_plan_test ds41_consumer_skip_arch_test consumer_skip_test
                       ds41_dspark_fp8_arch_test ds41_tbo_arch_test ds41_dspark_defer_arch_test
                       ds41_shape_probe_arch_test ds41_work_rows_arch_test ds41_ar_rows_arch_test ds41_ag_rows_arch_test
-                      aux_share_test aux_online_test)
+                      aux_share_test aux_online_test spark25_arch_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and
@@ -182,6 +182,9 @@ string(APPEND RAD_PERF_SCRIPT "include([==[${CMAKE_CURRENT_SOURCE_DIR}/perf_entr
 set(RAD_TESTS_WHOLE_CORE shipped_plugins_test)
 
 file(GLOB RAD_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
+if(NOT RAD_HIP_FOUND)
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/dspark_device_test\\.cpp$")
+endif()
 foreach(t ${RAD_TESTS})
   get_filename_component(n ${t} NAME_WE)
   if(n IN_LIST RAD_TESTS_NO_CORE)
@@ -279,16 +282,28 @@ foreach(t ${RAD_TESTS})
   if(n STREQUAL "mem_test")
     set_target_properties(${n} PROPERTIES ENABLE_EXPORTS ON)
   endif()
-  if(DEFINED RAD_TEST_SHARDS_${n})
-    math(EXPR last "${RAD_TEST_SHARDS_${n}} - 1")
-    foreach(k RANGE ${last})
-      rad_unit_test(${n}_shard${k} ${n} --shard ${k}/${RAD_TEST_SHARDS_${n}})
-    endforeach()
+  if(n STREQUAL "dspark_device_test")
+    if(RAD_HIP_FOUND AND TARGET libr4d)
+      add_dependencies(${n} libr4d)
+      add_test(NAME ${n} COMMAND ${n} ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
+      set_tests_properties(${n} PROPERTIES
+        LABELS gpu
+        SKIP_RETURN_CODE 77
+        TIMEOUT ${RAD_TEST_TIMEOUT}
+        ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+    endif()
   else()
-    rad_unit_test(${n} ${n})
+    if(DEFINED RAD_TEST_SHARDS_${n})
+      math(EXPR last "${RAD_TEST_SHARDS_${n}} - 1")
+      foreach(k RANGE ${last})
+        rad_unit_test(${n}_shard${k} ${n} --shard ${k}/${RAD_TEST_SHARDS_${n}})
+      endforeach()
+    else()
+      rad_unit_test(${n} ${n})
+    endif()
+    string(APPEND RAD_PERF_SCRIPT
+           "rad_perf_entry(${n} [==[${t}]==] [==[${CMAKE_BINARY_DIR}/tests/${n}]==])\n")
   endif()
-  string(APPEND RAD_PERF_SCRIPT
-         "rad_perf_entry(${n} [==[${t}]==] [==[${CMAKE_BINARY_DIR}/tests/${n}]==])\n")
 endforeach()
 
 # host_expert_pool_test again with RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=1: every case on
@@ -350,6 +365,11 @@ if(TARGET spechub)
   add_dependencies(sample_test spechub)
 endif()
 
+if(TARGET spark25_recipe_test)
+  target_compile_definitions(spark25_recipe_test PRIVATE
+    RAD_SPARK25_RECIPE_DIR="${CMAKE_SOURCE_DIR}/data/recipes")
+endif()
+
 # ================================================================== whole models on the CPU
 #
 # engine_e2e_test runs the radiance binary on tiny synthetic checkpoints (tests/tiny_model.h) on
@@ -361,12 +381,14 @@ set(RAD_E2E_DEPS radiance rad-convert libref libquant nemotron35_embed qwen35_bf
 if(TARGET libavx)
   list(APPEND RAD_E2E_DEPS libavx)
 endif()
-foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test)
+foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spark25_convert_test)
   if(TARGET ${t})
     target_compile_definitions(${t} PRIVATE
       RAD_E2E_SERVER="$<TARGET_FILE:radiance>" RAD_E2E_CONVERT="$<TARGET_FILE:rad-convert>"
       RAD_E2E_HOME="${RAD_PLUGIN_OUT}" RAD_E2E_RECIPES="${CMAKE_SOURCE_DIR}/data/recipes")
-    if(t STREQUAL "clef_decision_test")
+    if(t STREQUAL "spark25_convert_test")
+      add_dependencies(${t} rad-convert libref spark25_bf16)
+    elseif(t STREQUAL "clef_decision_test")
       # The tiny clef's golden (tests/mkclefgolden.py) and the one plugin a clef container selects.
       target_compile_definitions(${t} PRIVATE
         RAD_CLEF_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/data/golden/clef_tiny.json")
@@ -1042,6 +1064,12 @@ find_program(RAD_PYTHON3 NAMES python3)
 if(RAD_PYTHON3)
   add_test(NAME rad_export_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/rad_export_test.py)
   set_tests_properties(rad_export_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+  add_test(NAME spark25_validation_test
+           COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/spark25_validation_test.py)
+  set_tests_properties(spark25_validation_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+  add_test(NAME dspark_qos_regression_test
+           COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/dspark_qos_regression_test.py)
+  set_tests_properties(dspark_qos_regression_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
 endif()
 
 # ================================================================== the shipped plugins, out of tree

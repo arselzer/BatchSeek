@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 # VERSION is the server release that /version reports. The plugin ABI version is separate and is
 # read from abi/rad_abi.h below.
-project(radiance VERSION 1.16.0 LANGUAGES C CXX)
+project(radiance VERSION 1.17.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,6 +20,7 @@ set(RAD_WITH_FFMPEG "AUTO" CACHE STRING
     "ON | OFF | AUTO -- decode image, video and audio parts with libavformat/libavcodec/libswscale/libswresample")
 set_property(CACHE RAD_WITH_FFMPEG PROPERTY STRINGS ON OFF AUTO)
 option(RAD_BUILD_TESTS "Build the test suite"                            ON)
+option(RAD_ENABLE_KV_ROLLBACK_TEST_HOOK "Compile the test-only device KV rollback observer" OFF)
 option(RAD_ASAN        "Build host code with AddressSanitizer and UBSan"  OFF)
 option(RAD_TSAN        "Build host code with ThreadSanitizer"             OFF)
 # LLVM 24's VOPD pairing is not repeatable unless patched (docker/llvm-vopd-pairing.patch); when

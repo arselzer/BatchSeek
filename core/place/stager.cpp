@@ -867,11 +867,18 @@ int FileStager::start(int32_t li, RadStream s) {
             n_expert = (int32_t)n;
         }
     }
+    /* A read can also deposit units into the pool (Mover::stage_file_units under a dynamic plan),
+     * published settled at their pool slots. Upstream 1.17 (PR #390) waits on every read that
+     * issued a copy; a read that only deposited sets neither staged nor promoted below, so the
+     * compute stream is ordered behind its copies here. */
+    const uint64_t deposits0 = mover_->stats().ssd_deposits;
     const int rc = mover_->stage_file_units(layers_[(size_t)li].units, buf_[b], cap_,
                                             free_rec_[b] ? free_[b] : nullptr, done_[b],
                                             &staged_[b], &skipped_[b], ecnt, n_expert,
                                             &promoted_[b], cache_policy);
     if (rc < 0) return rc;
+    if (staged_[b].empty() && promoted_[b].empty() && mover_->stats().ssd_deposits != deposits0)
+        RAD_TRY(rad_event_wait(s, done_[b]));
     partial_[b] = false;
     pending_[b] = !staged_[b].empty() || !promoted_[b].empty();
     if (!staged_[b].empty() || !promoted_[b].empty()) holds_[b] = li;
@@ -4612,6 +4619,11 @@ int FileStager::operands(rad_op h, RadStream s, const RadTensor* t, int n_t) {
 }
 
 int FileStager::finish(int32_t b, RadStream s) {
+    /* A read the pass never reached (a read-ahead past where it ended) may still have admitted
+     * units into the hot cache or deposited them into the pool, whose publications outlive the
+     * buffer: order the stream behind those copies before anything later reads them (upstream
+     * 1.17's FileStager::finish). The layer being issued was waited on at its first op. */
+    if (pending_[b] && holds_[b] != cur_) RAD_TRY(rad_event_wait(s, done_[b]));
     RAD_TRY(rad_event_record(free_[b], s));
     free_rec_[b] = true;
     mover_->unstage_units(staged_[b]);

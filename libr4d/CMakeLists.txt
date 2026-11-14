@@ -163,6 +163,7 @@ set(R4D_UNITS
   "r4d_gemm_fp8a8|"
   "r4d_gemm_iqr|"
   "r4d_iqr_embed|"
+  "r4d_logits_vocab|"
   "r4d_quant_act_fp8|"
   "r4d_givens_rotate|"
   "r4d_fused_quant_fp8|"
@@ -204,6 +205,7 @@ set(R4D_UNITS
   "r4d_lora_bf16|"
   "r4d_dflash_conv_t2_g16_bf16|"
   "r4d_dflash_select_bf16|"
+  "r4d_dflash_markov_bf16|"
   "r4d_dflash_tree_bf16|"
   # Routed MoE: router, scatter, the grouped block-scaled fp8 GEMM and gather, in one unit because
   # the other three only feed the GEMM.

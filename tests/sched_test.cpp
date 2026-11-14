@@ -2298,6 +2298,7 @@ TEST(a_mixed_step_has_the_right_boundaries_and_slot_mapping) {
     CHECK_EQ(g0.block_table[128], btb[0]);
     CHECK_EQ(g0.seqused[0], 101);
     CHECK_EQ(g0.seqused[1], 64);
+    CHECK_EQ(s2->kv_used_max_h[0], std::max(g0.seqused[0], g0.seqused[1]));
 
     /* The linear group is per sequence, not per token: every token of a sequence maps to its one
      * state instance, and the block table row is that slot. */
@@ -7510,8 +7511,18 @@ TEST(a_preempted_ring_sequence_replays_its_output_a_token_a_step) {
      * nothing. */
     int64_t at = 0;
     for (int k = 0; k < 8 && at < 160; ++k) {
-        REQUIRE(f.sch.step() != nullptr);
+        const RadBatch* chunk = f.sch.step();
+        REQUIRE(chunk != nullptr);
         REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
+        const RadKVGroupBatch& paged = chunk->kv[0];
+        REQUIRE(paged.seqused_h != nullptr);
+        REQUIRE(chunk->positions_h != nullptr);
+        CHECK_EQ(paged.seqused_h[0], paged.seqused[0]);
+        CHECK_EQ(chunk->positions_h[0], chunk->positions[0]);
+        int32_t used_max = 0;
+        for (int64_t i = 0; i < chunk->n_seq; ++i)
+            used_max = std::max(used_max, paged.seqused[i]);
+        CHECK_EQ(chunk->kv_used_max_h[0], used_max);
         CHECK_EQ(f.sch.plan().e[0].ctx_len, at);
         at += f.sch.plan().e[0].n_tokens;
         CHECK(at <= 160);
@@ -7523,6 +7534,11 @@ TEST(a_preempted_ring_sequence_replays_its_output_a_token_a_step) {
     /* The replayed output token on its own, which samples the next. */
     const RadBatch* rb = f.sch.step();
     REQUIRE(rb != nullptr);
+    CHECK_EQ(rb->kv_used_max_h[0], rb->kv[0].seqused[0]);
+    REQUIRE(rb->kv[0].seqused_h != nullptr);
+    REQUIRE(rb->positions_h != nullptr);
+    CHECK_EQ(rb->kv[0].seqused_h[0], rb->kv[0].seqused[0]);
+    CHECK_EQ(rb->positions_h[0], rb->positions[0]);
     CHECK_EQ(f.sch.plan().e[0].ctx_len, 160);
     CHECK_EQ(f.sch.plan().e[0].n_tokens, 1);
     CHECK(f.sch.plan().e[0].produces_token);
@@ -7604,6 +7620,121 @@ TEST(media_rows_are_staged_by_chunk_at_the_tokens_that_take_them) {
             f.sch.serial_end(0);
         }
         f.commit_plain();
+    }
+}
+
+/* ================================================================== runs read both ways */
+/* A picture whose placeholders the model reads both ways (RadEncoderDecl::bidirectional) is never
+ * cut by a chunk: the chunk ends before it on the quantum (64 here, the linear group's chunk), or,
+ * starting at it, runs past its end, and the pass names the run's rows and the keys they see
+ * (RadBatch::n_bidi). Tokens 200..299 here; without the flag the first chunk would end at the
+ * checkpoint interval (256), inside the picture. A run longer than any step is cut where its chunk
+ * falls, and its rows then see the run up to the cut. An audio clip is read causally and cut
+ * anywhere. */
+namespace {
+
+std::unique_ptr<Request> with_run(Fixture& f, int n_prompt, int tok, int n, mm::Kind kind) {
+    auto item = std::make_shared<mm::Item>();
+    item->kind = kind;
+    item->n_seg = 1;
+    item->seg_rows = n;
+    item->encoded = true;
+    item->embd.assign((size_t)n * 4, 0);
+    auto req = f.request(n_prompt, 4);
+    req->media = std::make_shared<mm::PromptMedia>();
+    req->media->items.push_back(mm::Placed{ item, tok - 1 });
+    mm::RopeLayout::Run run;
+    run.tok = tok; run.n = n; run.w = n; run.base = tok; run.shift = 0; run.item = 0; run.flat = true;
+    req->media->rope.runs.push_back(run);
+    return req;
+}
+
+void media_fixture(Fixture& f, int64_t max_tok, int32_t bidi) {
+    f.build(/*blocks=*/4096, /*states=*/64, max_tok);
+    f.prog.encoder.modalities = RAD_MM_IMAGE;
+    f.prog.encoder.n_embd = 4;
+    f.prog.encoder.patch_dim = 4;
+    f.prog.encoder.merge = 1;
+    f.prog.encoder.max_patches = 1024;
+    f.prog.encoder.bidirectional = bidi;
+}
+
+}  /* namespace */
+
+TEST(a_run_read_both_ways_is_never_cut_by_a_chunk) {
+    Fixture f;
+    media_fixture(f, 256, 1);
+    CHECK_OK(f.start());
+    f.add(with_run(f, 400, 200, 100, mm::Kind::Image));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_tok, (int64_t)192);
+    CHECK_EQ(b->n_bidi, (int64_t)0);
+    f.commit_plain();
+    b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_tok, (int64_t)128);                  /* 192 .. 319, past the run's end */
+    REQUIRE_EQ(b->n_bidi, (int64_t)1);
+    CHECK_EQ(b->bidi_row[0], 8);
+    CHECK_EQ(b->bidi_n[0], 100);
+    CHECK_EQ(b->bidi_seq[0], 0);
+    CHECK_EQ(b->bidi_used[0], 300);
+    CHECK_EQ(b->n_mm_rows, (int64_t)100);
+    f.commit_plain();
+    b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_tok, (int64_t)64);                   /* to the tail checkpoint, text only */
+    CHECK_EQ(b->n_bidi, (int64_t)0);
+
+    /* bidi_fit itself: inside the run, from before it, from its start, and with too small a
+     * budget (wait) or a run no step holds (cut as it falls). */
+    auto r = with_run(f, 400, 200, 100, mm::Kind::Image);
+    CHECK_EQ(f.sch.bidi_fit(*r, 0, 400, 256, 256), 192);
+    CHECK_EQ(f.sch.bidi_fit(*r, 0, 400, 192, 256), 192);
+    CHECK_EQ(f.sch.bidi_fit(*r, 192, 400, 64, 256), 128);
+    CHECK_EQ(f.sch.bidi_fit(*r, 192, 400, 64, 100), 0);
+    CHECK_EQ(f.sch.bidi_fit(*r, 0, 250, 250, 256), 250);   /* the sequence ends inside it */
+    auto big = with_run(f, 800, 200, 400, mm::Kind::Image);
+    CHECK_EQ(f.sch.bidi_fit(*big, 192, 800, 64, 256), 64);
+    /* Two video frames, <eoi><boi> apart: back past both, or on past both. */
+    auto vid = with_run(f, 400, 100, 70, mm::Kind::Video);
+    mm::RopeLayout::Run second = vid->media->rope.runs[0];
+    second.tok = 172;
+    vid->media->rope.runs.push_back(second);
+    CHECK_EQ(f.sch.bidi_fit(*vid, 0, 400, 200, 256), 64);
+    CHECK_EQ(f.sch.bidi_fit(*vid, 64, 400, 64, 256), 192);
+    CHECK_EQ(f.sch.bidi_fit(*vid, 64, 400, 64, 128), 0);
+}
+
+TEST(a_run_longer_than_a_step_is_cut_and_reads_up_to_the_cut) {
+    Fixture f;
+    media_fixture(f, 256, 1);
+    CHECK_OK(f.start());
+    f.add(with_run(f, 800, 200, 400, mm::Kind::Image));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_tok, (int64_t)192);
+    f.commit_plain();
+    b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_tok, (int64_t)64);
+    REQUIRE_EQ(b->n_bidi, (int64_t)1);
+    CHECK_EQ(b->bidi_row[0], 8);
+    CHECK_EQ(b->bidi_n[0], 56);
+    CHECK_EQ(b->bidi_used[0], 256);
+}
+
+TEST(runs_are_cut_anywhere_without_the_flag_and_for_audio) {
+    for (int k = 0; k < 2; ++k) {
+        Fixture f;
+        media_fixture(f, 256, k == 0 ? 0 : 1);
+        CHECK_OK(f.start());
+        f.add(with_run(f, 400, 200, 100, k == 0 ? mm::Kind::Image : mm::Kind::Audio));
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        CHECK_EQ(b->n_tok, (int64_t)256);
+        CHECK_EQ(b->n_bidi, (int64_t)0);
+        CHECK_EQ(b->n_mm_rows, (int64_t)56);
     }
 }
 
@@ -12793,4 +12924,59 @@ TEST(dspark_bank_a_restored_prefix_leaves_the_drafter_to_catch_up_from_the_resto
         CHECK_EQ(r.f.sch.find(a)->n_computed, 384 + 128);
         r.covers(s, a, 384, 512);
     }
+}
+
+/* A recycled slot keeps its struct: add_locked only allocates when the slot's pointer is null, so
+ * every field it does not list survives from the request before. admitted_us is the one such field
+ * with no backstop where it is read -- the prefill figure is computed from it whenever it is
+ * non-zero, and a stamp left by an earlier request is always older, so the interval is inflated and
+ * reads as a slow prefill rather than as missing data. Admission cannot precede arrival, so
+ * prefill_s may never exceed ttft_s: that is the invariant that catches a stamp carried over from
+ * another request. */
+TEST(a_recycled_slot_does_not_carry_the_previous_request_s_admission) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(8, 4);
+    REQUIRE(a != 0);
+    for (int i = 0; i < 80 && f.sch.find(a)->state != ReqState::Finished; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    REQUIRE_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+
+    /* The slot A held, read while its row is still published. The whole case rests on B landing
+     * in this same slot: if the reap ever defers, or the free list is pre-populated, B gets a
+     * fresh struct, the stale stamp is gone by construction, and the invariant below would hold
+     * with the bug unpatched. So the precondition is asserted rather than trusted. */
+    int slot_a = -1;
+    {
+        std::vector<Scheduler::ReqStat> st(8);
+        const int n = f.sch.requests(st.data(), 8);
+        for (int j = 0; j < n; ++j) if (st[(size_t)j].id == a) slot_a = st[(size_t)j].slot;
+    }
+    REQUIRE(slot_a >= 0);
+    CHECK_OK(f.sch.reap(a));
+
+    /* A's slot is on the free list, so B takes the slot and the struct that came with it. */
+    const uint64_t b = f.submit(8, 4);
+    REQUIRE(b != 0);
+    for (int i = 0; i < 80; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+        std::vector<Scheduler::ReqStat> st(8);
+        const int n = f.sch.requests(st.data(), 8);
+        for (int j = 0; j < n; ++j) {
+            if (st[(size_t)j].id != b) continue;
+            if (st[(size_t)j].ttft_s < 0) break;   /* no first token yet */
+            /* Both figures describe this request alone, so prefill -- admission to first token --
+             * is bounded by ttft, arrival to first token. */
+            CHECK_EQ(st[(size_t)j].slot, slot_a);   /* the reuse this case is about */
+            CHECK(st[(size_t)j].prefill_s >= 0);
+            CHECK(st[(size_t)j].prefill_s <= st[(size_t)j].ttft_s);
+            return;
+        }
+    }
+    CHECK(!"the second request never reached its first token");
 }

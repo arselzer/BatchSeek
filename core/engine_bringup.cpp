@@ -519,6 +519,35 @@ int Engine::copy_table(const RadFile& owner,const uint8_t* src, int64_t n, int64
     return RAD_OK;
 }
 
+/* --ngram-placement disk=DIR: the container's [src, src + n) at file offset `foff` read from its own
+ * file, DIR/ngram-<id>.bin (the table's bytes and nothing else, the id table_share_id's: the
+ * container's path, size and mtime and the table's place in it). The first start fills it from the
+ * container through a temporary name and renames it, so a file under the real name is complete; a
+ * later start checks samples of it against the container. Mapped read-only in place of the
+ * container's range, which is all the disk gather needs: it finds the file behind the mapping and
+ * reads it directly (libavx avx_ngram.cpp, table_file). */
+int Engine::table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** out,
+                           std::string* why) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string id = table_share_id(file_->path(), foff, n);
+    if (id.empty()) {
+        *why = fmt("the container %s cannot be stat'ed, which names the table's file", file_->path());
+        return RAD_E_IO;
+    }
+    const std::string& dir = cfg_.ngram_disk_dir;
+    const std::string path = dir + (dir.back() == '/' ? "" : "/") + "ngram-" + id + ".bin";
+    TableCopy c;
+    bool filled = false;
+    const int rc = table_file_open(*file_, src, n, foff, path, &c, &filled, why);
+    if (rc != RAD_OK) return rc;
+    table_files_.push_back(c);
+    RAD_INFO("placement: n-gram table read from %s (%s%s, %.1f s)", path.c_str(), humanb(n).c_str(),
+             filled ? ", filled from the container" : "",
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    *out = c.base;
+    return RAD_OK;
+}
+
 /* When --ngram-placement auto chose a pinned copy for a card and it could not be made, move the
  * gather to the host. Every rank's n-gram weights take the host site, in both the WeightInfo
  * Ctx::init reads and the plan, so the gather and its scale move together; a copy already
@@ -1041,6 +1070,7 @@ int Engine::load_plugins() {
 
     const Plugin* ap = rad_tools_registry().plugin(plugins_.arch_plugin);
     arch_step_ = ap ? ap->arch_step : nullptr;
+    arch_pass_key_ = ap ? ap->arch_pass_key : nullptr;
     return RAD_OK;
 }
 
@@ -3474,6 +3504,26 @@ int Engine::load_weights() {
                                "rows are read from the container%s", into, why.c_str(),
                                card ? " by the host gather" : ""));
                 }
+                /* --ngram-placement disk=DIR: the table's own file instead of the container. */
+                if (cfg_.ngram_resolved == TablePlacement::Disk && !cfg_.ngram_disk_dir.empty() &&
+                    is_ngram_table(r->program, (rad_weight)i) && n >= kTableShareMin) {
+                    void* m = nullptr;
+                    for (size_t k = 0; k < table_files_.size() && !m; ++k)
+                        if (table_file_src_[k] == w.host_ptr) m = table_files_[k].base;
+                    std::string why;
+                    if (!m) {
+                        const int fs = table_file_map((const uint8_t*)w.ptr, n, (int64_t)p0.offset,
+                                                      &m, &why);
+                        if (fs != RAD_OK) {
+                            RAD_ERR("--ngram-placement disk=%s: '%s': %s",
+                                    cfg_.ngram_disk_dir.c_str(), w.name.c_str(), why.c_str());
+                            return fs;
+                        }
+                        table_file_src_.push_back(w.host_ptr);
+                    }
+                    w.ptr = m;
+                    w.host_ptr = m;
+                }
                 /* No readahead on a mapped weight: a host kernel gathers a few rows from a table
                  * too large to be resident, so the default 128 KiB readahead would read 32 pages
                  * for a row of a few hundred bytes. MADV_RANDOM is per range, so the rest of the
@@ -4556,6 +4606,7 @@ int Engine::start() {
         /* Null for all-in-VRAM: the mover never runs and lookup uses WeightInfo::ptr. */
         d.residency   = r->plan.strategy == Strategy::AllVram ? nullptr : r->mover.residency();
         d.arch_step   = arch_step_;
+        d.arch_pass_key = arch_pass_key_;
         d.profile_ops = cfg_.profile_ops;
         d.row_prefetch = cfg_.row_prefetch;
         d.tape_dump   = cfg_.debug_tape_dump;
@@ -4904,10 +4955,16 @@ int Engine::start() {
                      : fmt("%s --gpu-headroom-mib", humanb(want).c_str());
         if (room < allowance) {
             const int64_t raise_mib = (allowance - room + MiB - 1) / MiB;
+            const int64_t need_head = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) + raise_mib;
+            const std::string fix = cfg_.gpu_memory_mib > 0
+                ? fmt("Set --gpu-memory-mib to at most %lld: what is left here falls with it one "
+                      "for one.",
+                      (long long)(props.vram_bytes / MiB - need_head))
+                : fmt("Set --gpu-headroom-mib to at least %lld: what is left here rises with it "
+                      "one for one.", (long long)need_head);
             RAD_WARN("card %d settled at %s free against %s, which leaves %s for a kernel's first "
                      "launch to load its code object and size its scratch in -- under the %s this "
-                     "engine allows for its own. %s Set --gpu-headroom-mib to at least %lld: what "
-                     "is left here rises with it one for one.",
+                     "engine allows for its own. %s %s",
                      r->device, humanb(got).c_str(), asked.c_str(),
                      humanb(std::max<int64_t>(room, 0)).c_str(), humanb(allowance).c_str(),
                      got < want
@@ -4915,7 +4972,7 @@ int Engine::start() {
                                "another process on it or an allocation the budget does not "
                                "count.", humanb(want - got).c_str()).c_str()
                          : "",
-                     (long long)(std::max<int64_t>(cfg_.gpu_headroom_mib, 0) + raise_mib));
+                     fix.c_str());
         } else if (got < want) {
             RAD_INFO("card %d settled at %s free against %s: %s of the headroom was taken after "
                      "the budget read the card, by another process on it or an allocation the "

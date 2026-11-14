@@ -952,6 +952,13 @@ typedef struct RadEncoderDecl {
      * position tables or kernels are per geometry; the core ends a pass where the grid changes.
      * 0 packs segments of any grid into a pass. */
     int32_t     one_grid;
+
+    /* ---- appended in ABI 32 (runs the language model reads both ways) */
+    /* 1: the language model attends the placeholders of one picture or video frame to each other
+     * both ways (Gemma 4's use_bidirectional_attention "vision"), text before and after them
+     * causally. The core then ends no prefill chunk inside such a run and states each trunk pass's
+     * runs (RadBatch::n_bidi). 0 for an audio encoder. */
+    int32_t     bidirectional;
 } RadEncoderDecl;
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d);
@@ -1999,6 +2006,12 @@ int         rad_arch_declare(RadBuilder* b, const RadModelMeta* meta, const RadB
 struct RadCtx;
 struct RadBatch;
 void        rad_arch_step(struct RadCtx* c, const struct RadBatch* batch);
+/* Optional. Return a stable fingerprint of actual dispatch geometry whose grid depends on live
+ * per-group seqused values. `kv_used_max_h[g]` is the host maximum for batch->kv[g], and
+ * rad_ctx_wgp_count(c) supplies the device's WGP count. Return 0 when exact geometry is unknown;
+ * that pass runs live and is not recorded. */
+uint64_t    rad_arch_pass_key(struct RadCtx* c, const struct RadBatch* batch,
+                              const int32_t* kv_used_max_h);
 
 #ifdef __cplusplus
 }   /* extern "C" */
