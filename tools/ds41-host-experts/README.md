@@ -92,14 +92,14 @@ tools/ds41-host-experts/batch_client.py questions.jsonl answers.jsonl --concurre
 
 **Expected throughput** (whole batch, client wall time, four cards, hybrid decode at 60%, `--max-seq-len 4096` and
 the tiled prefill twin `Qsp-Qt-Qz`, replies byte-identical to the base engine's; window ab-20261115T070032Z, the
-512-stream row from ab-20261113T123110Z without the tiled twin):
+512-stream row from ab-20261115T114758Z):
 
 | Job | Plain engine | Preset | Decode, all streams |
 |---|---:|---:|---:|
 | 256 BIRD Mini-Dev questions (public; 11 SQLite databases; replies <= 512 tokens) | 1,025 s | 179 s | 157 tok/s |
 | 256 text-to-SQL questions over shared schemas (private set, ~1K-token prompts, 128-token replies) | 911 s | 250 s | 203 tok/s |
 | 128 of the same at 128 streams | 539 s | 150 s | 134 tok/s |
-| 512 longer questions of the same kind at 512 streams (`--streams 512`) | - | 734 s | 252 tok/s |
+| 512 longer questions of the same kind at 512 streams (`--streams 512`) | - | 677 s | 256 tok/s |
 
 The BIRD replies score 59.6% execution accuracy against BIRD's reference results on the real databases, the same
 with and without the optimizations (they are byte-identical). Prefill runs at about 380 tok/s of computed (not
