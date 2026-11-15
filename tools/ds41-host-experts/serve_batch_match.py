@@ -25,7 +25,8 @@ RESERVE = "RADIANCE_EXPERIMENTAL_DS41_RAM_RESERVE_MIB"
 HYBRID = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID"
 ADAPT = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT"
 P1_SWITCHES = (("--tiled", "RADIANCE_EXPERIMENTAL_DS41_P1_TILED"), ("--tail-once", "RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE"),
-               ("--swiglu-span", "RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN"))   # Qt, Qz, Qsp
+               ("--swiglu-span", "RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN"),   # Qt, Qz, Qsp
+               ("--engram-early", "RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY"))    # Ee (the harness sets it only when on)
 
 
 def resolve(words):
