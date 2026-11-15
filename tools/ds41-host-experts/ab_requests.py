@@ -123,6 +123,10 @@ def request_timeout():
 
 # DeepSeek-V4.1's chat tokens, as the held-out prompts use them.
 BOS, USER, ASSISTANT, END_THINK = 0, 128803, 128804, 128822
+SYSTEM, THINK = 128799, 128821
+# The official V4.1 encoding's thinking mode (work/dsml/ds41-chat.jinja): this system line, and <think> after the last
+# <|Assistant|> instead of </think>.
+THINKING_SYSTEM = ("Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n")
 _eos = {}
 
 
@@ -151,7 +155,7 @@ def eos_id(url):
     return _eos[url]
 
 
-def chat_prompt(turns, url, replies, sent_back=None, system=None):
+def chat_prompt(turns, url, replies, sent_back=None, system=None, thinking=False):
     """The token ids of a chat_turns conversation (see the module's docstring). `replies`: earlier
     requests' rows by name. For each reply sent back, `sent_back` gets {from, ids, generated}: the
     reply text's own token count against the tokens the server generated for it. Equal counts
@@ -160,10 +164,15 @@ def chat_prompt(turns, url, replies, sent_back=None, system=None):
     re-tokenization changed them and the chain parts there. `system`: a system prompt (the
     request's chat_system), right after BOS, where the official encoding puts it."""
     ids = [BOS]
-    if system:
+    if thinking:
+        if system:
+            raise ValueError("thinking with a chat_system: the official encoding has one system line")
+        ids += [SYSTEM] + tokenize(url, THINKING_SYSTEM)
+    elif system:
         ids += tokenize(url, system)
     for i, t in enumerate(turns):
-        ids += [USER] + tokenize(url, t["user"]) + [ASSISTANT, END_THINK]
+        last = i + 1 == len(turns)
+        ids += [USER] + tokenize(url, t["user"]) + [ASSISTANT, THINK if (thinking and last) else END_THINK]
         if "assistant" in t:
             ids += tokenize(url, t["assistant"]) + [eos_id(url)]
         elif "assistant_from" in t:
@@ -196,6 +205,7 @@ def framed(b, url, prompt_ids=None):
             raise ValueError("a chat_turns request: its prompt needs the earlier replies (one())")
         body.pop("chat_turns")
         body.pop("chat_system", None)
+        body.pop("thinking", None)
         body["prompt"] = prompt_ids
     if os.environ.get("AB_MAX_TOKENS"):
         body["max_tokens"] = int(os.environ["AB_MAX_TOKENS"])
@@ -216,7 +226,7 @@ def one(b, url, replies=None, timeout=600.0):
     if "chat_turns" in b["request"]:
         try:
             prompt_ids = chat_prompt(b["request"]["chat_turns"], url, replies or {}, sent_back,
-                                     b["request"].get("chat_system"))
+                                     b["request"].get("chat_system"), bool(b["request"].get("thinking")))
         except Exception as e:  # recorded, the next request still runs
             print("%s: ERROR building the prompt: %r" % (b["name"], e), flush=True)
             return {"name": b["name"], "family": family(b), "wall_s": 0.0, "text": None, "timings": {},
