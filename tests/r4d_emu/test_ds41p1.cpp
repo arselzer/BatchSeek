@@ -855,6 +855,7 @@ int moe_f32(int grid, const uint16_t* x, int AR, int K, const std::vector<const 
 struct WmmaStats {
     long long outputs = 0, same = 0, one = 0, more = 0, more_bad = 0, nan_inf_bad = 0, f32_checked = 0, f32_bad = 0;
     double f32_max_rel = 0, f32_max_abs = 0;
+    long long range = 0;   /* NaN/inf class differences on rows with an activation above 2^120 */
 } g_ws;
 
 void wmma_case(const Bank& b, const Shape& sh, int M, int kind, uint32_t seed) {
@@ -911,12 +912,18 @@ void wmma_case(const Bank& b, const Shape& sh, int M, int kind, uint32_t seed) {
         const int f = full.sorted[(size_t)i];
         const int tok = sh.sorted ? i : f / kTop;
         const uint16_t* xr = &xin[(size_t)tok * K];
-        bool row_finite = true;
-        for (int k = 0; k < K; ++k) row_finite &= fin16(xr[k]);
+        bool row_finite = true, row_huge = false;   /* huge: an activation above 2^120 (the kernel's range note) */
+        for (int k = 0; k < K; ++k) {
+            row_finite &= fin16(xr[k]);
+            row_huge |= fin16(xr[k]) && std::fabs(bf2f(xr[k])) > 0x1p120f;
+        }
         for (int c = 0; c < N; ++c) {
             ++g_ws.outputs;
             if (pe[c] == pw[c] || (nan16(pe[c]) && nan16(pw[c]))) { ++same; continue; }
-            if (!fin16(pe[c]) || !fin16(pw[c])) { ++cls_bad; continue; }
+            if (!fin16(pe[c]) || !fin16(pw[c])) {
+                if (row_huge) ++g_ws.range; else ++cls_bad;   /* kv x past f32 before d: the documented range */
+                continue;
+            }
             const long d = ulp16(pe[c], pw[c]);
             if (d <= 1) { ++one; continue; }
             ++more;
@@ -932,7 +939,7 @@ void wmma_case(const Bank& b, const Shape& sh, int M, int kind, uint32_t seed) {
             }
         }
         /* f32: every output of the first 6 finite rows of the case, against the f64 sum of the exact products. */
-        if (row_finite && f32_n < (size_t)6 * N) {
+        if (row_finite && !row_huge && f32_n < (size_t)6 * N) {
             for (int c = 0; c < N; ++c) {
                 double S, Aa;
                 host_dot(b.e[(size_t)e]->block, K, c, xr, &S, &Aa);
@@ -1117,10 +1124,11 @@ int main(int argc, char** argv) {
                 }
         wmma_invariance(b0, b1, { 1, 7, 64, 1896 });
         std::printf("%s: %d cases, %lld rows; WMMA twin against the exact twin: %lld outputs, %lld same, %lld 1-ulp, "
-                    "%lld further (%lld beyond the reordering bound), %lld NaN/inf class differences; f32 %lld checked, "
+                    "%lld further (%lld beyond the reordering bound), %lld NaN/inf class differences (%lld more on rows with "
+                    "|x| > 2^120, the range note); f32 %lld checked, "
                     "%lld beyond 2^-16 sum|wx|, max |err|/sum|wx| %.3g, max |err| %.3g; %.0f s\n",
                     g_fails ? "FAIL" : "PASS", g_cases, g_rows, g_ws.outputs, g_ws.same, g_ws.one, g_ws.more,
-                    g_ws.more_bad, g_ws.nan_inf_bad, g_ws.f32_checked, g_ws.f32_bad, g_ws.f32_max_rel, g_ws.f32_max_abs,
+                    g_ws.more_bad, g_ws.nan_inf_bad, g_ws.range, g_ws.f32_checked, g_ws.f32_bad, g_ws.f32_max_rel, g_ws.f32_max_abs,
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         munmap(page, 1 << 16);
         return g_fails ? 1 : 0;

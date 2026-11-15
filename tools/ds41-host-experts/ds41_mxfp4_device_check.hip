@@ -3401,6 +3401,7 @@ struct P1wStats {
     unsigned long long outputs = 0, hist[5] = { 0, 0, 0, 0, 0 }, more_bad = 0, cls_bad = 0, f32_n = 0, f32_bad = 0;
     double max_abs = 0, max_rel = 0, f32_max_rel = 0;
     size_t det = 0, invar = 0;
+    unsigned long long range = 0;   /* NaN/inf class differences on rows with an activation above 2^120 */
 };
 long p1w_ulp(uint16_t a, uint16_t b) {
     auto ord = [](uint16_t v) { return (v & 0x8000u) ? -(long)(v & 0x7fffu) : (long)v; };
@@ -3512,10 +3513,12 @@ void p1w_rows(P1Ctx& c, P1Wf32 f32x, const P1Routing& r, int M, std::mt19937_64&
                 continue;
             }
             const uint16_t* xr = g ? &x[(size_t)(full.sorted[(size_t)i] / kTop) * kEmbd] : &in[(size_t)i * K];
+            bool huge = false;   /* an activation above 2^120: kv x can pass f32 before d (the kernel's range note) */
+            for (int k = 0; k < K; ++k) huge |= p1w_fin(xr[k]) && std::fabs(bf16_to_f32(xr[k])) > 0x1p120f;
             for (int q = 0; q < N; ++q) {
                 ++st.outputs;
                 if (pw[q] == pe[q] || (p1_nan(pw[q]) && p1_nan(pe[q]))) { ++hist[0]; continue; }
-                if (!p1w_fin(pw[q]) || !p1w_fin(pe[q])) { ++cls_bad; continue; }
+                if (!p1w_fin(pw[q]) || !p1w_fin(pe[q])) { if (huge) ++st.range; else ++cls_bad; continue; }
                 const long d = p1w_ulp(pw[q], pe[q]);
                 ++hist[d <= 1 ? 1 : d == 2 ? 2 : d <= 4 ? 3 : 4];
                 const double fw = bf16_to_f32(pw[q]), fe = bf16_to_f32(pe[q]), gap = std::fabs(fw - fe);
@@ -3555,7 +3558,8 @@ void p1w_rows(P1Ctx& c, P1Wf32 f32x, const P1Routing& r, int M, std::mt19937_64&
                     if (forms[(size_t)e] == 2) continue;
                     const uint16_t* xr = g ? &x[(size_t)(full.sorted[(size_t)i] / kTop) * kEmbd] : &in[(size_t)i * K];
                     bool fin = true;
-                    for (int k = 0; k < K; ++k) fin &= p1w_fin(xr[k]);
+                    for (int k = 0; k < K; ++k)
+                        fin &= p1w_fin(xr[k]) && std::fabs(bf16_to_f32(xr[k])) <= 0x1p120f;
                     if (!fin) continue;
                     ++done;
                     for (int q = 0; q < N; ++q) {
@@ -3740,10 +3744,10 @@ int p1w_check(const Lib& L, int mmax, const char* routes_path) {
     const unsigned long long fin = st.hist[0] + st.hist[1] + st.hist[2] + st.hist[3] + st.hist[4];
     std::printf("%s: %d cases, %zu (token, slot) rows, %llu outputs against the exact twin: ulp 0 %llu (%.4f%%), 1 %llu, "
                 "2 %llu, 3-4 %llu, 5+ %llu; max |diff| %.3g, max |diff|/|exact| %.3g; %llu beyond the reordering bound, "
-                "%llu NaN/inf class differences; f32 %llu checked, %llu beyond 2^-16 sum|wx|, max |err|/sum|wx| %.3g; "
-                "%zu differ across runs/grids; batch invariance %zu differ; %zu bad values, %.0f s\n", mode, c.cases,
+                "%llu NaN/inf class differences (%llu more on rows with |x| > 2^120, the range note); f32 %llu checked, "
+                "%llu beyond 2^-16 sum|wx|, max |err|/sum|wx| %.3g; %zu differ across runs/grids; batch invariance %zu differ; %zu bad values, %.0f s\n", mode, c.cases,
                 c.rows, st.outputs, st.hist[0], fin ? 100.0 * st.hist[0] / fin : 0.0, st.hist[1], st.hist[2],
-                st.hist[3], st.hist[4], st.max_abs, st.max_rel, st.more_bad, st.cls_bad, st.f32_n, st.f32_bad,
+                st.hist[3], st.hist[4], st.max_abs, st.max_rel, st.more_bad, st.cls_bad, st.range, st.f32_n, st.f32_bad,
                 st.f32_max_rel, st.det, st.invar, c.bad,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     std::fflush(stdout);

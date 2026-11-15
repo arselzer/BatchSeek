@@ -1595,9 +1595,12 @@ __global__ __launch_bounds__(kMxThreads) void mx_p1t_kernel(MxGemvArgs A) {
  * summation order.
  *   - Weights: each code's table value kv[nibble] (kMxValues: the doubled e2m1, 0 .. 12, every one exact in bf16)
  *     goes into the B fragment as bf16, its block's scale d = 2^(e - 128) (mx_e8m0_half) left out. A block whose
- *     scale is outside [2^-126, 2^124] (e < 2 or e > 252, where kv * d would be subnormal or overflow in f32) has
- *     d folded into its B values instead (kv * d, still exact in bf16, an infinity where the exact path's weight is
- *     one) and its scale taken as 1, so the products stay the exact path's there too.
+ *     scale is outside [2^-126, 2^64] (e < 2 or e > 192: kv * d subnormal, or large enough that a product's
+ *     overflow could depend on where d is applied) has d folded into its B values instead (kv * d, still exact in
+ *     bf16, an infinity where the exact path's weight is one) and its scale taken as 1, so the products are the
+ *     exact path's there too. The release's scales sit near e = 120: the fold is for edge weights only.
+ *   - Range: kv * x is formed before d is applied, so an activation within a factor 12 of the f32 maximum (|x| >
+ *     2^124) can overflow to an infinity where the exact path's (kv d) x is finite. No hidden state comes near.
  *   - Activations: the bf16 rows as they are (staged in LDS, never converted or quantized).
  *   - Sums: a 32-value block is two v_wmma_f32_16x16x16_bf16 from a zero accumulator (every product exact in f32),
  *     then acc = fma(d, block sum, acc) -- d a power of two, so that is the block sum scaled and added, one
@@ -1861,7 +1864,7 @@ __device__ __forceinline__ void mx_p1w_body(const MxGemvArgs& A, float* y32) {
                     b0[t] = mx_p1w_b(tab, q0);
                     b1[t] = mx_p1w_b(tab, q1);
                     float d = mx_e8m0_half(ex);
-                    if (ex < 2u || ex > 252u) {   /* kv * d subnormal or past f32: folded, exact in bf16 */
+                    if (ex < 2u || ex > 192u) {   /* kv * d subnormal or very large: folded, exact in bf16 */
                         mx_p1w_fold(b0[t], d);
                         mx_p1w_fold(b1[t], d);
                         d = 1.0f;
