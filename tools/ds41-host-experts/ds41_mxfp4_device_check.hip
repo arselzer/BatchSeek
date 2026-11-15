@@ -61,6 +61,15 @@
  *                                                      SwiGLU waves equal to one launch; pitched slices
  *                                                      preserve guards and NaN payloads; then "p1 time:" lines. Last line
  *                                                      "p1: PASS ..." or "p1: FAIL ...".
+ *   ds41_mxfp4_device_check LIBR4D.so p1tiled [MMAX] [ROUTES]
+ *                                                      the same with RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1 (set
+ *                                                      here): the row must name the register-tiled twin, which
+ *                                                      serves every case above, and in every rows case both forms
+ *                                                      forced (the twin's kernel, the tiled one on grids 0, 7 and
+ *                                                      4096) give the served bytes; M 3072 added. "p1 time:"
+ *                                                      lines for both forms, the stager's two-expert waves and
+ *                                                      the tiled grid. Last line "p1tiled: PASS ..." or
+ *                                                      "p1tiled: FAIL ...".
  *   ds41_mxfp4_device_check LIBR4D.so lsparse [C] [W:r...] the sparse ops at long context (LCP=C, 2048 by
  *                                                      default, set here): index_score, index_candidates,
  *                                                      index_topk (with and without keep) and attn_sparse_sink
@@ -139,6 +148,8 @@ static_assert(p1_same_str(ds41p1::kEnv, kR4dDs41P1Env), "the switch's name");
 static_assert(p1_same_str(ds41p1::kTwinRow, kR4dDs41P1Row), "the twin row's name");
 static_assert(ds41p1::kTwinMaxRows == kR4dDs41P1MaxRows, "the twin's bound");
 static_assert(ds41p1::kMarkPacked == kR4dDs41MarkPacked && ds41p1::kMarkSkip == kR4dDs41MarkSkip, "the marks");
+static_assert(p1_same_str(ds41p1::kTiledEnv, kR4dDs41P1TiledEnv), "the tiled switch's name");
+static_assert(p1_same_str(ds41p1::kTiledMark, kR4dDs41P1TiledMark), "the tiled row's mark");
 
 #define HC(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::fprintf(stderr, "%s: %s\n", #x, hipGetErrorString(e_)); std::exit(2); } } while (0)
 
@@ -180,6 +191,9 @@ struct Lib {
     /* For `aux` / `auxrt`: the gemv_vp row (moe_gemm_ggml_mxfp4_gemv_vp), the only one the aux expert worker runs. */
     Launch moe_vp = nullptr;
     int (*moe_p1_opts)(const RadArgs*, RadStream, int, int, int, int) = nullptr;
+    /* For `p1tiled`: the twin in a forced form (0 its own kernel, 1 the register-tiled one) and the served form. */
+    int (*moe_p1_form)(const RadArgs*, RadStream, int, int) = nullptr;
+    int (*p1_tiled_on)(void) = nullptr;
     int (*count)(void) = nullptr;
     const RadKernelInfo* (*at)(int) = nullptr;
     explicit Lib(const char* path) {
@@ -211,6 +225,8 @@ struct Lib {
         moe_p1 = (Launch)dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_tall_p1");
         moe_vp = (Launch)dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_vp");
         moe_p1_opts = (int (*)(const RadArgs*, RadStream, int, int, int, int))dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_opts");
+        moe_p1_form = (int (*)(const RadArgs*, RadStream, int, int))dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_form");
+        p1_tiled_on = (int (*)(void))dlsym(h, "r4d_ds41_p1_tiled_on");
         count = (int (*)(void))dlsym(h, "rad_kernel_count");
         at = (const RadKernelInfo* (*)(int))dlsym(h, "rad_kernel_at");
         if (!moe) { std::fprintf(stderr, "%s lacks r4d_rad_moe_gemm_mxfp4_gemv\n", path); std::exit(2); }
@@ -2701,11 +2717,13 @@ struct P1Ctx {
     const void* noread = nullptr;
     size_t bad = 0, rows = 0, host_rows = 0, nan_pairs = 0;
     int cases = 0;
+    /* `p1tiled`: the served twin is the register-tiled kernel; every rows case also forces both forms. */
+    bool tiled = false;
+    size_t form_rows = 0;
 };
-
-/* One moe_gemm_ggml launch over device buffers. */
-int p1_launch(P1Ctx& c, Launch f, const int* split, void* x, int AR, int K, void* tab, int N, void* so, void* of,
-              int T, void* y, bool sorted_order) {
+/* The twin in form `form` (0 its own kernel, 1 the register-tiled one) on `grid` blocks (0 the launcher's). */
+int p1_form(P1Ctx& c, int form, int grid, void* x, int AR, int K, void* tab, int N, void* so, void* of, int T, void* y,
+            bool sorted_order) {
     RadTensor t[5] = { tensor(x, RAD_BF16, { AR, K }), tensor(tab, RAD_U8, { kNe, N, K / 32 * 17 }),
                        tensor(so, RAD_I32, { T }), tensor(of, RAD_I32, { kNe + 1 }), tensor(y, RAD_BF16, { T, N }) };
     t[1].stride[0] = 0;
@@ -2713,6 +2731,20 @@ int p1_launch(P1Ctx& c, Launch f, const int* split, void* x, int AR, int K, void
                       ps("a_order", sorted_order ? "sorted" : "token") };
     RadArgs a{};
     a.t = t; a.n_t = 5; a.p = p; a.n_p = 6;
+    return c.L->moe_p1_form ? c.L->moe_p1_form(&a, (RadStream)c.s, form, grid) : RAD_E_UNSUPPORTED;
+}
+
+/* One moe_gemm_ggml launch over device buffers. */
+/* `no_tail`: the stager's wave relaunch under ds41p1::kTailOnceEnv (ds41p1::kTailParam = 0: no tail fill). */
+int p1_launch(P1Ctx& c, Launch f, const int* split, void* x, int AR, int K, void* tab, int N, void* so, void* of,
+              int T, void* y, bool sorted_order, bool no_tail = false) {
+    RadTensor t[5] = { tensor(x, RAD_BF16, { AR, K }), tensor(tab, RAD_U8, { kNe, N, K / 32 * 17 }),
+                       tensor(so, RAD_I32, { T }), tensor(of, RAD_I32, { kNe + 1 }), tensor(y, RAD_BF16, { T, N }) };
+    t[1].stride[0] = 0;
+    RadParam p[7] = { ps("type", "mxfp4"), pi("N", N), pi("K", K), pi("n_expert", kNe), pi("top_k", kTop),
+                      ps("a_order", sorted_order ? "sorted" : "token"), pi(ds41p1::kTailParam, 0) };
+    RadArgs a{};
+    a.t = t; a.n_t = 5; a.p = p; a.n_p = no_tail ? 7 : 6;
     if (split) return c.opts(&a, (RadStream)c.s, split[0], split[1], split[2], split[3]);
     return f(&a, (RadStream)c.s);
 }
@@ -2859,12 +2891,37 @@ void p1_rows(P1Ctx& c, const P1Routing& r, int M, std::mt19937_64& rng, bool spl
                 ++nsplit;
             }
         }
+        /* `p1tiled`: both forms forced, the tiled one on other grids too, give the served call's bytes. */
+        size_t fdiff = 0;
+        int nform = 0;
+        if (c.tiled) {
+            const int fg[][2] = { { 0, 0 }, { 1, 0 }, { 1, 7 }, { 1, 4096 } };
+            for (const auto& f : fg) {
+                HC(hipMemset(d_y.p, 0xAA, d_y.n));
+                if (p1_form(c, f[0], f[1], xin, AR, K, d_tab.p, N, d_so.p, d_of.p, T, d_y.p, !g) != RAD_OK) {
+                    std::printf("FAIL %s: the P1 twin in form %d was refused\n", label, f[0]);
+                    ++c.bad;
+                    continue;
+                }
+                HC(hipStreamSynchronize(c.s));
+                std::vector<uint16_t> y2((size_t)T * N);
+                d_y.get(y2.data());
+                /* The served form's own runs bit for bit; the twin's kernel a NaN equal to any NaN (two kernels may
+                 * carry different NaN payloads, as against the 16-token passes). */
+                fdiff += f[0] == 1 ? count_diff(y.data(), y2.data(), y.size())
+                                   : p1_diff(y.data(), y2.data(), y.size(), &c.nan_pairs);
+                ++nform;
+            }
+            c.form_rows += (size_t)full.local;
+        }
         std::printf("p1 rows %-16s %-7s local %5d live %2d (skipped %2d, packed %2d) busiest %4d: %zu differ from "
                     "16-token passes, %zu from the host, %zu skipped values written, %zu tail values not zero, %d "
-                    "splits %zu differ\n", label, g ? "gate_up" : "down", full.local, full.live, nskip, npk,
-                    full.busiest, differ, hdiff, untouched, tail, nsplit, sdiff);
+                    "splits %zu differ%s\n", label, g ? "gate_up" : "down", full.local, full.live, nskip, npk,
+                    full.busiest, differ, hdiff, untouched, tail, nsplit, sdiff,
+                    c.tiled ? (", " + std::to_string(nform) + " forced forms " + std::to_string(fdiff) + " differ").c_str()
+                            : "");
         std::fflush(stdout);
-        c.bad += differ + hdiff + untouched + tail + sdiff;
+        c.bad += differ + hdiff + untouched + tail + sdiff + fdiff;
     }
 }
 
@@ -2952,20 +3009,22 @@ void p1_waves(P1Ctx& c, const P1Routing& r, int M, std::mt19937_64& rng, bool sm
     Dev G((size_t)T * 2 * kFf * 2), S((size_t)T * kFf * 2), D((size_t)T * kEmbd * 2);
     Dev G2(G.n), S2(S.n), D2(D.n), tg(kNe * sizeof(void*)), td(kNe * sizeof(void*));
     for (Dev* d : { &G, &S, &D, &G2, &S2, &D2 }) HC(hipMemset(d->p, 0xAA, d->n));
-    auto chain = [&](const std::vector<int>& forms, Dev& g, Dev& sw, Dev& dn, int lo, int hi) {
+    auto chain = [&](const std::vector<int>& forms, Dev& g, Dev& sw, Dev& dn, int lo, int hi, bool no_tail = false) {
         std::vector<void*> a = p1_table(c.gu, forms, c.noread), b = p1_table(c.dn, forms, c.noread);
         tg.put(a.data());
         td.put(b.data());
-        int rc = p1_launch(c, c.p1, nullptr, d_x.p, M, kEmbd, tg.p, 2 * kFf, d_so.p, d_of.p, T, g.p, false);
+        int rc = p1_launch(c, c.p1, nullptr, d_x.p, M, kEmbd, tg.p, 2 * kFf, d_so.p, d_of.p, T, g.p, false, no_tail);
         rc |= p1_swiglu_slice(c.L->swiglu, c.s, g.p, sw.p, T, kFf, 2 * kFf, kFf, lo, hi);
-        rc |= p1_launch(c, c.p1, nullptr, sw.p, T, kFf, td.p, kEmbd, d_so.p, d_of.p, T, dn.p, true);
+        rc |= p1_launch(c, c.p1, nullptr, sw.p, T, kFf, td.p, kEmbd, d_so.p, d_of.p, T, dn.p, true, no_tail);
         HC(hipStreamSynchronize(c.s));   /* the tables are rewritten next */
         return rc;
     };
     const int ref_rc = chain(full_forms, G, S, D, 0, T);
     std::vector<int> main_forms = full_forms;
     for (int e : sub) main_forms[(size_t)e] = 2;
-    for (bool spans : { false, true }) {
+    /* Variants: full SwiGLU, spans, and spans with the waves' tail fill skipped (ds41p1::kTailOnceEnv). */
+    for (int variant = 0; variant < 3; ++variant) {
+        const bool spans = variant >= 1, tail_once = variant == 2;
         if (spans) ++c.cases;
         for (Dev* d : { &G2, &S2, &D2 }) HC(hipMemset(d->p, 0xAA, d->n));
         int rc = ref_rc | chain(main_forms, G2, S2, D2, 0, T);
@@ -2982,7 +3041,7 @@ void p1_waves(P1Ctx& c, const P1Routing& r, int M, std::mt19937_64& rng, bool sm
                 }
             }
             if (hi <= lo) lo = hi = 0;
-            rc |= chain(wf, G2, S2, D2, spans ? lo : 0, spans ? hi : T);
+            rc |= chain(wf, G2, S2, D2, spans ? lo : 0, spans ? hi : T, tail_once);
         }
         size_t d[3] = { 0, 0, 0 };
         const Dev* a[3] = { &G, &S, &D };
@@ -2995,7 +3054,7 @@ void p1_waves(P1Ctx& c, const P1Routing& r, int M, std::mt19937_64& rng, bool sm
         }
         std::printf("p1 waves M=%d %s rank %d, SwiGLU %s: %d local slots, %zu experts in %d waves of 1-3: "
                     "%zu gate_up, %zu swiglu, %zu down values differ from one launch%s\n", M, r.name.c_str(), r.rank,
-                    spans ? "spans" : "full", p.local, sub.size(), waves,
+                    tail_once ? "spans, tail once" : spans ? "spans" : "full", p.local, sub.size(), waves,
                     d[0], d[1], d[2], rc ? " (a launch was refused)" : "");
         std::fflush(stdout);
         c.bad += d[0] + d[1] + d[2] + (rc ? 1 : 0);
@@ -3068,9 +3127,11 @@ double p1_pass_time(P1Ctx& c, const P1Pass& p, int M, int kind, int form, const 
     return tg_us + td_us;
 }
 
-int p1_check(const Lib& L, int mmax, const char* routes_path) {
+int p1_check(const Lib& L, int mmax, const char* routes_path, bool tiled = false) {
     P1Ctx c;
     c.L = &L;
+    c.tiled = tiled;
+    const char* const mode = tiled ? ds41p1::kTiledCheckMode : ds41p1::kCheckMode;
     int rc = 0;
     /* The row table: the P1 twin in place of the LCP twin, reaching MMAX, one priority below the gemv. */
     {
@@ -3089,15 +3150,23 @@ int p1_check(const Lib& L, int mmax, const char* routes_path) {
                 ++m_le;
                 reach = twin->constraints[i].ival;
             }
+        /* The served form: the row names the register-tiled twin exactly when `p1tiled` asked for it. */
+        const bool names = twin && twin->computes && std::strstr(twin->computes, ds41p1::kTiledMark);
+        const int on = L.p1_tiled_on ? L.p1_tiled_on() : 0;
+        const bool form_ok = tiled ? names && on == 1 && L.moe_p1_form : !names && on == 0;
         const bool ok = gemv && twin && !lcp_twin && L.moe_p1 && twin->launch == L.moe_p1 && m_le == 1 &&
                         reach >= mmax && reach <= ds41p1::kTwinMaxRows && twin->priority == gemv->priority - 1 &&
-                        twin->n_constraints == gemv->n_constraints && twin->layout == gemv->layout;
-        std::printf("%s: row table: %s %s (reach %lld, priority %d, the gemv's %d), %s %s\n", ok ? "PASS" : "FAIL",
+                        twin->n_constraints == gemv->n_constraints && twin->layout == gemv->layout && form_ok;
+        std::printf("%s: row table: %s %s (reach %lld, priority %d, the gemv's %d), %s %s; served form: %s (the row "
+                    "%s it, r4d_ds41_p1_tiled_on %d%s)\n", ok ? "PASS" : "FAIL",
                     ds41p1::kTwinRow, twin ? "present" : "missing", reach, twin ? twin->priority : -1,
-                    gemv ? gemv->priority : -1, ds41p1::kLcpTwinRow, lcp_twin ? "present (must not be)" : "absent");
+                    gemv ? gemv->priority : -1, ds41p1::kLcpTwinRow, lcp_twin ? "present (must not be)" : "absent",
+                    tiled ? ds41p1::kTiledMark : "the twin's own kernel", names ? "names" : "does not name", on,
+                    tiled && !L.moe_p1_form ? ", no _form export" : "");
         rc |= ok ? 0 : 1;
-        if (!L.moe_p1 || !L.moe_p1_opts) {
-            std::printf("p1: FAIL: the plugin lacks r4d_rad_moe_gemm_mxfp4_gemv_tall_p1 or its _opts export\n");
+        if (!L.moe_p1 || !L.moe_p1_opts || (tiled && !L.moe_p1_form)) {
+            std::printf("%s: FAIL: the plugin lacks r4d_rad_moe_gemm_mxfp4_gemv_tall_p1 or its _opts%s export\n", mode,
+                        tiled ? " or _form" : "");
             return 1;
         }
     }
@@ -3130,6 +3199,7 @@ int p1_check(const Lib& L, int mmax, const char* routes_path) {
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     std::fflush(stdout);
     std::vector<int> Ms = { 17, 33, 48, 64, 100, 256, 1024, 2048 };
+    if (tiled && mmax > 3072) Ms.push_back(3072);
     if (mmax > 2048) Ms.push_back(mmax);
     for (int M : Ms) {
         if (M > mmax) continue;
@@ -3161,43 +3231,107 @@ int p1_check(const Lib& L, int mmax, const char* routes_path) {
             for (int k = 0; k < kTop; ++k) edge.p[(size_t)t * kTop + k] = no_local ? 96 + k : ids[k];
         p1_waves(c, edge, 17, rng, true);
     }
-    std::printf("p1: %d cases, %zu (token, slot) rows against 16-token passes, %zu against the host kernels, %zu NaN "
-                "pairs (any NaN equal), %zu bad values, %.0f s\n", c.cases, c.rows, c.host_rows, c.nan_pairs, c.bad,
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    std::printf("%s: %d cases, %zu (token, slot) rows against 16-token passes, %zu against the host kernels, %zu NaN "
+                "pairs (any NaN equal), %zu bad values, %.0f s%s\n", mode, c.cases, c.rows, c.host_rows, c.nan_pairs,
+                c.bad, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                tiled ? (", " + std::to_string(c.form_rows) + " rows in both forms forced").c_str() : "");
     std::fflush(stdout);
     /* Timing. */
     std::printf("p1 time: gate_up + down a pass (hipEvent, median), us a local expert-row and a token row-layer\n");
     const char* fname[3] = { "block", "packed", "mix 1/6 skip" };
-    const char* kname[4] = { "P1 twin", "LCP twin (served)", "LCP twin cut", "LCP twin balanced" };
+    const char* kname[5] = { tiled ? "P1 tiled" : "P1 twin", "LCP twin (served)", "LCP twin cut", "LCP twin balanced",
+                             "P1 twin" };
+    static const int kTwinSplit[4] = { 0, 0, 0, 0 };   /* the _opts export at its defaults: the twin's own kernel */
     for (int M : { 64, 256, 1024, 2048 }) {
         if (M > mmax) continue;
         for (int lr = 0; lr < (real ? 3 : 1); ++lr) {
             const int layer = lr == 0 ? 12 : lr == 1 ? 25 : 36, rank = lr == 1 ? 2 : 0;
             const P1Routing r = real ? p1_routing("real", M, rank, layer, rng) : p1_routing("skewed", M, rank, 0, rng);
             const P1Pass p = p1_pass(r, 0, M);
-            for (int kind = 0; kind < 4; ++kind)
-                for (int form = 0; form < (kind == 0 ? 3 : 1); ++form) {
-                    /* The served twin costs seconds a call at these heights: one layer, M <= 1024, one rep. */
+            for (int kind = 0; kind < 5; ++kind)
+                for (int form = 0; form < (kind == 0 || kind == 4 ? 3 : 1); ++form) {
+                    /* The served twin costs seconds a call at these heights: one layer, M <= 1024, one rep.
+                     * `p1tiled` times the tiled form beside the twin's own kernel (kind 4) and nothing else. */
                     if (kind == 1 && (M > 1024 || lr)) continue;
                     if ((kind == 2 || kind == 3) && lr) continue;
+                    if (tiled ? kind >= 1 && kind <= 3 : kind == 4) continue;
                     double gu = 0;
-                    const double us = p1_pass_time(c, p, M, kind, form, nullptr, &gu, kind == 0 ? 5 : 1);
-                    const int counted = kind == 0 && form == 2 ? p.local - [&] {
+                    const double us = kind == 4 ? p1_pass_time(c, p, M, 0, form, kTwinSplit, &gu, 5)
+                                                : p1_pass_time(c, p, M, kind, form, nullptr, &gu, kind == 0 ? 5 : 1);
+                    const int counted = (kind == 0 || kind == 4) && form == 2 ? p.local - [&] {
                         int sk = 0;
                         for (int e = 5; e < kNe; e += 6) sk += p.off[(size_t)e + 1] - p.off[(size_t)e];
                         return sk;
                     }() : p.local;
                     std::printf("p1 time: M %4d %-8s rank %d %-18s %-12s local %5d live %2d busiest %4d: gate_up %9.1f "
                                 "down %9.1f us = %7.2f us an expert-row, %8.2f us a row-L\n", M, r.name.c_str(), rank,
-                                kname[kind], kind == 0 ? fname[form] : "block", counted, p.live, p.busiest, gu, us - gu,
+                                kname[kind], kind == 0 || kind == 4 ? fname[form] : "block", counted, p.live, p.busiest, gu, us - gu,
                                 counted > 0 ? us / counted : 0.0, us / M);
                     std::fflush(stdout);
                 }
         }
     }
+    /* `p1tiled`: the stager's waves as served (Qw2: two experts a launch, every other entry skipped, real routing),
+     * each form, and the tiled form's grid. */
+    for (int M : { 1024, 2048 }) {
+        if (!tiled || M > mmax) continue;
+        const P1Routing r = real ? p1_routing("real", M, 0, 12, rng) : p1_routing("skewed", M, 0, 0, rng);
+        const P1Pass p = p1_pass(r, 0, M);
+        const int T = M * kTop;
+        Dev d_so((size_t)T * 4), d_of((kNe + 1) * 4), d_x((size_t)M * kEmbd * 2), d_a((size_t)T * kFf * 2);
+        Dev gy((size_t)T * 2 * kFf * 2), dy((size_t)T * kEmbd * 2), tg(kNe * sizeof(void*)), td(kNe * sizeof(void*));
+        d_so.put(p.sorted.data());
+        d_of.put(p.off.data());
+        HC(hipMemset(d_x.p, 0x3c, d_x.n));
+        HC(hipMemset(d_a.p, 0x3c, d_a.n));
+        std::vector<int> live;
+        for (int e = 0; e < kNe; ++e)
+            if (p.off[(size_t)e + 1] > p.off[(size_t)e]) live.push_back(e);
+        for (int wv = 0; wv < 3 && 2 * wv + 1 < (int)live.size(); ++wv) {
+            /* Waves of two: the busiest pair, a middle pair, the two smallest. */
+            std::vector<int> byrows = live;
+            std::sort(byrows.begin(), byrows.end(), [&](int a, int b) {
+                return p.off[(size_t)a + 1] - p.off[(size_t)a] > p.off[(size_t)b + 1] - p.off[(size_t)b];
+            });
+            const size_t at = wv == 0 ? 0 : wv == 1 ? byrows.size() / 2 - 1 : byrows.size() - 2;
+            std::vector<int> forms(kNe, 2);
+            int rows = 0;
+            for (size_t j = at; j < at + 2; ++j) {
+                forms[(size_t)byrows[j]] = 0;
+                rows += p.off[(size_t)byrows[j] + 1] - p.off[(size_t)byrows[j]];
+            }
+            std::vector<void*> a = p1_table(c.gu, forms, c.noread), b = p1_table(c.dn, forms, c.noread);
+            tg.put(a.data());
+            td.put(b.data());
+            for (int form = 0; form < 2; ++form) {
+                const double g = p1_time(c, [&] { return p1_form(c, form, 0, d_x.p, M, kEmbd, tg.p, 2 * kFf, d_so.p,
+                                                                 d_of.p, T, gy.p, false); }, 5);
+                const double d = p1_time(c, [&] { return p1_form(c, form, 0, d_a.p, T, kFf, td.p, kEmbd, d_so.p,
+                                                                 d_of.p, T, dy.p, true); }, 5);
+                std::printf("p1 time wave: M %4d %s rank 0 two experts of %4d rows (%s pair) %-8s: gate_up %8.1f down "
+                            "%8.1f us = %6.2f us an expert-row\n", M, r.name.c_str(), rows,
+                            wv == 0 ? "busiest" : wv == 1 ? "middle" : "smallest", form ? "P1 tiled" : "P1 twin", g, d,
+                            rows > 0 ? (g + d) / rows : 0.0);
+                std::fflush(stdout);
+            }
+        }
+        for (int grid : { 0, 256, 512, 2048, 4096 }) {
+            std::vector<int> forms(kNe, 0);
+            std::vector<void*> a = p1_table(c.gu, forms, c.noread), b = p1_table(c.dn, forms, c.noread);
+            tg.put(a.data());
+            td.put(b.data());
+            const double g = p1_time(c, [&] { return p1_form(c, 1, grid, d_x.p, M, kEmbd, tg.p, 2 * kFf, d_so.p, d_of.p,
+                                                             T, gy.p, false); }, 5);
+            const double d = p1_time(c, [&] { return p1_form(c, 1, grid, d_a.p, T, kFf, td.p, kEmbd, d_so.p, d_of.p,
+                                                             T, dy.p, true); }, 5);
+            std::printf("p1 time tiled grid: M %d %s rank 0 local %d grid %4d: gate_up %8.1f down %8.1f us = %6.2f us an "
+                        "expert-row\n", M, r.name.c_str(), p.local, grid, g, d, p.local ? (g + d) / p.local : 0.0);
+            std::fflush(stdout);
+        }
+    }
     /* The work split (grid, item size, items a block, staged rows; 0 the default) at M 256, 1024 and 2048. */
     for (int M : { 256, 1024, 2048 }) {
-        if (M > mmax) continue;
+        if (tiled || M > mmax) continue;
         const P1Routing r = real ? p1_routing("real", M, 0, 12, rng) : p1_routing("skewed", M, 0, 0, rng);
         const P1Pass p = p1_pass(r, 0, M);
         const int sps[][4] = { { 0, 0, 0, 0 },    { 256, 0, 0, 36 }, { 256, 0, 0, 0 },  { 1024, 0, 0, 0 },
@@ -3215,12 +3349,17 @@ int p1_check(const Lib& L, int mmax, const char* routes_path) {
     (void)hipStreamDestroy(c.s);
     rc |= c.bad ? 1 : 0;
     if (rc)
-        std::printf("p1: FAIL: %zu bad values in %d cases (rows, splits, waves; see FAIL and the counts above)%s\n",
-                    c.bad, c.cases, c.bad ? "" : ", or the row table");
+        std::printf("%s: FAIL: %zu bad values in %d cases (rows, splits, waves%s; see FAIL and the counts above)%s\n",
+                    mode, c.bad, c.cases, tiled ? ", forced forms" : "", c.bad ? "" : ", or the row table");
+    else if (tiled)
+        std::printf("%s: PASS: %s served on %s at M 17..%d: %zu rows equal to 16-token passes, skipped rows untouched, "
+                    "tail zeros, splits, both forms forced on %zu rows byte for byte, and full/span SwiGLU waves of 1-3 "
+                    "equal to one launch, also with the tail filled once (%d cases)\n", mode, ds41p1::kTwinRow, ds41p1::kTiledMark, Ms.back(), c.rows,
+                    c.form_rows, c.cases);
     else
         std::printf("p1: PASS: %s at M 17..%d: %zu rows equal to 16-token passes, skipped rows untouched, tail zeros, "
-                    "splits and full/span SwiGLU waves of 1-3 equal to one launch (%d cases)\n", ds41p1::kTwinRow, Ms.back(), c.rows,
-                    c.cases);
+                    "splits and full/span SwiGLU waves of 1-3 equal to one launch, also with the tail filled once (%d cases)\n",
+                    ds41p1::kTwinRow, Ms.back(), c.rows, c.cases);
     return rc;
 }
 
@@ -4129,14 +4268,19 @@ int aux_swap(const Lib& lib, int rounds) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | lsparse [C] [W:r...] | bal [C] [ROUTES] | p1 [MMAX] [ROUTES] | sweep [trials] | sweep0 [trials] | aux OUT [trials] | auxtall OUT [MMAX] [trials] | auxrt [jobs] | auxswap [rounds]\n", argv[0]); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | lsparse [C] [W:r...] | bal [C] [ROUTES] | p1 [MMAX] [ROUTES] | p1tiled [MMAX] [ROUTES] | sweep [trials] | sweep0 [trials] | aux OUT [trials] | auxtall OUT [MMAX] [trials] | auxrt [jobs] | auxswap [rounds]\n", argv[0]); return 2; }
     /* `tall`: the switch before the plugin's row table and its sparse launchers first read it, and
      * the routed GEMM as the A/B's servers run it (no live tail); the other modes as the loop's
      * measured runs ran it. */
     /* `lcp [C]`: RADIANCE_EXPERIMENTAL_DS41_LCP=C and EXACT_TALL unset, as an Lc arm's server has them;
      * `sweep` keeps an LCP already in the environment (its heights) instead of setting EXACT_TALL. */
     /* Every mode but `p1` runs without prefill Phase 1's switch (its twin replaces the LCP twin `lcp` checks). */
-    if (std::strcmp(argv[2], ds41p1::kCheckMode) && std::strcmp(argv[2], "auxtall")) unsetenv(ds41p1::kEnv);
+    if (std::strcmp(argv[2], ds41p1::kCheckMode) && std::strcmp(argv[2], ds41p1::kTiledCheckMode) &&
+        std::strcmp(argv[2], "auxtall"))
+        unsetenv(ds41p1::kEnv);
+    /* The register-tiled twin: on for `p1tiled`, off for `p1`; `auxtall` keeps the window's (its line says which). */
+    if (!std::strcmp(argv[2], ds41p1::kTiledCheckMode)) setenv(ds41p1::kTiledEnv, "1", 1);
+    else if (std::strcmp(argv[2], "auxtall")) unsetenv(ds41p1::kTiledEnv);
     if (!std::strcmp(argv[2], "auxtall")) {
         /* `auxtall`: LCP=2048 and P1, as the server of an AxrN arm has them (the worker's rows above 16 are the P1
          * twin's); the live tail left as the window has it, as for `aux`. */
@@ -4145,8 +4289,8 @@ int main(int argc, char** argv) {
         unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
         unsetenv("RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE");
         g_lcp = 2048;
-    } else if (!std::strcmp(argv[2], ds41p1::kCheckMode)) {
-        /* `p1 [MMAX] [ROUTES]`: LCP=2048 and the switch, as a P1 arm's server has them. */
+    } else if (!std::strcmp(argv[2], ds41p1::kCheckMode) || !std::strcmp(argv[2], ds41p1::kTiledCheckMode)) {
+        /* `p1 [MMAX] [ROUTES]`: LCP=2048 and the switch, as a P1 arm's server has them (`p1tiled`: and kTiledEnv). */
         setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "2048", 1);
         setenv(ds41p1::kEnv, "1", 1);
         unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
@@ -4245,13 +4389,13 @@ int main(int argc, char** argv) {
         if (ws.empty()) ws = { { 32769, 1 }, { 65537, 2 }, { 131073, 1 }, { 262145, 2 }, { 524289, 1 } };
         return long_sparse_check(lib, ws);
     }
-    if (!std::strcmp(argv[2], ds41p1::kCheckMode)) {
+    if (!std::strcmp(argv[2], ds41p1::kCheckMode) || !std::strcmp(argv[2], ds41p1::kTiledCheckMode)) {
         const int mmax = argc > 3 ? std::atoi(argv[3]) : ds41p1::kTwinMaxRows;
         if (mmax < 17 || mmax > ds41p1::kTwinMaxRows) {
-            std::fprintf(stderr, "p1 MMAX: 17 .. %d\n", ds41p1::kTwinMaxRows);
+            std::fprintf(stderr, "%s MMAX: 17 .. %d\n", argv[2], ds41p1::kTwinMaxRows);
             return 2;
         }
-        return p1_check(lib, mmax, argc > 4 ? argv[4] : nullptr);
+        return p1_check(lib, mmax, argc > 4 ? argv[4] : nullptr, !std::strcmp(argv[2], ds41p1::kTiledCheckMode));
     }
     if (!std::strcmp(argv[2], "tall")) {
         std::vector<int> Ts;

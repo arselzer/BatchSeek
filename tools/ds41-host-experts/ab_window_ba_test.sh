@@ -266,7 +266,7 @@ B256=all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm
 SB=$B256-Sb SBNP=$B256-Sb-Xnp SBXQ=$B256-Sb-Xqprof SBRES=${B256/-mA-/-mA20480-}-Sb SB64=${B256/Pch32/Pch64}-Sb
 SBRD=${B256/Rd13/Rd12}-Sb SBNOMA=${B256/-mA-/-}-Sb SBL=${B256/L294912/L294913}-Sb SBPCS=${B256/Pcs128/Pcs64}-Sb
 SBBOTH=$B256-Sb-Xnp-Xqprof SBQD=${B256%-Qy60}; SBQD=${SBQD/-Qd64/}-Sb SBOFF=${B256%-Qy60}-Sb SBQYF=${B256/Qy60/Qyf60}-Sb
-SBSL=${B256/L294912/L294912-Sl4096}-Sb
+SBSL=${B256/L294912/L294912-Sl4096}-Sb SBQT=$B256-Qsp-Qt-Qz-Sb
 mkdir -p "$T/profiles"; echo '{}' > "$T/profiles/prof.json"
 (
   set +u
@@ -285,16 +285,19 @@ mkdir -p "$T/profiles"; echo '{}' > "$T/profiles/prof.json"
   BAL_OK=1 BAL_WHY=test BAL_SUM=$SUM BAL_LIB=$LIB BAL_MAX_M=4096 P1_OK=1 P1_WHY=test P1_SUM=$SUM P1_LIB=$LIB
   AUX_OK=1 AUX_LIB=$LIB AUX_SUM=$SUM AUX_UUID=GPU-00000000000000aa AUX_MIB=26000
   OUT=$T/sbout; mkdir -p "$OUT"; CANCEL_FILE=/nonexistent/cancel; CANCEL=$CANCEL_FILE
+  P1T_OK=1 P1T_WHY=test P1T_SUM=$SUM P1T_LIB=$LIB   # Qt's p1tiled check, and Qsp's / Qz's oracle lines
+  echo 'p1: PASS: ... splits and full/span SwiGLU waves of 1-3 equal to one launch, also with the tail filled once (52 cases)' > "$OUT/devcheck-p1.log"
+  echo 'p1tiled: PASS: ... equal to one launch, also with the tail filled once (54 cases)' > "$OUT/devcheck-p1tiled.log"
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
   eval "$(sed -n '/^launch_words() {/,/^}/p' "$W")"
   eval "$(sed -n '/^sb_check() {/,/^}/p' "$W")"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
-  ARMS="$SB $SBNP $SBXQ $SBRES $SB64 $SBRD $SBNOMA $SBL $SBPCS $SBBOTH $SBQD $SBOFF $SBQYF $SBSL"
+  ARMS="$SB $SBNP $SBXQ $SBRES $SB64 $SBRD $SBNOMA $SBL $SBPCS $SBBOTH $SBQD $SBOFF $SBQYF $SBSL $SBQT"
   s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)
   e=$(awk -v s="$s" 'NR > s && /^done$/ { print NR; exit }' "$W")
   eval "$(sed -n "${s},${e}p" "$W")"
 ) > "$T/sbloop.txt" 2>&1
-for a in "$SB" "$SBNP" "$SBXQ" "$SBRES" "$SB64" "$SBOFF" "$SBSL"; do
+for a in "$SB" "$SBNP" "$SBXQ" "$SBRES" "$SB64" "$SBOFF" "$SBSL" "$SBQT"; do
   if grep -qx "ARM $a" "$T/sbloop.txt"; then ok "Sb: launched: ...${a#$B256}"
   else bad "Sb: ...${a#$B256} not launched: $(grep -m2 -F "arm $a:" "$T/sbloop.txt")"; fi
 done
@@ -320,6 +323,10 @@ tr '\n' ' ' < "$T/sbout/$SB64.sb.args" 2>/dev/null | grep -q -- '--shared-head 6
 tr '\n' ' ' < "$T/sbout/$SB.sb.args" 2>/dev/null | grep -q -- '--hybrid 60 ' && ok "Sb Qy60: --hybrid 60" || bad "Sb Qy60"
 tr '\n' ' ' < "$T/sbout/$SBOFF.sb.args" 2>/dev/null | grep -q -- '--hybrid 0 ' && ok "Sb without Qy: --hybrid 0" || bad "Sb without Qy"
 tr '\n' ' ' < "$T/sbout/$SBSL.sb.args" 2>/dev/null | grep -q -- '--max-seq-len 4096' && ok "Sb Sl4096: --max-seq-len 4096" || bad "Sb Sl4096"
+tr '\n' ' ' < "$T/sbout/$SBQT.sb.args" 2>/dev/null | grep -q -- '--tiled 1 --tail-once 1 --swiglu-span 1 ' &&
+  ok "Sb Qsp-Qt-Qz: --tiled 1 --tail-once 1 --swiglu-span 1" || bad "Sb Qsp-Qt-Qz: $(tr '\n' ' ' < "$T/sbout/$SBQT.sb.args" 2>/dev/null)"
+tr '\n' ' ' < "$T/sbout/$SB.sb.args" 2>/dev/null | grep -q -- '--tiled 0 --tail-once 0 --swiglu-span 0 ' &&
+  ok "Sb without Qt/Qz/Qsp: all three 0" || bad "Sb without Qt/Qz/Qsp"
 # arm()'s Sb branch: the launch through serve-batch.sh (a stub binary that records its environment and arguments,
 # and answers like a server), then batch_client.py after the requests (a stub client).
 armfn=$(sed -n '/^arm() {   # name/,/^}/p' "$W")

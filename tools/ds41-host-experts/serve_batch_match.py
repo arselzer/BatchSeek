@@ -7,7 +7,8 @@ serve_batch_test.sh).
       its flags). Prints the serve-batch.sh arguments for it, one a line: --model, --silu-table, --streams,
       --ctx-per-stream (--max-model-len / --max-num-seqs, which must divide), --port, --served-name,
       --radiance-home, --shared-head, --hybrid (..._P1_HYBRID: QyP's P, 0 or unset off; a held share, Qyf, is
-      refused), and --profile, --mirror, --reserve-mib, --max-seq-len (SlN) where the launch has them. Exit 1
+      refused), --tiled / --tail-once / --swiglu-span (Qt / Qz / Qsp: ..._P1_TILED,
+      _P1_TAIL_ONCE, _P1_SWIGLU_SPAN, 0 or unset off), and --profile, --mirror, --reserve-mib, --max-seq-len (SlN) where the launch has them. Exit 1
       with the reason when a value is missing or does not fit.
   serve_batch_match.py compare WORDS DRYRUN [FLAG ...]
       DRYRUN: serve-batch.sh --dry-run's output. Each side resolved as the server sees it (every variable at its
@@ -23,6 +24,8 @@ SHEAD = "RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD"
 RESERVE = "RADIANCE_EXPERIMENTAL_DS41_RAM_RESERVE_MIB"
 HYBRID = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID"
 ADAPT = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT"
+P1_SWITCHES = (("--tiled", "RADIANCE_EXPERIMENTAL_DS41_P1_TILED"), ("--tail-once", "RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE"),
+               ("--swiglu-span", "RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN"))   # Qt, Qz, Qsp
 
 
 def resolve(words):
@@ -92,6 +95,8 @@ def params(words):
     if env.get(ADAPT):
         raise ValueError("%s=%s (Qyf: a held hybrid share), which serve-batch.sh does not set" % (ADAPT, env[ADAPT]))
     out += ["--hybrid", env.get(HYBRID) or "0"]
+    for opt, var in P1_SWITCHES:
+        out += [opt, env.get(var) or "0"]
     if flags.get("--max-seq-len"):
         out += ["--max-seq-len", flags["--max-seq-len"]]
     return out
