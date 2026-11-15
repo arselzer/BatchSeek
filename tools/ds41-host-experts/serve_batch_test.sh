@@ -44,6 +44,7 @@ LW=$(sed -n '/^launch_words() {/,/^}/p' "$W")
   echo 'p1: PASS: test, full/span SwiGLU waves, also with the tail filled once' > "$OUT/devcheck-p1.log"
   echo 'p1tiled: PASS: test, also with the tail filled once' > "$OUT/devcheck-p1tiled.log"
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
+  eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
   ARMS=$ARM
   s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)

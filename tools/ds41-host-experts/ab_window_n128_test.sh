@@ -79,6 +79,7 @@ run_loop() { # oracle-present flag, SHA
     N128_OK=$1 N128_SUM=$2 N128_MAX_M=4096 N128_WHY='missing test oracle'
     ARMS="$B $B-Fn128 $B-Fn128-BT4096"
     eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
+    eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
     eval "$(sed -n '/^n128_arm_gate() {/,/^}/p' "$W")"
     HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
     s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)

@@ -159,6 +159,7 @@ window() {   # the window's state as the script has it when the loop starts; out
   OUT=$1; mkdir -p "$OUT"; CANCEL_FILE=/nonexistent/cancel; CANCEL=$CANCEL_FILE
   echo '{}' > "$OUT/kld-corpus.jsonl"
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
+  eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
   eval "$FUNCS"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
   ROCR_VISIBLE_DEVICES=$MASK

@@ -146,6 +146,7 @@ out=$(
   CANCEL=/nonexistent/cancel
   unset RADIANCE_TUNE
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
+  eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
   s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)
   e=$(awk -v s="$s" 'NR > s && /^done$/ {print NR; exit}' "$W")
   eval "$(sed -n "${s},${e}p" "$W")"
