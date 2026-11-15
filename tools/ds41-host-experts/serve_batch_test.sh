@@ -19,7 +19,7 @@ fail=0
 ok()  { echo "ok   $*"; }
 bad() { echo "FAIL $*"; fail=1; }
 
-ARM=all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-mA-Qd64-Qa0-Pc-Pch32-Pcs128-L294912-Pf-N256-C256-Ba2048-Bs-Qy60-Xqprof
+ARM=all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-mA-Qd64-Qa0-Pc-Pch32-Pcs128-L294912-Pf-N256-C256-Ba2048-Bs-Qy60-Qsp-Qt-Qz-Xqprof
 mkdir -p "$T/home/kernels" "$T/mirror" "$T/profiles"; echo "{}" > "$T/profiles/prof.json"
 echo "not a library" > "$T/home/kernels/libr4d.so"
 echo '{}' > "$T/prompts.json"
@@ -39,7 +39,10 @@ LW=$(sed -n '/^launch_words() {/,/^}/p' "$W")
   TALL_OK=1 TALL_WHY=test TALL_SUM=$SUM TALL_LIB=$LIB DK_OK=1 DK_WHY=test DK_SUM=$SUM DK_LIB=$LIB
   RB_OK=1 RB_WHY=test RB_SUM=$SUM RB_LIB=$LIB LCP_OK=1 LCP_WHY=test LCP_SUM=$SUM LCP_LIB=$LIB LCP_C=4096
   BAL_OK=1 BAL_WHY=test BAL_SUM=$SUM BAL_LIB=$LIB BAL_MAX_M=4096 P1_OK=1 P1_WHY=test P1_SUM=$SUM P1_LIB=$LIB
+  P1T_OK=1 P1T_WHY=test P1T_SUM=$SUM P1T_LIB=$LIB
   OUT=$T/out; mkdir -p "$OUT"; CANCEL_FILE=/nonexistent/cancel; CANCEL=$CANCEL_FILE
+  echo 'p1: PASS: test, full/span SwiGLU waves, also with the tail filled once' > "$OUT/devcheck-p1.log"
+  echo 'p1tiled: PASS: test, also with the tail filled once' > "$OUT/devcheck-p1tiled.log"
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
   ARMS=$ARM
@@ -88,11 +91,11 @@ grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=0' <<< "$d0h" && [[ $d0h == *
   ok "--hybrid 0: off (an arm without Qy); --max-seq-len 4096: SlN's flag" || bad "--hybrid 0 / --max-seq-len"
 [[ $dh != *--max-seq-len* ]] && ok "no --max-seq-len by default" || bad "a --max-seq-len by default"
 
-dq=$("$SB" --model M --silu-table S --tiled 1 --tail-once 1 --swiglu-span 1 --dry-run)
-grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TILED=0' <<< "$dh" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=0' <<< "$dh" &&
-  grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN=0' <<< "$dh" && ok "Qt, Qz, Qsp off by default" || bad "the Qt/Qz/Qsp defaults"
-grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1' <<< "$dq" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=1' <<< "$dq" &&
-  grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN=1' <<< "$dq" && ok "--tiled 1 --tail-once 1 --swiglu-span 1: Qt, Qz, Qsp" ||
+dq=$("$SB" --model M --silu-table S --tiled 0 --tail-once 0 --swiglu-span 0 --dry-run)
+grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1' <<< "$dh" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=1' <<< "$dh" &&
+  grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN=1' <<< "$dh" && ok "Qt, Qz, Qsp on by default" || bad "the Qt/Qz/Qsp defaults"
+grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TILED=0' <<< "$dq" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=0' <<< "$dq" &&
+  grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN=0' <<< "$dq" && ok "--tiled 0 --tail-once 0 --swiglu-span 0: off" ||
   bad "--tiled / --tail-once / --swiglu-span"
 
 # ---- 3. refusals

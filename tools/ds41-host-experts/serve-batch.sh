@@ -17,7 +17,8 @@
 #     decode at 256 streams (window ab-20261113T014719Z); --hybrid 0 turns it off (the arm without Qy).
 #   - --max-seq-len N (SlN) only when given.
 #   - --tiled (Qt, ..._P1_TILED), --tail-once (Qz, ..._P1_TAIL_ONCE) and --swiglu-span (Qsp, ..._P1_SWIGLU_SPAN): the
-#     prefill Phase 1 twin's variants, 0 (off, as measured) unless given 1; not yet measured with hybrid decode.
+#     prefill Phase 1 twin's variants, on by default: exact, prefill -19% and 256 NL-SQL 287 -> 250 s with hybrid
+#     decode (window ab-20261115T070032Z); give 0 to turn one off.
 #   - --served-model-name ds41 (a name only; --served-name sets another) and --radiance-home only when given
 #     (RADIANCE_HOME otherwise).
 #
@@ -32,7 +33,7 @@
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
-EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=0 TAILONCE=0 SPAN=0
+EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1
 while (( $# )); do
   case $1 in
     --model) MODEL=${2:?}; shift ;;
