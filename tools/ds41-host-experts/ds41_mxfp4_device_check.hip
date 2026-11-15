@@ -3402,6 +3402,9 @@ struct P1wStats {
     double max_abs = 0, max_rel = 0, f32_max_rel = 0;
     size_t det = 0, invar = 0;
     unsigned long long range = 0;   /* NaN/inf class differences on rows with an activation above 2^120 */
+    /* class differences where the exact path's own f32 weights or products overflow: the WMMA twin agreeing with the
+     * f64 sum of the exact products (ok), or not (bad, counted as a bad value too) */
+    unsigned long long ovf_ok = 0, ovf_bad = 0;
 };
 long p1w_ulp(uint16_t a, uint16_t b) {
     auto ord = [](uint16_t v) { return (v & 0x8000u) ? -(long)(v & 0x7fffu) : (long)v; };
@@ -3410,10 +3413,11 @@ long p1w_ulp(uint16_t a, uint16_t b) {
 bool p1w_fin(uint16_t v) { return (v & 0x7f80u) != 0x7f80u; }
 /* Weight row n of a block_mxfp4 weight against activation row x: the f64 sum of the exact products and of their
  * magnitudes. */
-void p1w_host_dot(const uint8_t* blk, int K, int n, const uint16_t* x, double* S, double* Aa) {
+void p1w_host_dot(const uint8_t* blk, int K, int n, const uint16_t* x, double* S, double* Aa, bool* ovf = nullptr,
+                  bool* both = nullptr) {
     static const float kv[16] = { 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12 };
     const int UK = K / 32;
-    double s = 0, a = 0;
+    double s = 0, a = 0, pos = 0, neg = 0;
     for (int u = 0; u < UK; ++u) {
         const uint8_t* b = blk + ((size_t)n * UK + u) * 17;
         const uint32_t e = b[0];
@@ -3422,13 +3426,24 @@ void p1w_host_dot(const uint8_t* blk, int K, int n, const uint16_t* x, double* S
         std::memcpy(&d, &bits, 4);
         for (int v = 0; v < 32; ++v) {
             const int nib = v < 16 ? (b[1 + v] & 15) : (b[1 + v - 16] >> 4);
-            const double p = (double)(kv[nib] * d) * (double)bf16_to_f32(x[(size_t)u * 32 + v]);
+            const float w = kv[nib] * d;
+            {
+                const double q = (double)w * (double)bf16_to_f32(x[(size_t)u * 32 + v]);
+                if (q > 0) pos += q;
+                if (q < 0) neg -= q;
+            }
+            const double p = (double)w * (double)bf16_to_f32(x[(size_t)u * 32 + v]);
+            /* The exact path's f32 weight or rounded f32 product past the f32 range. */
+            if (ovf && (std::isinf(w) || (std::isfinite(p) && std::fabs(p) > (double)3.4028234663852886e38))) *ovf = true;
             s += p;
             a += std::fabs(p);
         }
     }
     *S = s;
     *Aa = a;
+    /* Positive and negative mass each past the f32 range: an f32 sum of these terms reaches +inf, -inf or NaN by
+     * its order alone. */
+    if (both) *both = pos > (double)3.4028234663852886e38 && neg > (double)3.4028234663852886e38;
 }
 int p1w_f32(P1Ctx& c, P1Wf32 f, void* x, int AR, int K, void* tab, int N, void* so, void* of, int T, void* y, float* y32,
             bool sorted_order) {
@@ -3518,7 +3533,48 @@ void p1w_rows(P1Ctx& c, P1Wf32 f32x, const P1Routing& r, int M, std::mt19937_64&
             for (int q = 0; q < N; ++q) {
                 ++st.outputs;
                 if (pw[q] == pe[q] || (p1_nan(pw[q]) && p1_nan(pe[q]))) { ++hist[0]; continue; }
-                if (!p1w_fin(pw[q]) || !p1w_fin(pe[q])) { if (huge) ++st.range; else ++cls_bad; continue; }
+                if (!p1w_fin(pw[q]) || !p1w_fin(pe[q])) {
+                    if (huge) { ++st.range; continue; }
+                    /* The exact path's own f32 weights or products overflow (an e8m0 of 2^126-scale weights: the
+                     * release's scales are 117..126, work/fastpf/real-e8m0-scan.txt): its NaN is then an artefact of
+                     * f32 range, and the WMMA twin is held to the f64 sum of the exact products instead -- the same
+                     * infinity, or NaN where that sum is NaN; where both signs' mass passes f32 (an f32 sum then
+                     * reaches +inf, -inf or NaN by its order alone, the exact twin's included) any non-finite value.
+                     * Counted apart; a mismatch there is a bad value. */
+                    {
+                        double S0, A0;
+                        bool ovf = false, both = false;
+                        p1w_host_dot(b.host[(size_t)e].data(), K, q, xr, &S0, &A0, &ovf, &both);
+                        if (ovf) {
+                            const float fw = bf16_to_f32(pw[q]);
+                            /* Both signs' mass past f32: every class is an order's (the exact twin's too). */
+                            const bool agree = both ? !std::isfinite(fw)
+                                             : std::isnan(S0) ? std::isnan(fw)
+                                             : std::isinf(S0) ? (std::isinf(fw) && (fw > 0) == (S0 > 0))
+                                             : std::isfinite(fw) && std::fabs((double)fw - S0) <= std::ldexp(A0, -15) +
+                                                   std::ldexp(1.0, std::ilogb(std::max(std::fabs(S0), 1e-30)) - 7);
+                            if (agree) { ++st.ovf_ok; continue; }
+                            ++st.ovf_bad;
+                        }
+                    }
+                    /* Name it: both sides, the f64 sum and sum |w x|, the weight row's largest block scale and the
+                     * activation row's largest magnitude. */
+                    if (cls_bad < 6) {
+                        double S, Aa;
+                        p1w_host_dot(b.host[(size_t)e].data(), K, q, xr, &S, &Aa);
+                        int emax = 0, emin = 255;
+                        const uint8_t* wr = b.host[(size_t)e].data() + (size_t)q * (K / 32) * 17;
+                        for (int u = 0; u < K / 32; ++u) { emax = std::max(emax, (int)wr[u * 17]); emin = std::min(emin, (int)wr[u * 17]); }
+                        float xm = 0;
+                        for (int k = 0; k < K; ++k) if (p1w_fin(xr[k])) xm = std::max(xm, std::fabs(bf16_to_f32(xr[k])));
+                        std::printf("  %s %s: slot %d col %d (expert %d, %s): exact %04x (%g) wmma %04x (%g); f64 sum %.6g, "
+                                    "sum |wx| %.6g; the weight row's e8m0 %d..%d; the activation row's max |x| %g\n",
+                                    label, g ? "gate_up" : "down", i, q, e, forms[(size_t)e] ? "packed" : "block", pe[q],
+                                    bf16_to_f32(pe[q]), pw[q], bf16_to_f32(pw[q]), S, Aa, emin, emax, xm);
+                    }
+                    ++cls_bad;
+                    continue;
+                }
                 const long d = p1w_ulp(pw[q], pe[q]);
                 ++hist[d <= 1 ? 1 : d == 2 ? 2 : d <= 4 ? 3 : 4];
                 const double fw = bf16_to_f32(pw[q]), fe = bf16_to_f32(pe[q]), gap = std::fabs(fw - fe);
@@ -3543,6 +3599,7 @@ void p1w_rows(P1Ctx& c, P1Wf32 f32x, const P1Routing& r, int M, std::mt19937_64&
         if (f32x && full.local) {
             Dev d_32((size_t)T * N * 4), d_y3((size_t)T * N * 2);
             HC(hipMemset(d_32.p, 0, d_32.n));
+            HC(hipMemset(d_y3.p, 0xAA, d_y3.n));   /* skipped rows keep 0xAAAA, as in the served call's output */
             if (p1w_f32(c, f32x, xin, AR, K, d_tab.p, N, d_so.p, d_of.p, T, d_y3.p, (float*)d_32.p, !g) != RAD_OK) {
                 std::printf("FAIL %s: the f32 export refused the call\n", label);
                 ++c.bad;
@@ -3744,10 +3801,12 @@ int p1w_check(const Lib& L, int mmax, const char* routes_path) {
     const unsigned long long fin = st.hist[0] + st.hist[1] + st.hist[2] + st.hist[3] + st.hist[4];
     std::printf("%s: %d cases, %zu (token, slot) rows, %llu outputs against the exact twin: ulp 0 %llu (%.4f%%), 1 %llu, "
                 "2 %llu, 3-4 %llu, 5+ %llu; max |diff| %.3g, max |diff|/|exact| %.3g; %llu beyond the reordering bound, "
-                "%llu NaN/inf class differences (%llu more on rows with |x| > 2^120, the range note); f32 %llu checked, "
+                "%llu NaN/inf class differences (%llu more on rows with |x| > 2^120, the range note; %llu more where the exact "
+                "path's own f32 weights or products overflow, the WMMA twin there equal to the f64 sum's class, %llu not); "
+                "f32 %llu checked, "
                 "%llu beyond 2^-16 sum|wx|, max |err|/sum|wx| %.3g; %zu differ across runs/grids; batch invariance %zu differ; %zu bad values, %.0f s\n", mode, c.cases,
                 c.rows, st.outputs, st.hist[0], fin ? 100.0 * st.hist[0] / fin : 0.0, st.hist[1], st.hist[2],
-                st.hist[3], st.hist[4], st.max_abs, st.max_rel, st.more_bad, st.cls_bad, st.range, st.f32_n, st.f32_bad,
+                st.hist[3], st.hist[4], st.max_abs, st.max_rel, st.more_bad, st.cls_bad, st.range, st.ovf_ok, st.ovf_bad, st.f32_n, st.f32_bad,
                 st.f32_max_rel, st.det, st.invar, c.bad,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     std::fflush(stdout);
@@ -3792,10 +3851,12 @@ int p1w_check(const Lib& L, int mmax, const char* routes_path) {
         std::printf("%s: PASS: %s on %s at M 17..%d: %llu outputs within f32 reordering of the exact twin (%.4f%% "
                     "bit-equal, max %llu at 2+ ulp, all within the bound), f32 within 2^-16 sum|wx| (max %.3g), the "
                     "same bytes across runs and grids, one token's rows the same bits at M %d..%d, skipped rows "
-                    "untouched, tail zeros, waves equal to one launch (%d cases)\n", mode, ds41p1::kTwinRow,
-                    ds41p1::kWmmaMark, Ms.back() <= mmax ? Ms.back() : mmax, st.outputs,
+                    "untouched, tail zeros, waves equal to one launch (%d cases); exempt from the exact twin's NaN/inf "
+                    "class, held to the f64 sum instead: %llu outputs whose exact f32 weights or products overflow "
+                    "(test-only e8m0 edges; the release's are 117..126), %llu on rows with |x| > 2^120\n", mode,
+                    ds41p1::kTwinRow, ds41p1::kWmmaMark, Ms.back() <= mmax ? Ms.back() : mmax, st.outputs,
                     fin ? 100.0 * st.hist[0] / fin : 0.0, st.hist[2] + st.hist[3] + st.hist[4], st.f32_max_rel,
-                    inv.front(), inv.back(), c.cases);
+                    inv.front(), inv.back(), c.cases, st.ovf_ok, st.range);
     return rc;
 }
 
