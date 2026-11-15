@@ -223,11 +223,22 @@ constexpr bool decode_rows_ok(long n) { return n == 0 || (n >= kMinArmRows && n 
  * units are skip-marked and in no wave, and their rows are copied over the down projection's before the gather as
  * the CPU path's are. kHybridAdaptEnv=0 holds the share at P (1 / unset / empty: it adapts per rank from each
  * layer's outcome, at most P). Needs kDecodeRowsEnv; refused beside the host verify (kVerifyEnv), the CPU path's
- * verify policy, speculation, a drafter and the aux expert worker. Prefill passes never split. Not yet measured
- * on the cards. */
+ * verify policy, speculation, a drafter and the aux expert worker. Prefill passes split only under
+ * kHybridPrefillEnv. Not yet measured on the cards. */
 constexpr const char* kHybridEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID";
 constexpr const char* kHybridAdaptEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT";
 constexpr int kMaxHybridPct = 400;
+/* Hybrid prefill (kHybridPrefillEnv=P; 0 off, the default; else 1 to kMaxHybridPct): the same split in a prefill
+ * pass armed for the card path (kEnv, at least kMinRowsEnv rows): each card-path routed layer gives the CPU pool the
+ * RAM-cache units with the fewest rows while the pool's predicted time stays within P percent of the card's
+ * predicted link time for the rest, with a share of its own (adapted per rank as kHybridAdaptEnv says) and counts of
+ * its own. A card's prefill MoE time is its link time for the units it stages, which differs between the ranks layer
+ * by layer (EPBAL-20261115.md: the slowest rank stages ~10% above the mean, ~7 ms a layer at the MoE all-reduce);
+ * the pool is shared, so a rank with more to stage keeps more of it and the CPU evens the ranks out as well as
+ * shortening them. Exact as the decode split: the CPU's rows are written into the owning rank's down-projection
+ * rows before its gather, the same bytes the card path writes (core/place/p1_hybrid.h). Independent of kHybridEnv
+ * (either or both); the same refusals, except that it does not need kDecodeRowsEnv. */
+constexpr const char* kHybridPrefillEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL";
 constexpr const char* kLendRestEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_REST_MS";
 constexpr int kDefLendRestMs = 5000, kMaxLendRestMs = 600000;
 constexpr int kDefWave = 2, kDefInflight = 16, kDefReady = 6, kDefAhead = 8, kDefMinRows = 320;
@@ -273,6 +284,7 @@ constexpr const char* kLogLendAudit = "ds41 p1: lent audit";    /* rank 0, at st
 constexpr const char* kLogLendRest = "ds41 p1: lent rest";      /* rank 0, at startup, with a rest (kLendRestEnv) */
 constexpr const char* kLogDecode = "ds41 p1: decode passes on the cards";   /* rank 0, at startup, with kDecodeRowsEnv */
 constexpr const char* kLogHybrid = "ds41 p1: hybrid decode on";   /* rank 0, at startup, with kHybridEnv */
+constexpr const char* kLogHybridPrefill = "ds41 p1: hybrid prefill on";   /* rank 0, at startup, with kHybridPrefillEnv */
 
 /* Whether the lent arena is asked for (kEnv `p1` on, kLendArenaEnv `lend` a count from 1 to kMaxLend):
  * the deepseek41 plugin then declares at a smaller step too. A value the core refuses counts as not

@@ -201,6 +201,18 @@
 # measured only with rank 0's "ds41 p1: hybrid decode on: ... (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=P;" line
 # naming its share mode (any other arm only without one), and at exit (qy_gate) only if every rank's stats line
 # counts its hybrid passes and some rank split one ("hybrid: passes split S", S > 0). Not yet measured on the cards.
+# QypP: hybrid prefill (..._P1_HYBRID_PREFILL=P, 1-400; every other arm states 0): the same split in the prefill
+# passes P1 arms, with a share of its own (EPBAL-20261115.md: the CPU pool takes the fewest-row RAM-cache units off
+# the link-bound cards, more from a rank with more to stage). Needs P1, not Qd; Qyf's held share holds it too.
+# Skipped beside Sg, Ds, Ax (Ax0 is fine), Qv and the verify policy, as Qy. Measured only with rank 0's "ds41 p1:
+# hybrid prefill on: ... (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL=P;" line (any other arm only without it), and
+# at exit (qyp_gate) only if every rank's stats line counts its prefill splits and some rank split a pass ("hybrid
+# prefill: passes split S", S > 0). Not yet measured on the cards.
+# Qyk: kernel costs (..._HOST_EXPERTS_KERNEL_COST=1; every other arm states 0): the CPU pool charges a job's further
+# rows at the rate of the kernel it runs (the many-row one from 4 rows when Mr is above 4), and the hybrid split
+# (Qy, Qyp) takes units cheapest first instead of fewest rows first, so a 3- or 4-row unit that does not fit no
+# longer blocks cheaper 5-row-or-more ones. Selection only (exact). Changes nothing at Mr4. Measured only with the
+# pool's "host experts: kernel costs" line (any other arm only without it).
 #
 # Coordinated actual Ar1280+Ag1024 caps additionally need SELFTEST_AR_AG_SHARED=<r4d_selftest>:
 # fresh all-four-card ds41_ar_ag_shared_exact pointer/lifetime/mixed replay receipt. It supplements
@@ -573,6 +585,19 @@ lcp_check() {   # name
     return 1
   fi
   [[ -n "${ARM_QY:-}" ]] && grep -m1 -E 'ds41 p1: hybrid decode on' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # QypP: rank 0's hybrid prefill line at startup, in a Qyp arm only (qyp_gate).
+  local qyp_why
+  if declare -F qyp_gate >/dev/null && ! qyp_why=$(qyp_gate "$OUT/$name.server.log" "${ARM_QYP:-}" start); then
+    log "arm $name: $qyp_why; not measured"
+    return 1
+  fi
+  [[ -n "${ARM_QYP:-}" ]] && grep -m1 -E 'ds41 p1: hybrid prefill on' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # Qyk: the pool's kernel-cost line at startup, in a Qyk arm only (qyk_gate).
+  local qyk_why
+  if declare -F qyk_gate >/dev/null && ! qyk_why=$(qyk_gate "$OUT/$name.server.log" "${ARM_QYK:-}"); then
+    log "arm $name: $qyk_why; not measured"
+    return 1
+  fi
   # Ee: rank 0's Engram-early line at startup, in an Ee arm only (ee_gate).
   local ee_why
   if declare -F ee_gate >/dev/null && ! ee_why=$(ee_gate "$OUT/$name.server.log" "${ARM_EE:-}" start); then
@@ -1012,6 +1037,48 @@ qy_gate() {   # log, Qy share, Qyf (non-empty: held), start/exit
   done < <(grep -E 'ds41 p1 stats, rank [0-9]+: ' "$f")
   (( ranks > 0 )) || { echo "Qy$qy, but no 'ds41 p1 stats, rank' line at exit"; return 1; }
   (( split > 0 )) || { echo "Qy$qy, but no rank split a decode pass (no RAM-cache unit fit the share?): the switch never acted"; return 1; }
+  return 0
+}
+
+# Qyk (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST): the pool's startup line in a Qyk arm, none in any other.
+# Arguments: the log, the arm's flag (non-empty: Qyk). 0 when the arm may be measured; else 1, the reason on stdout.
+qyk_gate() {   # log, Qyk flag
+  local f=$1 qyk=$2 n
+  n=$(grep -c 'host experts: kernel costs (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST=1)' "$f")
+  if [[ -z "$qyk" ]]; then
+    (( n == 0 )) || { echo "no Qyk part, but the pool runs kernel costs (the knob set for the window?)"; return 1; }
+    return 0
+  fi
+  (( n > 0 )) || { echo "Qyk, but the server log has no 'host experts: kernel costs' line"; return 1; }
+  return 0
+}
+
+# QypP (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL): at start rank 0's "ds41 p1: hybrid prefill on: ...
+# (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL=P;" line in a Qyp arm, none in any other; at exit every rank's stats
+# line with its prefill hybrid counts and some rank's split prefill passes above 0 (the switch acted). Arguments: the
+# log, the arm's P (empty: no Qyp part), start/exit. 0 when the arm may be measured; else 1, the reason on stdout.
+qyp_gate() {   # log, Qyp share, start/exit
+  local f=$1 qyp=$2 stage=${3:-start} n split=0 ranks=0 a line
+  n=$(grep -c 'ds41 p1: hybrid prefill on' "$f")
+  if [[ -z "$qyp" ]]; then
+    if (( n > 0 )); then echo "no Qyp part, but the server splits prefill passes (the knob set for the window?)"; return 1; fi
+    if [[ "$stage" == exit ]] && grep -qE 'ds41 p1 stats, rank [0-9]+: .*; hybrid prefill: passes split [1-9]' "$f"; then
+      echo "no Qyp part, but a rank split prefill passes"; return 1
+    fi
+    return 0
+  fi
+  if ! grep -q "ds41 p1: hybrid prefill on: .*(RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL=$qyp;" "$f"; then
+    echo "Qyp$qyp, but the server log has no 'ds41 p1: hybrid prefill on: ... (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL=$qyp;' line ($(grep -m1 -E 'ds41 p1: hybrid prefill|P1_HYBRID_PREFILL' "$f"))"; return 1
+  fi
+  [[ "$stage" == exit ]] || return 0
+  while IFS= read -r line; do
+    ranks=$((ranks + 1))
+    a=$(sed -nE 's/.*; hybrid prefill: passes split ([0-9]+) of ([0-9]+) armed.*/\1/p' <<< "$line")
+    if [[ -z "$a" ]]; then echo "Qyp$qyp, but a 'ds41 p1 stats, rank' line without its prefill hybrid counts ($line)"; return 1; fi
+    split=$((split + a))
+  done < <(grep -E 'ds41 p1 stats, rank [0-9]+: ' "$f")
+  (( ranks > 0 )) || { echo "Qyp$qyp, but no 'ds41 p1 stats, rank' line at exit"; return 1; }
+  (( split > 0 )) || { echo "Qyp$qyp, but no rank split a prefill pass (no RAM-cache unit fit the share?): the switch never acted"; return 1; }
   return 0
 }
 
@@ -1779,6 +1846,13 @@ EOF2
     log "arm $name: $qy_exit_why; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
+  # QypP at exit: some rank split a prefill pass (qyp_gate).
+  local qyp_exit_why
+  if declare -F qyp_gate >/dev/null && ! qyp_exit_why=$(qyp_gate "$OUT/$name.server.log" "${ARM_QYP:-}" exit); then
+    log "arm $name: $qyp_exit_why; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+  fi
+  [[ -n "${ARM_QYP:-}" ]] && grep -E 'ds41 p1 stats, rank [0-9]+: ' "$OUT/$name.server.log" | sed -nE 's/^(I\[[0-9]+\]) .*(; hybrid prefill: .*)$/\1\2/p' | tee -a "$OUT/window.log"
   # Pmr with a drafting Ds part (DSpark's 2+ row verify passes) at shutdown: the predictor's
   # multi-row line, and some rank's "by pass size" line with a "2 rows:" entry that planned units;
   # otherwise the switch never acted on a verify pass and the arm is set aside (mrra review B3).
@@ -3443,7 +3517,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$(arm_full "$a")"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" sg="" pcn=""
-  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qsp="" qt="" qz="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr="" ee=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qyp="" qyk="" qsp="" qt="" qz="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr="" ee=""
   ctp=""   # Ctp / CtpN: the prefill chain trace (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL)
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
@@ -3681,6 +3755,15 @@ for a in $ARMS; do
                  [[ $qk == VERIFY ]] && qv=$((10#$qn))
                else log "arm $a: $p: ${p:0:2} takes $qlo-$qhi; the arm is skipped"; skip=1; fi ;;
       Qs)      q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN=start) ;;       # ...chunks aligned to the start
+      Qyk)                                                             # kernel costs: the pool's and the hybrid split's
+               if [[ -n "$qyk" ]]; then log "arm $a: two Qyk parts; the arm is skipped"; skip=1; fi
+               qyk=1 ;;
+      Qyp[0-9]*)                                                       # hybrid prefill: the CPU's share P% in armed prefill passes
+               qn=${p#Qyp}
+               if [[ -n "$qyp" ]]; then log "arm $a: two Qyp parts; the arm is skipped"; skip=1
+               elif [[ $qn =~ ^[0-9]+$ ]] && (( 10#$qn >= 1 && 10#$qn <= 400 )); then
+                 qyp=$((10#$qn)); q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL=$qyp)
+               else log "arm $a: $p: Qyp takes 1-400 (percent); the arm is skipped"; skip=1; fi ;;
       Qy[0-9]*|Qyf[0-9]*)                                              # hybrid decode: the CPU's share P% (Qyf: held)
                if [[ $p == Qyf* ]]; then qyf=1; qn=${p#Qyf}; else qn=${p#Qy}; fi
                if [[ -n "$qy" ]]; then log "arm $a: two Qy parts; the arm is skipped"; skip=1
@@ -4017,6 +4100,9 @@ for a in $ARMS; do
   # MrN: arms without it take jobs of the default 4 rows, whatever the window's environment (0 is
   # not this switch's off: any value outside 1-32 turns host experts off).
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS="* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=4)
+  # Qyk: kernel costs on; every other arm states them off, whatever the window's environment.
+  if [[ -n "$qyk" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST=1)
+  else env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST=0); fi
   # Dk / Dkt / DbN / Dg / Df act on the DSpark drafter only: without a Ds part the arm would not test
   # them. Dg gates drafts, so not with Ds0 (nothing drafts; the engine refuses the pair); Df extends
   # the trunk's FP8 to the drafter, so it needs F8 (without it the plugin keeps the drafter bf16).
@@ -4238,7 +4324,7 @@ for a in $ARMS; do
           RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0
           RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=0
           RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=0 RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=0
-          RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT= "${q1[@]}")
+          RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT= RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL=0 "${q1[@]}")
     [[ -n "$qg" && -z "$ql$qe" ]] && { log "arm $a: Qh$qg sets the lent slots' grace, which needs a QlK or QeK part; the arm is skipped"; skip=1; }
     # QdN: decode passes of N rows or more on the cards; a pass is at most the chunk, and a split step (Tb) launches
     # a layer's expert ops once a micro-batch (the engine refuses both).
@@ -4254,6 +4340,14 @@ for a in $ARMS; do
       [[ -n "$qv" && "$qv" != 0 ]] && { log "arm $a: Qy$qy beside Qv$qv (the host verify: the engine refuses it); the arm is skipped"; skip=1; }
       [[ "$pol" == verify ]] && { log "arm $a: Qy$qy beside the verify policy (the engine refuses it); the arm is skipped"; skip=1; }
     fi
+    # QypP: hybrid prefill splits the prefill passes P1 arms; the same refusals as Qy, without Qd.
+    if [[ -n "$qyp" ]]; then
+      [[ -n "$sg" && "$sg" != 0 ]] && { log "arm $a: Qyp$qyp beside Sg$sg (speculation: the engine refuses it); the arm is skipped"; skip=1; }
+      [[ -n "$ds" ]] && { log "arm $a: Qyp$qyp beside $ds (a drafter: the engine refuses it); the arm is skipped"; skip=1; }
+      [[ -n "$ax" && "$ax" != 0 ]] && { log "arm $a: Qyp$qyp beside the aux expert worker (Ax: the engine refuses it); the arm is skipped"; skip=1; }
+      [[ -n "$qv" && "$qv" != 0 ]] && { log "arm $a: Qyp$qyp beside Qv$qv (the host verify: the engine refuses it); the arm is skipped"; skip=1; }
+      [[ "$pol" == verify ]] && { log "arm $a: Qyp$qyp beside the verify policy (the engine refuses it); the arm is skipped"; skip=1; }
+    fi
   else
     (( ${#q1[@]} )) && { log "arm $a: the Q parts (${q1[*]}) need P1; the arm is skipped"; skip=1; }
     [[ -n "$ctp" ]] && { log "arm $a: Ctp$ctp traces armed card-path prefill passes, which need P1; the arm is skipped"; skip=1; }
@@ -4262,7 +4356,7 @@ for a in $ARMS; do
           RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0
           RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=0
           RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=0 RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=0
-          RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT=)
+          RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT= RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL=0)
   fi
   # LhS (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT): the lent slots follow live decode routing, in an arm that lends
   # the arena (QeK, so P1 and Lc too). Every arm states the switch (0 without the part) and its two tunables
@@ -4428,7 +4522,7 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
   if [[ -n "$ARM_TIMEOUT" ]] && ! [[ $ARM_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]]; then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QSP=$qsp ARM_QT=$qt ARM_QZ=$qz ARM_LH=$lh ARM_EE=$ee
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QYP=$qyp ARM_QYK=$qyk ARM_QSP=$qsp ARM_QT=$qt ARM_QZ=$qz ARM_LH=$lh ARM_EE=$ee
   ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr ARM_SL=$sl ARM_CTX=$arm_ctx ARM_CR=$cr
   if [[ -n "$cr" ]]; then
     crk=${ARM_CONC:-${AB_CONCURRENCY:-1}}

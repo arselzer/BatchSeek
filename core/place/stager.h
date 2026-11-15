@@ -873,7 +873,8 @@ private:
     int64_t  p1_decode_rows_ = 0;
     bool     p1_decode_pass_ = false;
     uint64_t p1_dec_passes_ = 0, p1_dec_rows_ = 0, p1_dec_max_ = 0, p1_dec_ns_ = 0, p1_dec_below_ = 0;
-    /* ..._P1_HYBRID (p1_hybrid.h; 0 off: none of this acts): this pass is an armed decode pass that may split;
+    /* ..._P1_HYBRID (p1_hybrid.h; 0 off: none of this acts): this pass is an armed decode pass that may split
+     * (or, under ..._P1_HYBRID_PREFILL, an armed prefill pass: p1_decode_pass_ false);
      * the layer whose CPU units are with the pool (-1 none); the event behind its waves (after_op) and whether
      * it was recorded; the submit time; the share. p1_hyb_pick chooses (fills p1_hyb_to_, by want_ index),
      * p1_hyb_take borrows and submits, p1_hyb_done counts a layer at its gather (hx_finish). */
@@ -893,6 +894,10 @@ private:
     RadEvent p1_hyb_ev_ = nullptr;
     std::chrono::steady_clock::time_point p1_hyb_t_sub_{};
     p1hyb::Share p1_hyb_share_;
+    /* ..._P1_HYBRID_PREFILL: the prefill passes' own share (a prefill layer stages far more than a decode one, so
+     * the two adapt apart); p1_hyb_shr() is the share of this pass's kind. */
+    p1hyb::Share p1_hyb_pf_share_;
+    p1hyb::Share& p1_hyb_shr() { return p1_decode_pass_ ? p1_hyb_share_ : p1_hyb_pf_share_; }
     std::vector<p1hyb::Cand> p1_hyb_cand_;
     std::vector<uint8_t> p1_hyb_to_;
     std::vector<int> p1_hyb_order_;
@@ -902,7 +907,14 @@ private:
         uint64_t other_level = 0;   /* layers whose operands were last seen at the other arena level */
         uint64_t cpu_rows = 0, cpu_ns = 0, wait_ns = 0, late = 0, late_wait_ns = 0, early = 0;
         double   pred_cpu_ns = 0, pred_card_ns = 0;
-    } p1_hyb_st_;
+        uint64_t issue_ns = 0;      /* prefill only: the armed passes' issue time (decode's is p1_dec_ns_) */
+    } p1_hyb_st_, p1_hyb_pf_st_;   /* decode passes', and (..._P1_HYBRID_PREFILL) prefill passes' */
+    HybStats& p1_hyb_cur() { return p1_decode_pass_ ? p1_hyb_st_ : p1_hyb_pf_st_; }
+    /* Whether an armed pass may split, from its kind and the two switches (the event is the switches' common
+     * resource). */
+    static bool p1_hyb_arms(bool armed, bool decode, int hybrid, int hybrid_prefill, bool have_event) {
+        return armed && have_event && (decode ? hybrid > 0 : hybrid_prefill > 0);
+    }
     int  p1_hyb_pick(int32_t li);
     bool p1_hyb_borrow(int32_t u, int rows, bool admit);
     int  p1_hyb_submit(int32_t li);

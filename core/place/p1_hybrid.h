@@ -25,6 +25,17 @@
  * unit to the ring as before; so which units the RAM cache holds evolves as without the switch, except
  * that background inserts that wait for an idle pool (HostExpertPool::wait_idle) may land later.
  *
+ * ---- prefill (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL=<pct>) ------------------------------------------------
+ *
+ * The same split in an armed prefill pass's card-path layers, with a share and counts of its own. Nothing above
+ * depends on the pass's height: the CPU path's rows are the decode band's bits at any height (the CPU path takes
+ * whole prefill chunks under LCP), the skip mark keeps the twin (and the register-tiled twin) off a unit's slots at
+ * any M, and hx_finish copies the rows over the owning rank's down projection before that rank's gather. So each
+ * rank's bf16 partial, and the all-reduce's ascending-rank fold of the four, are the base's. Why: a prefill card is
+ * link-bound on the units it stages, and which rank stages most changes layer by layer (EPBAL-20261115.md); the
+ * pool is one for all ranks, and each rank's budget is its own remaining card bytes, so the CPU takes more from a
+ * rank with more to stage.
+ *
  * ---- the split ----------------------------------------------------------------------------------------
  *
  * choose(): of a layer's off-card selected units (its ring units without the switch), only RAM-cache hits
@@ -68,9 +79,17 @@ struct Split {
 };
 
 /* to_cpu[i] (n entries) set for the units the CPU takes. cpu_bpns / link_bpns: bytes a ns
- * (HostExpertPool::cpu_bytes_per_ns, link_bytes_per_ns); share > 0. `order` is scratch. */
+ * (HostExpertPool::cpu_bytes_per_ns, link_bytes_per_ns); share > 0. `order` is scratch.
+ *
+ * `cost`: a unit's cost of `rows` rows (null: HostExpertPool::cost_rows). `by_cost`
+ * (..._HOST_EXPERTS_KERNEL_COST): the scan takes units cheapest first (stable: rows, then the layer's order, on
+ * ties) instead of fewest rows first. Every unit stands for the same card bytes here, so cheapest first is the
+ * order in which the first misfit bounds every unit after it and the break stays right; fewest rows first is the
+ * same order only while the cost grows with the rows, which the default's costs do not past four rows a job. */
 inline Split choose(const Cand* c, int n, int64_t backlog, double cpu_bpns, double link_bpns, double share,
-                    uint8_t* to_cpu, std::vector<int>* order) {
+                    uint8_t* to_cpu, std::vector<int>* order, bool by_cost = false,
+                    int64_t (*cost_fn)(int) = nullptr) {
+    int64_t (*const cost_of)(int) = cost_fn ? cost_fn : &HostExpertPool::cost_rows;
     Split s;
     for (int i = 0; i < n; ++i) {
         to_cpu[i] = 0;
@@ -83,9 +102,11 @@ inline Split choose(const Cand* c, int n, int64_t backlog, double cpu_bpns, doub
     for (int i = 0; i < n; ++i)
         if (c[i].cached && c[i].rows > 0 && c[i].bytes > 0) order->push_back(i);
     std::stable_sort(order->begin(), order->end(), [&](int a, int b) { return c[a].rows < c[b].rows; });
+    if (by_cost)
+        std::stable_sort(order->begin(), order->end(), [&](int a, int b) { return cost_of(c[a].rows) < cost_of(c[b].rows); });
     const double base = (double)std::max<int64_t>(backlog, 0);
     for (int i : *order) {
-        const int64_t cost = s.cpu_cost + HostExpertPool::cost_rows(c[i].rows);
+        const int64_t cost = s.cpu_cost + cost_of(c[i].rows);
         const int64_t left = s.card_bytes - c[i].bytes;
         const double cpu = (base + (double)cost) / cpu_bpns, card = (double)left / link_bpns;
         if (cpu > share * card) break;

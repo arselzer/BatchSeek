@@ -33,6 +33,16 @@
 #      the held share) and every other switch as the fast arm, every arm without the part states it 0 and the adapt
 #      switch empty, while Qy without Qd, beside Sg8, Qv8 or Ax, Qy0, two Qy parts and Qy without P1 are skipped
 #      with the reason.
+#   6c. QypP (hybrid prefill, ..._P1_HYBRID_PREFILL): qyp_gate on synthetic logs (a Qyp arm is measured only with
+#      rank 0's hybrid prefill line naming its share, and at exit only when every rank's stats line counts its prefill
+#      splits and some rank split one; an arm without the part only without the line and with none split; the decode
+#      hybrid's line and counts never stand in for it, nor its for them); in the arm loop Qyp30 on the fast arm (no Qd
+#      needed) and Qd64-Qy60-Qyp30 are launched with the switch and every other switch as the fast arm (Qy60's
+#      decode switch unchanged beside it), every arm without the part states it 0, while Qyp beside Sg8, Qv8 or Ax,
+#      Qyp0, two Qyp parts and Qyp without P1 are skipped with the reason.
+#   6d. Qyk (kernel costs, ..._HOST_EXPERTS_KERNEL_COST): qyk_gate on synthetic logs (the pool's line in a Qyk arm
+#      only); in the arm loop Qd64-Qy60-Qyk and Qd64-Qy60-Qyp60-Qyk on the fast arm state it 1, every other arm 0,
+#      and two Qyk parts are skipped.
 #   7. Ctp / CtpN (the prefill chain trace, ..._CHAIN_TRACE_PREFILL): the fast arm with Ctp traces one armed
 #      prefill pass in 4 into chain-<arm>, with Qd64 Ct16 Ctp2 both traces at their N into the same files;
 #      Ctp without P1 and Ctp0 are skipped with the reason; arms without the part do not set it; and
@@ -62,6 +72,10 @@ eval "$(sed -n '/^qd_gate() {/,/^}/p' "$W")"
 declare -F qd_gate >/dev/null || { echo "FAIL no qd_gate in $W"; exit 1; }
 eval "$(sed -n '/^qy_gate() {/,/^}/p' "$W")"
 declare -F qy_gate >/dev/null || { echo "FAIL no qy_gate in $W"; exit 1; }
+eval "$(sed -n '/^qyp_gate() {/,/^}/p' "$W")"
+eval "$(sed -n '/^qyk_gate() {/,/^}/p' "$W")"
+declare -F qyk_gate >/dev/null || { echo "FAIL no qyk_gate in $W"; exit 1; }
+declare -F qyp_gate >/dev/null || { echo "FAIL no qyp_gate in $W"; exit 1; }
 eval "$(sed -n '/^ee_gate() {/,/^}/p' "$W")"
 declare -F ee_gate >/dev/null || { echo "FAIL no ee_gate in $W"; exit 1; }
 OUT=$T/logs
@@ -228,6 +242,63 @@ qylc 1 "lcp_check: the P1 arm with Qd64-Qy25, no hybrid line"        qd64lc 25 "
 qylc 1 "lcp_check: the P1 arm without Qy on a server that splits"    qy25lc "" ""
 qylc 0 "lcp_check: the P1 arm with Qd64 without Qy, as before"       qd64lc "" ""
 
+# ---- 6c. QypP: qyp_gate on synthetic logs, alone and through lcp_check.
+qyp_line() { echo "I[0] ds41 p1: hybrid prefill on: in a prefill pass armed for the cards (320 rows or more), each card-path routed layer gives the CPU pool the RAM-cache units with the fewest rows while the pool's predicted time stays within $1% of the card's predicted link time for the rest (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL=$1; pool 78.0 GB/s, link 20.0 GB/s, a share of its own that adapts per rank from each layer's outcome, at most that); ..."; }
+qyp_stats() {   # rank, decode split, prefill split (empty: no prefill counts)
+  echo "I[$1] ds41 p1 stats, rank $1: passes 40, ...; touched experts 900: VRAM residents 1, slab 2, ring 3, CPU pool 4; ...; decode passes armed 12, rows 3072 (at most 256 a pass), issue 20.500 s; decode passes of 17 to 63 rows on the CPU path 3; hybrid: passes split $2 of 12 armed, layers 400, units CPU 900 / card 3000 (fell back 0, layers without rows 0), CPU rows 2000, ..., share 25.0% (lowest 12.0%)${3:+; hybrid prefill: passes split $3 of 30 armed, layers 1200, units CPU 9000 / card 60000 (fell back 0, layers without rows 0, rows at the other arena level 0), CPU rows 20000, CPU 12.000 s (0.4000 s a pass) against issue 3.5000 s a pass, predicted CPU 9.000 s / card 70.000 s, gather wait 1.000 s, late layers 3 (wait 0.010 s), early layers 900, share 30.0% (lowest 20.0%)}"
+}
+mk qyp30 "$lc_line" "$(p1_line 320)" "$(qyp_line 30)"
+mk qyp30qy "$lc_line" "$(p1_line 320)" "$(qd_line 64 2048)" "$(qy_line 60 "$qy_adapt")" "$(qyp_line 30)"
+{ cat "$OUT/qyp30.server.log"; for r in 0 1 2 3; do qyp_stats $r 0 7; done; } > "$OUT/qypexit.server.log"
+{ cat "$OUT/qyp30.server.log"; for r in 0 1 2 3; do qyp_stats $r 0 0; done; } > "$OUT/qypidle.server.log"
+{ cat "$OUT/qyp30.server.log"; for r in 0 1 2 3; do qyp_stats $r 9 ""; done; } > "$OUT/qypnocount.server.log"
+{ cat "$OUT/qyp30.server.log"; qyp_stats 0 0 5; qyp_stats 1 0 ""; } > "$OUT/qypodd.server.log"
+{ cat "$OUT/qy25.server.log"; for r in 0 1 2 3; do qyp_stats $r 4 6; done; } > "$OUT/qypstray.server.log"
+{ cat "$OUT/qy25.server.log"; for r in 0 1 2 3; do qyp_stats $r 4 ""; done; } > "$OUT/qydeconly.server.log"
+qypexpect() {   # want(0/1) what log QYP stage
+  local want=$1 what=$2 rc
+  qyp_gate "$OUT/$3.server.log" "$4" "$5" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$what"; else bad "$what: exit $rc, want $want ($(qyp_gate "$OUT/$3.server.log" "$4" "$5"))"; fi
+}
+qypexpect 0 "Qyp30, its line"                                              qyp30      30 start
+qypexpect 0 "Qyp30 beside Qy60, its line"                                  qyp30qy    30 start
+qypexpect 1 "Qyp60 on a server that took 30"                               qyp30      60 start
+qypexpect 1 "Qyp30, only the decode hybrid's line"                         qy25       30 start
+qypexpect 1 "Qyp30, no hybrid line"                                        qd200      30 start
+qypexpect 1 "no Qyp part on a server that splits prefill passes"           qyp30      "" start
+qypexpect 0 "no Qyp part, the decode hybrid's line only"                   qy25       "" start
+qypexpect 0 "Qyp30 at exit: ranks split prefill passes"                    qypexit    30 exit
+qypexpect 1 "Qyp30 at exit: no rank split one (the switch never acted)"    qypidle    30 exit
+qypexpect 1 "Qyp30 at exit: decode splits only, no prefill counts"         qypnocount 30 exit
+qypexpect 1 "Qyp30 at exit: a stats line without its prefill counts"       qypodd     30 exit
+qypexpect 1 "Qyp30 at exit: no stats line"                                 qyp30      30 exit
+qypexpect 1 "no Qyp part at exit, but a rank split prefill passes"         qypstray   "" exit
+qypexpect 0 "no Qyp part at exit, decode splits only"                      qydeconly  "" exit
+qyexpect 0 "Qy25 at exit beside prefill counts: the decode gate unchanged" qypstray   25 ""  exit
+qyplc() {   # want(0/1) what log QYP
+  local want=$1 what=$2 rc
+  ARM_LC=2048 ARM_P1=1 ARM_QM=320 ARM_QL="" ARM_QE="" ARM_QD="" ARM_QY="" ARM_QYF="" ARM_QYP=$4 lcp_check "$3" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$what"; else bad "$what: exit $rc, want $want ($(tail -1 "$OUT/window.log"))"; fi
+}
+mk qyp30lc "${lc_line//1024/2048}" "$(p1_line 320 | sed 's/320 to 1024/320 to 2048/')" "$(qyp_line 30)"
+mk p1lc "${lc_line//1024/2048}" "$(p1_line 320 | sed 's/320 to 1024/320 to 2048/')"
+qyplc 0 "lcp_check: the P1 arm with Qyp30, its line"                 qyp30lc 30
+qyplc 1 "lcp_check: the P1 arm with Qyp30, no hybrid prefill line"   p1lc    30
+qyplc 1 "lcp_check: the P1 arm without Qyp on a server that splits"  qyp30lc ""
+qyplc 0 "lcp_check: the P1 arm without Qyp, as before"               p1lc    ""
+
+# ---- 6d. Qyk: qyk_gate on synthetic logs.
+mk qyk "$lc_line" "$(p1_line 320)" "I host experts: kernel costs (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST=1): a job's further rows at the rate of the kernel it runs (the many-row one from 4 rows), and the hybrid split takes units by cost"
+qykexpect() {   # want(0/1) what log QYK
+  local want=$1 what=$2 rc
+  qyk_gate "$OUT/$3.server.log" "$4" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$what"; else bad "$what: exit $rc, want $want"; fi
+}
+qykexpect 0 "Qyk, its line"                            qyk    1
+qykexpect 1 "Qyk, no kernel-cost line"                 qyp30  1
+qykexpect 1 "no Qyk part on a server with kernel costs" qyk   ""
+qykexpect 0 "no Qyk part, no line"                     qyp30  ""
+
 # Qsp's startup and useful-work gates, independent of ordinary P1 startup admission.
 eval "$(sed -n '/^qsp_gate() {/,/^}/p' "$W")"
 declare -F qsp_gate >/dev/null || { echo "FAIL no qsp_gate in $W"; exit 1; }
@@ -388,6 +459,17 @@ CTP0=$FAST-Ctp0
 EE=$FAST-Ee
 EEQY=$FAST-Qd64-Qy60-Ee
 QY60=$FAST-Qd64-Qy60
+QYP30=$FAST-Qyp30
+QYPQY=$FAST-Qd64-Qy60-Qyp30
+QYPSG=$FAST-Qyp30-Sg8
+QYPV=$FAST-Qyp30-Qv8
+QYPAX=$FAST-Qyp30-Ax
+QYP0=$FAST-Qyp0
+QYPTWO=$FAST-Qyp30-Qyp60
+QYPNOP=$REF-Qyp30
+QYK=$FAST-Qd64-Qy60-Qyk
+QYKP=$FAST-Qd64-Qy60-Qyp60-Qyk
+QYKTWO=$FAST-Qd64-Qy60-Qyk-Qyk
 ARMS="$REF $NEW $NEWG $SHORTM $Q17 $OVERL $GNOL $LNOP $BIG $BIGG $BIGM $ENOP $COLD4K $PC4K $NOINT4K $LOWINT4K $NOPC4K $OVER4K"
 ARMS="$ARMS $FAST $SG8 $SGA8 $SG15 $SG16 $N2SG7 $N2SG8 $N8SG2 $SG0"
 ARMS="$ARMS $QD200 $QD4096 $QD16 $QDTB $QDNOP"
@@ -401,13 +483,14 @@ QTQZ=$FAST-Qsp-Qt-Qz
 QZNOP=$REF-Qz
 ARMS="$ARMS $QT $QTQSP $QTNOP $QZ $QTQZ $QZNOP"
 ARMS="$ARMS $EE $EEQY $QY60"
+ARMS="$ARMS $QYP30 $QYPQY $QYPSG $QYPV $QYPAX $QYP0 $QYPTWO $QYPNOP $QYK $QYKP $QYKTWO"
 run_loop() {   # actual balance-oracle bound; every model action remains stubbed
  (
   set +u
   log() { echo "LOG: $*"; }
   power_set() { :; }; power_restore() { :; }
   vpack_gate() { return 0; }
-  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; echo "  ARM_QD: ${ARM_QD:-}"; echo "  ARM_QY: ${ARM_QY:-}"; echo "  ARM_QYF: ${ARM_QYF:-}"; echo "  ARM_QT: ${ARM_QT:-}"; echo "  ARM_EE: ${ARM_EE:-}"; }
+  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; echo "  ARM_QD: ${ARM_QD:-}"; echo "  ARM_QY: ${ARM_QY:-}"; echo "  ARM_QYF: ${ARM_QYF:-}"; echo "  ARM_QYP: ${ARM_QYP:-}"; echo "  ARM_QYK: ${ARM_QYK:-}"; echo "  ARM_QT: ${ARM_QT:-}"; echo "  ARM_EE: ${ARM_EE:-}"; }
   HX_THREADS=16 SILU=/dev/null RHOME=$H RADIANCE_HOME_DIR2=$H MIRROR=$T
   PROMPTS=$T/prompts.json
   unset RADIANCE_TUNE
@@ -599,6 +682,52 @@ qdskip "$QYAX" "Qy25 beside the aux expert worker.*skipped"
 qdskip "$QY0" "Qy0: Qy takes 1-400.*skipped"
 qdskip "$QYTWO" "two Qy parts.*skipped"
 qdskip "$QYNOP" "the Q parts (.*RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=25.*) need P1.*skipped"
+# ---- 6c. QypP in the arm loop.
+for spec in "$QYP30:30:" "$QYPQY:30:60"; do
+  IFS=: read -r a n qyn <<< "$spec"
+  sec=$(section "$a")
+  if [[ -z "$sec" ]]; then bad "the Qyp$n arm was not launched: $(grep -m3 "arm $a" "$T/loop.txt")"; continue; fi
+  has "Qyp$n${qyn:+ beside Qy$qyn}" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL "$n"
+  has "Qyp$n${qyn:+ beside Qy$qyn}" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID "${qyn:-0}"
+  has "Qyp$n${qyn:+ beside Qy$qyn}" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT ""
+  has "Qyp$n${qyn:+ beside Qy$qyn}" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS "$([[ -n "$qyn" ]] && echo 64 || echo 0)"
+  grep -qx "  ARM_QYP: $n" <<< "$sec" && ok "Qyp$n: the arm is gated on its hybrid prefill line (ARM_QYP=$n)" || bad "Qyp$n: ARM_QYP is '$(grep '  ARM_QYP:' <<< "$sec")'"
+  grep -qx "  ARM_QY: $qyn" <<< "$sec" && ok "Qyp$n: ARM_QY='$qyn'" || bad "Qyp$n: ARM_QY is '$(grep '  ARM_QY:' <<< "$sec")'"
+  for v in RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA \
+           RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES \
+           RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS RADIANCE_EXPERIMENTAL_SCHED_TBO RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY; do
+    has "Qyp$n as the fast arm" "$sec" "$v" "$(val "$fast" "$v")"
+  done
+done
+for a in "$REF" "$NEW" "$BIG" "$FAST" "$SG8" "$QD200" "$QY25" "$QY60"; do
+  has "no Qyp part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL 0
+  grep -qx "  ARM_QYP: " <<< "$(section "$a")" && ok "no Qyp part ($a): ARM_QYP empty" || bad "no Qyp part ($a): ARM_QYP is '$(grep '  ARM_QYP:' <<< "$(section "$a")")'"
+done
+qdskip "$QYPSG" "Qyp30 beside Sg8 (speculation.*skipped"
+qdskip "$QYPV" "Qyp30 beside Qv8 (the host verify.*skipped"
+qdskip "$QYPAX" "Qyp30 beside the aux expert worker.*skipped"
+qdskip "$QYP0" "Qyp0: Qyp takes 1-400.*skipped"
+qdskip "$QYPTWO" "two Qyp parts.*skipped"
+qdskip "$QYPNOP" "the Q parts (.*RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL=30.*) need P1.*skipped"
+# ---- 6d. Qyk in the arm loop.
+for spec in "$QYK::60" "$QYKP:60:60"; do
+  IFS=: read -r a pf qyn <<< "$spec"
+  sec=$(section "$a")
+  if [[ -z "$sec" ]]; then bad "the Qyk arm $a was not launched: $(grep -m3 "arm $a" "$T/loop.txt")"; continue; fi
+  has "Qyk${pf:+ Qyp$pf}" "$sec" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST 1
+  has "Qyk${pf:+ Qyp$pf}" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID "$qyn"
+  has "Qyk${pf:+ Qyp$pf}" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL "${pf:-0}"
+  grep -qx "  ARM_QYK: 1" <<< "$sec" && ok "Qyk: the arm is gated on the pool's line (ARM_QYK=1)" || bad "Qyk: ARM_QYK is '$(grep '  ARM_QYK:' <<< "$sec")'"
+  for v in RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS \
+           RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS; do
+    has "Qyk as the fast arm" "$sec" "$v" "$(val "$fast" "$v")"
+  done
+done
+for a in "$REF" "$FAST" "$QY60" "$QYP30" "$QYPQY"; do
+  has "no Qyk part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST 0
+  grep -qx "  ARM_QYK: " <<< "$(section "$a")" && ok "no Qyk part ($a): ARM_QYK empty" || bad "no Qyk part ($a): ARM_QYK is '$(grep '  ARM_QYK:' <<< "$(section "$a")")'"
+done
+qdskip "$QYKTWO" "two Qyk parts.*skipped"
 # ---- 7. Ctp: the prefill chain trace's switch and output prefix; skipped without P1 or at 0.
 for x in "$CTP 4" "$CTP2 2"; do
   read -r a n <<< "$x"

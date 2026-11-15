@@ -54,6 +54,8 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         { ds41p1::kDecodeRowsEnv, 0, ds41p1::kTwinMaxRows, &r.decode_rows },
         /* Hybrid decode: the CPU's share in percent, 0 off (p1_hybrid.h). */
         { ds41p1::kHybridEnv, 0, ds41p1::kMaxHybridPct, &r.hybrid },
+        /* Hybrid prefill: the same split in armed prefill passes, its own share in percent, 0 off. */
+        { ds41p1::kHybridPrefillEnv, 0, ds41p1::kMaxHybridPct, &r.hybrid_prefill },
     };
     for (const K& k : ks) {
         const char* v = get(k.env);

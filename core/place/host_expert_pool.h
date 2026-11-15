@@ -97,9 +97,24 @@ public:
      * each more half of them in a job of up to four rows (computed from L2), an eighth in a larger
      * one (the many-row kernel: ~0.05 ms a further row against ~0.38 ms for an expert's first, 40
      * threads; ds41_host_experts_test rbench). */
-    static int64_t job_cost(int rows) {
-        return kExpertBytes + (int64_t)(rows - 1) * (rows <= kMaxRowsDefault ? kExpertBytes / 2 : kExpertBytes / 8);
+    static int64_t job_cost(int rows) { return job_cost_for(rows, cost_many_from()); }
+    /* The same with the many-row rate from `many` rows: the default's threshold is kMaxRowsDefault + 1 (a job of
+     * up to four rows at half the bytes a further row), which is not the kernel's: with more than four rows a job
+     * (max_rows() > 4) a job of four rows already runs the many-row kernel (many_from()). */
+    static int64_t job_cost_for(int rows, int many) {
+        return kExpertBytes + (int64_t)(rows - 1) * (rows >= many ? kExpertBytes / 8 : kExpertBytes / 2);
     }
+    /* RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST=1 (0 / unset / empty off; anything else turns the pool
+     * off, get() says so; read once): job_cost charges the further rows at the rate of the kernel the job runs
+     * (many_from()), and the hybrid split (p1_hybrid.h choose) takes units by their cost rather than their rows.
+     * With MAX_ROWS above 4 the default's costs are not monotonic in rows (MAX_ROWS=32: 1 row 1x the expert's
+     * bytes, 2 1.5x, 3 2x, 4 2.5x, 5 1.5x, then 1/8 a further row), so a 3- or 4-row unit that does not fit the
+     * share stopped the scan before every cheaper 5-row-or-more one after it. Selection and bookkeeping only:
+     * which side computes a unit never changes its rows' bytes. kernel_cost_set_for_test: 1 / 0 forced, -1 the
+     * environment. */
+    static bool kernel_cost();
+    static void kernel_cost_set_for_test(int v);
+    static int  cost_many_from() { return kernel_cost() ? many_from() : kMaxRowsDefault + 1; }
     /* How an expert's `rows` rows are cut into jobs: ceil(rows / max_rows()) of them, as even as the
      * count allows (40 rows at 32 a job: 20 and 20, not 32 and 8), the larger ones first. Job k of
      * jobs_for(rows) holds job_rows(rows, k) rows. */
@@ -112,10 +127,13 @@ public:
         return n ? rows / n + (k < rows % n ? 1 : 0) : 0;
     }
     /* An expert's `rows` rows as jobs_for(rows) jobs. */
-    static int64_t cost_rows(int rows) {
+    static int64_t cost_rows(int rows) { return cost_rows_for(rows, max_rows(), cost_many_from()); }
+    /* The same for a given MAX_ROWS and many-row threshold (tests; the split's arithmetic is the pool's). */
+    static int64_t cost_rows_for(int rows, int max_rows_, int many) {
+        if (rows <= 0 || max_rows_ <= 0) return 0;
+        const int n = (rows + max_rows_ - 1) / max_rows_;
         int64_t c = 0;
-        const int n = jobs_for(rows);
-        for (int k = 0; k < n; ++k) c += job_cost(job_rows(rows, k));
+        for (int k = 0; k < n; ++k) c += job_cost_for(rows / n + (k < rows % n ? 1 : 0), many);
         return c;
     }
     /* The jobs one caller waits for: submit adds them, the pool counts them down. */

@@ -36,6 +36,7 @@ constexpr const char* kEnvLink    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LIN
 constexpr const char* kEnvSpin    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SPIN_US";
 constexpr const char* kEnvNice    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_NICE";
 constexpr const char* kEnvMaxRows = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS";
+constexpr const char* kEnvKernelCost = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST";
 constexpr const char* kEnvLean    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES";
 constexpr const char* kEnvFutex   = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX";
 constexpr const char* kEnvPrewake = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE";
@@ -129,6 +130,25 @@ thread_local TileLanes t_lanes;
 
 thread_local HostExpertPool::WorkerCounts* HostExpertPool::t_counts_ = nullptr;
 
+/* ..._KERNEL_COST: 1 on, 0 off (unset, empty, "0"), -1 anything else. */
+static int parse_kernel_cost() {
+    const char* s = std::getenv(kEnvKernelCost);
+    if (!s || !*s || !std::strcmp(s, "0")) return 0;
+    return std::strcmp(s, "1") == 0 ? 1 : -1;
+}
+static std::atomic<int> g_kernel_cost_forced{ -1 };
+
+bool HostExpertPool::kernel_cost() {
+    const int f = g_kernel_cost_forced.load(std::memory_order_relaxed);
+    if (f >= 0) return f == 1;
+    static const bool on = parse_kernel_cost() == 1;
+    return on;
+}
+
+void HostExpertPool::kernel_cost_set_for_test(int v) {
+    g_kernel_cost_forced.store(v, std::memory_order_relaxed);
+}
+
 int HostExpertPool::max_rows() {
     static const int m = [] {
         const int v = parse_max_rows(kMaxRowsDefault, kMaxRowsCap);
@@ -155,6 +175,10 @@ HostExpertPool* HostExpertPool::get() {
         if (!path || !*path) {
             RAD_ERR("%s is set without %s, the card's silu table; host experts off", kEnvThreads,
                     kEnvSilu);
+            return nullptr;
+        }
+        if (parse_kernel_cost() < 0) {
+            RAD_ERR("%s=%s: 1 on, 0 / unset / empty off; host experts off", kEnvKernelCost, std::getenv(kEnvKernelCost));
             return nullptr;
         }
         if (parse_max_rows(kMaxRowsDefault, kMaxRowsCap) <= 0) {
@@ -207,6 +231,10 @@ HostExpertPool* HostExpertPool::get() {
                  "(silu table %s; scheduling at %.0f GB/s against %.0f GB/s a copy link)",
                  threads, cpus.empty() ? "" : (" pinned to " + std::string(cl)).c_str(), path,
                  p->cpu_bpns_, p->link_bpns_);
+        if (kernel_cost())
+            RAD_INFO("host experts: kernel costs (%s=1): a job's further rows at the rate of the kernel it runs "
+                     "(the many-row one from %d rows), and the hybrid split takes units by cost", kEnvKernelCost,
+                     many_from());
         if (max_rows() != kMaxRowsDefault)
             RAD_INFO("host experts: jobs of up to %d token rows of one expert (%s)%s", max_rows(), kEnvMaxRows,
                      max_rows() > kMaxRowsDefault ? "; four or more through the many-row kernel" : "");
