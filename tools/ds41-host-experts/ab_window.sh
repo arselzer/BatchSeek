@@ -677,6 +677,21 @@ n128_server_gate() {   # server log, Fn128 flag, active ranks (4 here); explanat
   return 0
 }
 
+# CrG (AB_REFILL=G): the arm's request json states "refill": G, written by ab_requests.py's pool; every
+# arm without the part must have none (its requests went in waves whatever the window's environment).
+refill_gate() {   # the arm's request json, Cr's G (empty without the part)
+  local f=$1 want=$2 got
+  got=$(python3 -I -c 'import json, sys
+print(json.load(open(sys.argv[1])).get("refill") or "")' "$f" 2>/dev/null) || { echo "no request json $f"; return 1; }
+  if [[ "$got" != "$want" ]]; then
+    if [[ -n "$want" && -n "$got" ]]; then echo "Cr$want, but the requests went in a pool refilled $got at a time"
+    elif [[ -n "$want" ]]; then echo "Cr$want, but the requests went in waves"
+    else echo "no Cr part, but the requests went in a pool refilled $got at a time"; fi
+    return 1
+  fi
+  return 0
+}
+
 # SlN (--max-seq-len N): the server's startup line "max seq len: N tokens a sequence (--max-seq-len N);"
 # in an Sl arm whose N is below its --max-model-len; an Sl arm at or past it, and every arm without
 # the part, must have no such line (a radiance without the flag refuses the arm at startup).
@@ -1560,7 +1575,7 @@ EOF2
     before_args=(--before "$ARM_BEFORE_PROMPTS" "$ARM_BEFORE_N" "$ARM_BEFORE_CONC")
     log "arm $name: first phase $ARM_BEFORE_PROMPTS ($ARM_BEFORE_N requests, concurrency $ARM_BEFORE_CONC); main ${ARM_PROMPTS:-$PROMPTS} ($n requests, concurrency ${ARM_CONC:-${AB_CONCURRENCY:-1}})"
   fi
-  env AB_CONCURRENCY=${ARM_CONC:-${AB_CONCURRENCY:-1}} ${ARM_TIMEOUT:+AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT} \
+  env AB_CONCURRENCY=${ARM_CONC:-${AB_CONCURRENCY:-1}} AB_REFILL=${ARM_CR:-} ${ARM_TIMEOUT:+AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT} \
     python3 -I "$HERE/ab_requests.py" "${before_args[@]}" "${ARM_PROMPTS:-$PROMPTS}" "http://127.0.0.1:$PORT" "$n" "$OUT/$name.json" >>"$OUT/window.log" 2>&1
   rc=$?
   log "arm $name: requests exit $rc"
@@ -1618,6 +1633,12 @@ EOF2
     return 1
   fi
   [[ -n "${ARM_SL:-}" ]] && grep -m2 -E 'max seq len: |step batch: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  local cr_why
+  if [[ -f "$OUT/$name.json" ]] && ! cr_why=$(refill_gate "$OUT/$name.json" "${ARM_CR:-}"); then
+    log "arm $name: $cr_why; not measured (results kept as $name.unmeasured.json)"
+    mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    return 1
+  fi
   [[ -n "${ARM_N128:-}" ]] && grep -F 'ds41 n128 active:' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   if [[ -n "${ARM_DME:-}" ]] && {
        ! grep -qE "DSpark matched early costs: k=${ARM_DME} n=[1-9][0-9]* " "$OUT/$name.server.log" ||
@@ -3191,7 +3212,12 @@ for a in $ARMS; do
 # an F8 arm is refused under RADIANCE_TUNE or a tune cache in its home, every other arm runs with the
 # knob off; Pf a prefill chunk runs in a step of its own and the decode rows of concurrent requests
 # run together (RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE); NK --max-num-seqs K, CK the arm's requests
-# sent K at a time (AB_CONCURRENCY), LK --max-model-len K (the KV pool backs about one sequence of K
+# sent K at a time (AB_CONCURRENCY), CrG those K kept in flight as a pool refilled whenever G of them are
+# free (AB_REFILL=G, ab_requests.py; G 1..K, K at least 2; without the part the K go in waves, the next wave
+# after the slowest request of the last; only when requests are sent changes, so replies stay the waves'
+# where a row's bits do not depend on its step, which the batch arms' identical replies across schedules
+# show; refused beside F5 and for a receipt whose requests send earlier replies back; measured only when
+# the arm's json states that G, and without the part only without one), LK --max-model-len K (the KV pool backs about one sequence of K
 # tokens in all: 512 holds four 110-token requests, 1024 eight, 2048 sixteen); SlN --max-seq-len N (one
 # request's prompt plus output at most N tokens, refused past it as past LK; the block tables, step staging
 # and rotary tables sized for N rather than for LK, which still sizes the KV pool: the VRAM they took goes
@@ -3355,7 +3381,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" sg="" pcn=""
-  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qsp="" qt="" qz="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qsp="" qt="" qz="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr=""
   ctp=""   # Ctp / CtpN: the prefill chain trace (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL)
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
@@ -3525,6 +3551,11 @@ for a in $ARMS; do
       Tb)      tb=1 ;;                                                 # two-batch overlap of concurrent decode steps
       N[0-9]*) ARGS+=(--max-num-seqs "${p#N}"); nseq=${p#N} ;;        # this arm's --max-num-seqs (MAX_SEQS for every arm)
       C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
+      Cr[0-9]*)                                                        # ... kept K in flight, refilled G at a time (AB_REFILL)
+               if [[ -n "$cr" ]]; then log "arm $a: duplicate Cr part; the arm is skipped"; skip=1; fi
+               cr=${p#Cr}
+               if [[ $cr =~ ^[0-9]{1,4}$ ]] && (( 10#$cr >= 1 )); then cr=$((10#$cr))
+               else log "arm $a: $p: a pool refills a whole number of slots, at least 1; the arm is skipped"; skip=1; fi ;;
       L[0-9]*) ARGS+=(--max-model-len "${p#L}"); arm_ctx=${p#L} ;;    # this arm's --max-model-len (KV for N sequences)
       Sl[0-9]*)                                                        # one sequence's bound below L (--max-seq-len N)
                if [[ -n "$sl" ]]; then log "arm $a: duplicate Sl part; the arm is skipped"; skip=1; fi
@@ -4335,7 +4366,22 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
   ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QSP=$qsp ARM_QT=$qt ARM_QZ=$qz ARM_LH=$lh
-  ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr ARM_SL=$sl ARM_CTX=$arm_ctx
+  ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr ARM_SL=$sl ARM_CTX=$arm_ctx ARM_CR=$cr
+  if [[ -n "$cr" ]]; then
+    crk=${ARM_CONC:-${AB_CONCURRENCY:-1}}
+    if ! [[ $crk =~ ^[0-9]+$ ]] || (( 10#$crk < 2 )); then
+      log "arm $a: Cr$cr needs a concurrency of at least 2 (a C part or AB_CONCURRENCY), not '$crk'; the arm is skipped"; skip=1
+    elif (( cr > 10#$crk )); then
+      log "arm $a: Cr$cr refills more slots than the arm's concurrency $((10#$crk)); the arm is skipped"; skip=1
+    fi
+    if [[ -n "$f5" ]]; then log "arm $a: Cr$cr beside $f5 (its phases go in waves); the arm is skipped"; skip=1; fi
+    crp=${ARM_PROMPTS:-$PROMPTS}
+    if [[ -f "$crp" ]] && ! python3 -I -c 'import json, sys
+r = json.load(open(sys.argv[1])).get("benchmark_requests") or []
+sys.exit(any("assistant_from" in t for b in r for t in (b.get("request") or {}).get("chat_turns") or []))' "$crp" 2>/dev/null; then
+      log "arm $a: Cr$cr: $(basename "$crp")'s requests send earlier replies back (assistant_from), which a pool cannot order; the arm is skipped"; skip=1
+    fi
+  fi
   if [[ -n "$sl" && $arm_ctx =~ ^[0-9]{1,9}$ ]] && (( sl > 10#$arm_ctx )); then
     log "arm $a: Sl$sl is past the arm's --max-model-len $((10#$arm_ctx)) (the server refuses it); the arm is skipped"; skip=1
   fi
