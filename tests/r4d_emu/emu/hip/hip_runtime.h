@@ -296,6 +296,7 @@ void emu_launch(void (*k)(A), dim3 g, dim3 b, A a) {
 /* R4D_EMIT (r4d_emit.h): every argument converted to its parameter's type, as r4d_emit does, and
  * `lds` bytes of dynamic LDS; the kernel's name is kept in emu_last_kernel. Returns RAD_OK. */
 extern const char* emu_last_kernel;
+extern const char* emu_prev_kernel;   /* the launch before it (a launcher's first of two) */
 template <class... P, class... A>
 int emu_emit(const char* name, void (*k)(P...), dim3 g, dim3 b, size_t lds, const A&... a) {
     static_assert(sizeof...(P) == sizeof...(A),
@@ -306,6 +307,7 @@ int emu_emit(const char* name, void (*k)(P...), dim3 g, dim3 b, size_t lds, cons
         static void run(void* p) { Call* c = (Call*)p; std::apply(c->k, c->v); }
     };
     Call c{k, std::tuple<P...>(static_cast<P>(a)...)};
+    emu_prev_kernel = emu_last_kernel;
     emu_last_kernel = name;
     emu_run_grid(g, b, &Call::run, &c, lds);
     return 0;

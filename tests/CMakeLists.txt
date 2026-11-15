@@ -841,6 +841,12 @@ if(R4D_EMU_BUILT)
   # The same at the small heights, in the fast tier.
   add_test(NAME r4d_emu_ds41p1_quick COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1 quick)
   set_tests_properties(r4d_emu_ds41p1_quick PROPERTIES LABELS "r4d_emu;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+  # The register-tiled form (RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1 beside P1 and LCP): the served twin is
+  # mx_p1t_kernel, held to the 16-token gemv in every rows, waves and cut case, and both forms forced (the tiled
+  # one on other grids) give the served bytes; heights 17, 64, 100 and a one-block last K chunk with rows past N.
+  add_test(NAME r4d_emu_ds41p1_tiled COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1 tiled)
+  set_tests_properties(r4d_emu_ds41p1_tiled PROPERTIES LABELS "r4d_emu;slow" TIMEOUT 3600
+                       ENVIRONMENT "RADIANCE_EXPERIMENTAL_DS41_LCP=2048;RADIANCE_EXPERIMENTAL_DS41_P1=1;RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1")
 endif()
 
 # The aux expert worker's launches (core/place/aux_expert_worker.h, work/aux/SPEC.md §15.5) on the emulator: gemv_vp

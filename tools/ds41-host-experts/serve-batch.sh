@@ -16,12 +16,16 @@
 #   - hybrid decode (Qy60, RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=60, the share adapting) is the default: exact and +28%
 #     decode at 256 streams (window ab-20261113T014719Z); --hybrid 0 turns it off (the arm without Qy).
 #   - --max-seq-len N (SlN) only when given.
+#   - --tiled (Qt, ..._P1_TILED), --tail-once (Qz, ..._P1_TAIL_ONCE) and --swiglu-span (Qsp, ..._P1_SWIGLU_SPAN): the
+#     prefill Phase 1 twin's variants, on by default: exact, prefill -19% and 256 NL-SQL 287 -> 250 s with hybrid
+#     decode (window ab-20261115T070032Z); give 0 to turn one off.
 #   - --served-model-name ds41 (a name only; --served-name sets another) and --radiance-home only when given
 #     (RADIANCE_HOME otherwise).
 #
 # Usage: serve-batch.sh --model MODEL.rad --silu-table FILE [--streams 256] [--port 8000] [--reserve-mib N]
 #                       [--ctx-per-stream 1152] [--profile FILE] [--mirror DIR] [--shared-head 32] [--served-name ds41]
-#                       [--radiance-home DIR] [--hybrid 60] [--max-seq-len N] [--dry-run]
+#                       [--radiance-home DIR] [--hybrid 60] [--max-seq-len N] [--tiled 0|1] [--tail-once 0|1]
+#                       [--swiglu-span 0|1] [--dry-run]
 #                       [-- more radiance flags, e.g. --expert-stats FILE to record a profile; outside the measured set]
 #   RADIANCE_BIN (default: radiance on PATH, else build/bin/radiance), RADIANCE_HOME as for any radiance run.
 # --dry-run prints the environment and the command and starts nothing. Otherwise the script becomes the server (exec:
@@ -29,7 +33,7 @@
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
-EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN=""
+EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1
 while (( $# )); do
   case $1 in
     --model) MODEL=${2:?}; shift ;;
@@ -45,6 +49,9 @@ while (( $# )); do
     --served-name) NAME=${2:?}; shift ;;
     --hybrid) HYBRID=${2:?}; shift ;;
     --max-seq-len) SEQLEN=${2:?}; shift ;;
+    --tiled) TILED=${2:?}; shift ;;
+    --tail-once) TAILONCE=${2:?}; shift ;;
+    --swiglu-span) SPAN=${2:?}; shift ;;
     --dry-run) DRY=1 ;;
     --) shift; EXTRA=("$@"); break ;;
     -h|--help) sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -59,6 +66,9 @@ num --streams "$STREAMS" 1; num --port "$PORT" 1; num --ctx-per-stream "$CTX" 1;
 [[ -z "$RESERVE" ]] || num --reserve-mib "$RESERVE" 1024
 num --hybrid "$HYBRID" 0; (( 10#$HYBRID <= 400 )) || die "--hybrid takes 0 (off) or a share of 1-400 percent, not '$HYBRID'"
 [[ -z "$SEQLEN" ]] || num --max-seq-len "$SEQLEN" 64
+for v in "--tiled $TILED" "--tail-once $TAILONCE" "--swiglu-span $SPAN"; do
+  [[ ${v#* } == [01] ]] || die "${v% *} takes 0 or 1, not '${v#* }'"
+done
 STREAMS=$((10#$STREAMS)) CTX=$((10#$CTX))
 if (( ! DRY )); then
   [[ -f "$MODEL" ]] || die "no model container at $MODEL"
@@ -68,7 +78,7 @@ if (( ! DRY )); then
 fi
 BIN=${RADIANCE_BIN:-$(command -v radiance || echo build/bin/radiance)}
 
-# The arm's environment (133 assignments). The empty ones are set empty, as the harness sets them, so that a value
+# The arm's environment (135 assignments). The empty ones are set empty, as the harness sets them, so that a value
 # in the caller's environment cannot change the configuration.
 ENV=(
   RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40
@@ -141,7 +151,9 @@ ENV=(
   RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=1
   RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE=0
   RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=
-  RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN=0
+  RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN=$SPAN      # Qsp
+  RADIANCE_EXPERIMENTAL_DS41_P1_TILED=$TILED           # Qt
+  RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=$TAILONCE    # Qz
   RADIANCE_EXPERIMENTAL_DS41_P1=1
   RADIANCE_EXPERIMENTAL_DS41_P1_WAVE=
   RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT=

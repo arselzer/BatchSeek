@@ -26,6 +26,7 @@
 #include "rad_abi_layout.h"
 #include "r4d_ds41_tall.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -10670,12 +10671,20 @@ const std::vector<TallTwin>& tall_twins() {
                                   "written as zeros)"
                           : lcp ? " tokens (RADIANCE_EXPERIMENTAL_DS41_LCP)"
                                 : " tokens (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL)") +
-                         ", each output the decode band's bits";
+                         ", each output the decode band's bits" +
+                         (p1 && r4d_ds41_p1_tiled()
+                              ? std::string("; ") + kR4dDs41P1TiledMark + " (" + kR4dDs41P1TiledEnv +
+                                    "=1: 4 weight rows x 8 activation rows a wave, K in chunks of 1024)"
+                              : std::string());
             h.shape = "M 17.." + std::to_string(reach) +
                       " tokens (the passes the gemv row leaves to the tiled one), any N, K a multiple of 32, up to "
                       "1024 experts";
             t.push_back(std::move(h));
         }
+        if (p1 && r4d_ds41_p1_tiled() && !t.empty())
+            std::fprintf(stderr, "libr4d: %s=1: %s takes %s (mx_p1t_kernel: 4 weight rows x 8 activation rows a "
+                         "wave, K in chunks of 1024, each output the decode band's sum operation for operation)\n",
+                         kR4dDs41P1TiledEnv, kR4dDs41P1Row, kR4dDs41P1TiledMark);
         /* The strings are pointed into only once the vector has stopped growing. */
         for (TallTwin& h : t) {
             h.info.name          = h.name.c_str();
