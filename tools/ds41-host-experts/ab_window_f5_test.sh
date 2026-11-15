@@ -43,6 +43,7 @@ DUP=$POST-F5warm
   ARMS="$PLAIN $POST $WARM $BADU $BADN $BADK $BADC $SHORT $DUP"
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
   eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
+  eval "$(sed -n '/^ARM_PRESET_B2=/p;/^ARM_PRESET_B4=/p;/^arm_full() {/,/^}/p' "$W")"
   s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)
   e=$(awk -v s="$s" 'NR > s && /^done$/ { print NR; exit }' "$W")
   eval "$(sed -n "${s},${e}p" "$W")"

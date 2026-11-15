@@ -160,6 +160,7 @@ window() {   # the window's state as the script has it when the loop starts; out
   echo '{}' > "$OUT/kld-corpus.jsonl"
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
   eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
+  eval "$(sed -n '/^ARM_PRESET_B2=/p;/^ARM_PRESET_B4=/p;/^arm_full() {/,/^}/p' "$W")"
   eval "$FUNCS"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
   ROCR_VISIBLE_DEVICES=$MASK
