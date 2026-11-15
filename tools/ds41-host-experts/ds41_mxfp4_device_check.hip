@@ -70,6 +70,15 @@
  *                                                      lines for both forms, the stager's two-expert waves and
  *                                                      the tiled grid. Last line "p1tiled: PASS ..." or
  *                                                      "p1tiled: FAIL ...".
+ *   ds41_mxfp4_device_check LIBR4D.so p1wmma [MMAX] [ROUTES]
+ *                                                      the WMMA P1 twin (RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=1, set
+ *                                                      here beside P1, LCP and the tiled switch; inexact by design):
+ *                                                      against the exact twin, the bf16 ulp histogram, max abs/rel
+ *                                                      error, every 2+ ulp output within the f32 reordering bound,
+ *                                                      f32 outputs against host f64 sums, determinism across runs and
+ *                                                      grids, batch invariance of one token's rows at M 1..MMAX,
+ *                                                      T3/T4 and waves, and "p1 time:" lines. Last line "p1wmma:
+ *                                                      PASS ..." or "p1wmma: FAIL ...".
  *   ds41_mxfp4_device_check LIBR4D.so lsparse [C] [W:r...] the sparse ops at long context (LCP=C, 2048 by
  *                                                      default, set here): index_score, index_candidates,
  *                                                      index_topk (with and without keep) and attn_sparse_sink
@@ -150,6 +159,8 @@ static_assert(ds41p1::kTwinMaxRows == kR4dDs41P1MaxRows, "the twin's bound");
 static_assert(ds41p1::kMarkPacked == kR4dDs41MarkPacked && ds41p1::kMarkSkip == kR4dDs41MarkSkip, "the marks");
 static_assert(p1_same_str(ds41p1::kTiledEnv, kR4dDs41P1TiledEnv), "the tiled switch's name");
 static_assert(p1_same_str(ds41p1::kTiledMark, kR4dDs41P1TiledMark), "the tiled row's mark");
+static_assert(p1_same_str(ds41p1::kWmmaEnv, kR4dDs41P1WmmaEnv), "the WMMA switch's name");
+static_assert(p1_same_str(ds41p1::kWmmaMark, kR4dDs41P1WmmaMark), "the WMMA row's mark");
 
 #define HC(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::fprintf(stderr, "%s: %s\n", #x, hipGetErrorString(e_)); std::exit(2); } } while (0)
 
@@ -194,6 +205,9 @@ struct Lib {
     /* For `p1tiled`: the twin in a forced form (0 its own kernel, 1 the register-tiled one) and the served form. */
     int (*moe_p1_form)(const RadArgs*, RadStream, int, int) = nullptr;
     int (*p1_tiled_on)(void) = nullptr;
+    /* For `p1wmma`: the served form and the WMMA twin's f32 export. */
+    int (*p1_wmma_on)(void) = nullptr;
+    int (*moe_p1_wmma_f32)(const RadArgs*, RadStream, float*, int) = nullptr;
     int (*count)(void) = nullptr;
     const RadKernelInfo* (*at)(int) = nullptr;
     explicit Lib(const char* path) {
@@ -227,6 +241,8 @@ struct Lib {
         moe_p1_opts = (int (*)(const RadArgs*, RadStream, int, int, int, int))dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_opts");
         moe_p1_form = (int (*)(const RadArgs*, RadStream, int, int))dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_form");
         p1_tiled_on = (int (*)(void))dlsym(h, "r4d_ds41_p1_tiled_on");
+        p1_wmma_on = (int (*)(void))dlsym(h, "r4d_ds41_p1_wmma_on");
+        moe_p1_wmma_f32 = (int (*)(const RadArgs*, RadStream, float*, int))dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_wmma_f32");
         count = (int (*)(void))dlsym(h, "rad_kernel_count");
         at = (const RadKernelInfo* (*)(int))dlsym(h, "rad_kernel_at");
         if (!moe) { std::fprintf(stderr, "%s lacks r4d_rad_moe_gemm_mxfp4_gemv\n", path); std::exit(2); }
@@ -3363,6 +3379,422 @@ int p1_check(const Lib& L, int mmax, const char* routes_path, bool tiled = false
     return rc;
 }
 
+/* ================================================================== `p1wmma`: the WMMA P1 twin (inexact by design)
+ *
+ * RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=1 (set here, beside P1, LCP=2048 and the tiled switch, as a Qw arm has them):
+ * the row must name the WMMA twin, which serves the twin's calls. It is NOT held to the decode band's bits; instead,
+ * against the exact twin (the register-tiled form forced, the decode band's bits by the `p1tiled` check) at ds41's
+ * shapes and M 17 .. MMAX, real and synthetic routings, block, packed and skipped entries:
+ *   - bf16 outputs: the ulp histogram (0, 1, 2, 3-4, 5+), max |diff| and max |diff| / |exact|; an output more than
+ *     one ulp away must be within 2^-15 sum|w x| (+ an ulp) of the exact one (cancellation: an f32 reordering of a
+ *     sum moves it by at most that), NaN / infinity where the exact twin has them;
+ *   - f32 outputs (the checker export, before the bf16 rounding) of sampled finite rows within 2^-16 sum|w x| of the
+ *     f64 sum of the exact products (host);
+ *   - determinism: a second served run and form 2 on grids 7 and 4096 give the same bytes;
+ *   - T3 / T4: skipped rows untouched, the tail zeros; the stager's waves equal to one launch (p1_waves, byte for byte:
+ *     each output is its own row's, whatever the wave);
+ *   - batch invariance: one token's gate_up and down rows the same bits in passes of 1, 7, 64, 1896 and MMAX tokens;
+ *   - "p1 time:" lines: gate_up + down a pass, the WMMA twin against the exact twin's tiled and own kernels.
+ * Last line "p1wmma: PASS: ..." or "p1wmma: FAIL: ...". */
+typedef int (*P1Wf32)(const RadArgs*, RadStream, float*, int);
+struct P1wStats {
+    unsigned long long outputs = 0, hist[5] = { 0, 0, 0, 0, 0 }, more_bad = 0, cls_bad = 0, f32_n = 0, f32_bad = 0;
+    double max_abs = 0, max_rel = 0, f32_max_rel = 0;
+    size_t det = 0, invar = 0;
+};
+long p1w_ulp(uint16_t a, uint16_t b) {
+    auto ord = [](uint16_t v) { return (v & 0x8000u) ? -(long)(v & 0x7fffu) : (long)v; };
+    return std::labs(ord(a) - ord(b));
+}
+bool p1w_fin(uint16_t v) { return (v & 0x7f80u) != 0x7f80u; }
+/* Weight row n of a block_mxfp4 weight against activation row x: the f64 sum of the exact products and of their
+ * magnitudes. */
+void p1w_host_dot(const uint8_t* blk, int K, int n, const uint16_t* x, double* S, double* Aa) {
+    static const float kv[16] = { 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12 };
+    const int UK = K / 32;
+    double s = 0, a = 0;
+    for (int u = 0; u < UK; ++u) {
+        const uint8_t* b = blk + ((size_t)n * UK + u) * 17;
+        const uint32_t e = b[0];
+        const uint32_t bits = e < 2u ? (0x00200000u << e) : ((e - 1u) << 23);
+        float d;
+        std::memcpy(&d, &bits, 4);
+        for (int v = 0; v < 32; ++v) {
+            const int nib = v < 16 ? (b[1 + v] & 15) : (b[1 + v - 16] >> 4);
+            const double p = (double)(kv[nib] * d) * (double)bf16_to_f32(x[(size_t)u * 32 + v]);
+            s += p;
+            a += std::fabs(p);
+        }
+    }
+    *S = s;
+    *Aa = a;
+}
+int p1w_f32(P1Ctx& c, P1Wf32 f, void* x, int AR, int K, void* tab, int N, void* so, void* of, int T, void* y, float* y32,
+            bool sorted_order) {
+    RadTensor t[5] = { tensor(x, RAD_BF16, { AR, K }), tensor(tab, RAD_U8, { kNe, N, K / 32 * 17 }),
+                       tensor(so, RAD_I32, { T }), tensor(of, RAD_I32, { kNe + 1 }), tensor(y, RAD_BF16, { T, N }) };
+    t[1].stride[0] = 0;
+    RadParam p[6] = { ps("type", "mxfp4"), pi("N", N), pi("K", K), pi("n_expert", kNe), pi("top_k", kTop),
+                      ps("a_order", sorted_order ? "sorted" : "token") };
+    RadArgs a{};
+    a.t = t; a.n_t = 5; a.p = p; a.n_p = 6;
+    return f ? f(&a, (RadStream)c.s, y32, 0) : RAD_E_UNSUPPORTED;
+}
+
+void p1w_rows(P1Ctx& c, P1Wf32 f32x, const P1Routing& r, int M, std::mt19937_64& rng, P1wStats& st) {
+    ++c.cases;
+    const P1Pass full = p1_pass(r, 0, M);
+    const int T = M * kTop;
+    std::vector<uint16_t> x((size_t)M * kEmbd), act((size_t)T * kFf);
+    for (int t = 0; t < M; ++t) {
+        const auto row = make_x(kEmbd, rng, t % 11 == 4);
+        std::copy(row.begin(), row.end(), x.begin() + (size_t)t * kEmbd);
+    }
+    {
+        std::normal_distribution<float> nd(0.f, 0.3f);
+        for (auto& v : act) v = f32_to_bf16(nd(rng));
+        static const uint16_t sp[] = { 0x7fc0, 0xff80, 0x7f80, 0x0001, 0x8001 };
+        for (int i = 0; i < 64; ++i) act[(size_t)(rng() % act.size())] = sp[rng() % 5];
+    }
+    std::vector<int> forms(kNe);
+    for (int e = 0; e < kNe; ++e) {
+        const uint64_t q = rng() % 20;
+        forms[(size_t)e] = q < 4 ? 2 : q < 10 ? 1 : 0;
+    }
+    std::vector<int> expert_of((size_t)std::max(1, full.local));
+    for (int e = 0; e < kNe; ++e)
+        for (int i = full.off[(size_t)e]; i < full.off[(size_t)e + 1]; ++i) expert_of[(size_t)i] = e;
+    Dev d_so(full.sorted.size() * 4), d_of((kNe + 1) * 4), d_x(x.size() * 2);
+    d_so.put(full.sorted.data());
+    d_of.put(full.off.data());
+    d_x.put(x.data());
+    char label[96];
+    std::snprintf(label, sizeof label, "M=%d %s rank %d", M, r.name.c_str(), r.rank);
+    for (int proj = 0; proj < 2; ++proj) {
+        const bool g = proj == 0;
+        P1Bank& b = g ? c.gu : c.dn;
+        const int N = b.N, K = b.K;
+        std::vector<void*> tab = p1_table(b, forms, c.noread);
+        Dev d_tab(kNe * sizeof(void*));
+        d_tab.put(tab.data());
+        std::vector<uint16_t> in;
+        std::unique_ptr<Dev> d_in;
+        if (!g) {
+            in.assign((size_t)T * K, 0);
+            for (int i = 0; i < full.local; ++i)
+                std::memcpy(&in[(size_t)i * K], &act[(size_t)full.sorted[(size_t)i] * K], (size_t)K * 2);
+            d_in.reset(new Dev(in.size() * 2));
+            d_in->put(in.data());
+        }
+        void* xin = g ? d_x.p : d_in->p;
+        const int AR = g ? M : T;
+        Dev d_y((size_t)T * N * 2), d_e((size_t)T * N * 2);
+        HC(hipMemset(d_y.p, 0xAA, d_y.n));
+        HC(hipMemset(d_e.p, 0xAA, d_e.n));
+        int rc = p1_launch(c, c.p1, nullptr, xin, AR, K, d_tab.p, N, d_so.p, d_of.p, T, d_y.p, !g);
+        rc |= p1_form(c, 1, 0, xin, AR, K, d_tab.p, N, d_so.p, d_of.p, T, d_e.p, !g);
+        HC(hipStreamSynchronize(c.s));
+        if (rc != RAD_OK) {
+            std::printf("FAIL %s %s: a launch was refused\n", label, g ? "gate_up" : "down");
+            ++c.bad;
+            return;
+        }
+        std::vector<uint16_t> y((size_t)T * N), ye((size_t)T * N);
+        d_y.get(y.data());
+        d_e.get(ye.data());
+        size_t untouched = 0, tail = 0;
+        unsigned long long more_bad = 0, cls_bad = 0, hist[5] = { 0, 0, 0, 0, 0 };
+        for (int i = 0; i < full.local; ++i) {
+            const int e = expert_of[(size_t)i];
+            const uint16_t *pw = &y[(size_t)i * N], *pe = &ye[(size_t)i * N];
+            if (forms[(size_t)e] == 2) {
+                for (int q = 0; q < N; ++q) untouched += pw[q] != 0xAAAAu;
+                continue;
+            }
+            const uint16_t* xr = g ? &x[(size_t)(full.sorted[(size_t)i] / kTop) * kEmbd] : &in[(size_t)i * K];
+            for (int q = 0; q < N; ++q) {
+                ++st.outputs;
+                if (pw[q] == pe[q] || (p1_nan(pw[q]) && p1_nan(pe[q]))) { ++hist[0]; continue; }
+                if (!p1w_fin(pw[q]) || !p1w_fin(pe[q])) { ++cls_bad; continue; }
+                const long d = p1w_ulp(pw[q], pe[q]);
+                ++hist[d <= 1 ? 1 : d == 2 ? 2 : d <= 4 ? 3 : 4];
+                const double fw = bf16_to_f32(pw[q]), fe = bf16_to_f32(pe[q]), gap = std::fabs(fw - fe);
+                st.max_abs = std::max(st.max_abs, gap);
+                if (fe != 0) st.max_rel = std::max(st.max_rel, gap / std::fabs(fe));
+                if (d > 1) {
+                    double S, Aa;
+                    p1w_host_dot(b.host[(size_t)e].data(), K, q, xr, &S, &Aa);
+                    const double u = std::ldexp(1.0, std::ilogb(std::max(std::fabs(fw), std::fabs(fe))) - 7);
+                    if (gap > std::ldexp(Aa, -15) + u) {
+                        if (more_bad < 4)
+                            std::printf("  %s %s: slot %d col %d: exact %04x wmma %04x (%ld ulp), sum %.9g of |%.9g|\n",
+                                        label, g ? "gate_up" : "down", i, q, pe[q], pw[q], d, S, Aa);
+                        ++more_bad;
+                    }
+                }
+            }
+        }
+        for (size_t i = (size_t)full.local * N; i < y.size(); ++i) tail += y[i] != 0;
+        /* f32: every output of up to 3 sampled finite rows, against the host's f64 sum. */
+        unsigned long long f32_n = 0, f32_bad = 0;
+        if (f32x && full.local) {
+            Dev d_32((size_t)T * N * 4), d_y3((size_t)T * N * 2);
+            HC(hipMemset(d_32.p, 0, d_32.n));
+            if (p1w_f32(c, f32x, xin, AR, K, d_tab.p, N, d_so.p, d_of.p, T, d_y3.p, (float*)d_32.p, !g) != RAD_OK) {
+                std::printf("FAIL %s: the f32 export refused the call\n", label);
+                ++c.bad;
+            } else {
+                HC(hipStreamSynchronize(c.s));
+                std::vector<float> y32((size_t)T * N);
+                std::vector<uint16_t> y3((size_t)T * N);
+                d_32.get(y32.data());
+                d_y3.get(y3.data());
+                st.det += count_diff(y.data(), y3.data(), y.size());
+                for (int tries = 0, done = 0; tries < 40 && done < 3; ++tries) {
+                    const int i = (int)(rng() % (uint64_t)full.local), e = expert_of[(size_t)i];
+                    if (forms[(size_t)e] == 2) continue;
+                    const uint16_t* xr = g ? &x[(size_t)(full.sorted[(size_t)i] / kTop) * kEmbd] : &in[(size_t)i * K];
+                    bool fin = true;
+                    for (int k = 0; k < K; ++k) fin &= p1w_fin(xr[k]);
+                    if (!fin) continue;
+                    ++done;
+                    for (int q = 0; q < N; ++q) {
+                        double S, Aa;
+                        p1w_host_dot(b.host[(size_t)e].data(), K, q, xr, &S, &Aa);
+                        if (!std::isfinite(S)) continue;
+                        const double err = std::fabs((double)y32[(size_t)i * N + q] - S);
+                        ++f32_n;
+                        if (err > std::ldexp(Aa, -16) + 1e-37) ++f32_bad;
+                        if (Aa > 0) st.f32_max_rel = std::max(st.f32_max_rel, err / Aa);
+                    }
+                }
+            }
+        }
+        /* Determinism: a second served run and form 2 on other grids. */
+        size_t det = 0;
+        for (int grid : { -1, 7, 4096 }) {
+            HC(hipMemset(d_e.p, 0xAA, d_e.n));
+            const int r2 = grid < 0 ? p1_launch(c, c.p1, nullptr, xin, AR, K, d_tab.p, N, d_so.p, d_of.p, T, d_e.p, !g)
+                                    : p1_form(c, 2, grid, xin, AR, K, d_tab.p, N, d_so.p, d_of.p, T, d_e.p, !g);
+            HC(hipStreamSynchronize(c.s));
+            if (r2 != RAD_OK) { ++det; continue; }
+            std::vector<uint16_t> y2((size_t)T * N);
+            d_e.get(y2.data());
+            det += count_diff(y.data(), y2.data(), y.size());
+        }
+        st.det += det;
+        for (int k = 0; k < 5; ++k) st.hist[k] += hist[k];
+        st.more_bad += more_bad;
+        st.cls_bad += cls_bad;
+        st.f32_n += f32_n;
+        st.f32_bad += f32_bad;
+        c.rows += (size_t)full.local;
+        std::printf("p1wmma rows %-16s %-7s local %5d: ulp 0 %llu, 1 %llu, 2 %llu, 3-4 %llu, 5+ %llu (%llu beyond the "
+                    "reordering bound), %llu NaN/inf class differences; f32 %llu checked, %llu bad; %zu skipped values "
+                    "written, %zu tail values not zero, %zu differ across runs and grids\n", label, g ? "gate_up" : "down",
+                    full.local, hist[0], hist[1], hist[2], hist[3], hist[4], more_bad, cls_bad, f32_n, f32_bad, untouched,
+                    tail, det);
+        std::fflush(stdout);
+        c.bad += more_bad + cls_bad + f32_bad + untouched + tail + det;
+    }
+}
+
+/* One token's rows in passes of `Ms` tokens (the rest random): the same bits in each. */
+void p1w_invariance(P1Ctx& c, const std::vector<int>& Ms, P1wStats& st) {
+    ++c.cases;
+    const int me[kTop] = { 3, 150, 50, 300, 95, 200 };   /* 3, 50, 95 local to rank 0 */
+    std::mt19937_64 r0(77);
+    const std::vector<uint16_t> x0 = make_x(kEmbd, r0, false);
+    std::vector<uint16_t> a0((size_t)kTop * kFf);
+    {
+        std::normal_distribution<float> nd(0.f, 0.3f);
+        for (auto& v : a0) v = f32_to_bf16(nd(r0));
+    }
+    std::vector<int> forms(kNe);
+    for (int e = 0; e < kNe; ++e) forms[(size_t)e] = e % 3 == 1 ? 1 : 0;
+    std::vector<void*> tg = p1_table(c.gu, forms, c.noread), td = p1_table(c.dn, forms, c.noread);
+    Dev d_tg(kNe * sizeof(void*)), d_td(kNe * sizeof(void*));
+    d_tg.put(tg.data());
+    d_td.put(td.data());
+    std::vector<uint16_t> refg, refd;
+    for (int M : Ms) {
+        std::mt19937_64 rng(1000 + (uint64_t)M);
+        P1Routing r = p1_routing("uniform", M, 0, 0, rng);
+        for (int k = 0; k < kTop; ++k) r.p[(size_t)k] = me[k];
+        const P1Pass p = p1_pass(r, 0, M);
+        const int T = M * kTop;
+        std::vector<uint16_t> x((size_t)M * kEmbd), din((size_t)T * kFf);
+        std::normal_distribution<float> nd(0.f, 0.3f);
+        for (auto& v : x) v = f32_to_bf16(nd(rng));
+        for (auto& v : din) v = f32_to_bf16(nd(rng));
+        std::copy(x0.begin(), x0.end(), x.begin());
+        std::vector<int> mine;
+        for (int k = 0; k < kTop; ++k)
+            for (int i = 0; i < p.local; ++i)
+                if (p.sorted[(size_t)i] == k) {
+                    mine.push_back(i);
+                    std::memcpy(&din[(size_t)i * kFf], &a0[(size_t)k * kFf], (size_t)kFf * 2);
+                }
+        Dev d_so((size_t)T * 4), d_of((kNe + 1) * 4), d_x(x.size() * 2), d_a(din.size() * 2);
+        Dev G((size_t)T * 2 * kFf * 2), D((size_t)T * kEmbd * 2);
+        d_so.put(p.sorted.data());
+        d_of.put(p.off.data());
+        d_x.put(x.data());
+        d_a.put(din.data());
+        int rc = p1_launch(c, c.p1, nullptr, d_x.p, M, kEmbd, d_tg.p, 2 * kFf, d_so.p, d_of.p, T, G.p, false);
+        rc |= p1_launch(c, c.p1, nullptr, d_a.p, T, kFf, d_td.p, kEmbd, d_so.p, d_of.p, T, D.p, true);
+        HC(hipStreamSynchronize(c.s));
+        if (rc != RAD_OK || mine.size() != 3) {
+            std::printf("FAIL p1wmma invariance M %d: %s\n", M, rc != RAD_OK ? "a launch was refused" : "token 0 is not 3 local slots");
+            ++c.bad;
+            return;
+        }
+        std::vector<uint16_t> hg((size_t)T * 2 * kFf), hd((size_t)T * kEmbd), g, d;
+        G.get(hg.data());
+        D.get(hd.data());
+        for (int i : mine) {
+            g.insert(g.end(), hg.begin() + (ptrdiff_t)i * 2 * kFf, hg.begin() + (ptrdiff_t)(i + 1) * 2 * kFf);
+            d.insert(d.end(), hd.begin() + (ptrdiff_t)i * kEmbd, hd.begin() + (ptrdiff_t)(i + 1) * kEmbd);
+        }
+        if (refg.empty()) { refg = g; refd = d; }
+        const size_t dd = count_diff(g.data(), refg.data(), g.size()) + count_diff(d.data(), refd.data(), d.size());
+        st.invar += dd;
+        std::printf("p1wmma invariance: M %4d (%5d local slots): token 0's 3 gate_up and 3 down rows: %zu values differ "
+                    "from M %d's\n", M, p.local, dd, Ms[0]);
+        std::fflush(stdout);
+    }
+    c.bad += st.invar;
+}
+
+int p1w_check(const Lib& L, int mmax, const char* routes_path) {
+    P1Ctx c;
+    c.L = &L;
+    const char* const mode = ds41p1::kWmmaCheckMode;
+    int rc = 0;
+    {
+        const RadKernelInfo* twin = nullptr;
+        for (int i = 0; L.count && i < L.count(); ++i) {
+            const RadKernelInfo* k = L.at(i);
+            if (k && k->name && !std::strcmp(k->name, ds41p1::kTwinRow)) twin = k;
+        }
+        const bool names = twin && twin->computes && std::strstr(twin->computes, ds41p1::kWmmaMark);
+        const int on = L.p1_wmma_on ? L.p1_wmma_on() : 0;
+        const bool ok = twin && L.moe_p1 && twin->launch == L.moe_p1 && names && on == 1 && L.moe_p1_form &&
+                        L.moe_p1_wmma_f32;
+        std::printf("%s: row table: %s %s; served form: %s (the row %s it, r4d_ds41_p1_wmma_on %d%s)\n",
+                    ok ? "PASS" : "FAIL", ds41p1::kTwinRow, twin ? "present" : "missing", ds41p1::kWmmaMark,
+                    names ? "names" : "does not name", on,
+                    L.moe_p1_wmma_f32 && L.moe_p1_form ? "" : ", no _form or _wmma_f32 export");
+        if (!ok) {
+            std::printf("%s: FAIL: the plugin does not serve the WMMA twin\n", mode);
+            return 1;
+        }
+    }
+    c.p1 = L.moe_p1;
+    c.opts = L.moe_p1_opts;
+    HC(hipStreamCreate(&c.s));
+    c.noread = (const void*)(uintptr_t)0x1000;
+    if (routes_path) {
+        FILE* f = std::fopen(routes_path, "rb");
+        int32_t h[3];
+        if (f && std::fread(h, 4, 3, f) == 3 && h[2] == kTop && h[0] > 0 && h[1] > 0) {
+            g_p1_layers = h[0];
+            g_p1_rows = h[1];
+            g_p1_routes.resize((size_t)h[0] * h[1] * kTop);
+            if (std::fread(g_p1_routes.data(), 2, g_p1_routes.size(), f) != g_p1_routes.size()) g_p1_routes.clear();
+        }
+        if (f) std::fclose(f);
+        if (g_p1_routes.empty()) std::printf("note: cannot read the routes %s; synthetic routings only\n", routes_path);
+    }
+    const bool real = !g_p1_routes.empty();
+    const auto t0 = std::chrono::steady_clock::now();
+    std::mt19937_64 rng(1717);
+    p1_bank(&c.gu, 2 * kFf, kEmbd, rng);
+    p1_bank(&c.dn, kEmbd, kFf, rng);
+    std::printf("p1wmma: 96 experts of gate_up [%d, %d] and down [%d, %d] in VRAM, block_mxfp4 and packed (%d and %d raw "
+                "rounds)\n", 2 * kFf, kEmbd, kEmbd, kFf, c.gu.raw_rounds, c.dn.raw_rounds);
+    std::fflush(stdout);
+    P1wStats st;
+    P1Wf32 f32x = L.moe_p1_wmma_f32;
+    std::vector<int> Ms = { 17, 33, 48, 64, 100, 256, 1024, 2048, 3072 };
+    if (mmax > 3072) Ms.push_back(mmax);
+    for (int M : Ms) {
+        if (M > mmax) continue;
+        if (real) {
+            p1w_rows(c, f32x, p1_routing("real", M, 0, 3 + M % 30, rng), M, rng, st);
+            p1w_rows(c, f32x, p1_routing("real", M, 2, 25, rng), M, rng, st);
+        }
+        p1w_rows(c, f32x, p1_routing("skewed", M, 1, 0, rng), M, rng, st);
+        if (M <= 256) {
+            p1w_rows(c, f32x, p1_routing("uniform", M, 3, 0, rng), M, rng, st);
+            p1w_rows(c, f32x, p1_routing("hot", M, 0, 0, rng), M, rng, st);
+        }
+    }
+    std::vector<int> inv = { 1, 7, 64, 1896 };
+    if (mmax > 1896) inv.push_back(mmax);
+    p1w_invariance(c, inv, st);
+    for (int M : { 64, 256, 2048 }) {
+        if (M > mmax) continue;
+        p1_waves(c, real ? p1_routing("real", M, 0, 12, rng) : p1_routing("skewed", M, 0, 0, rng), M, rng);
+    }
+    const unsigned long long fin = st.hist[0] + st.hist[1] + st.hist[2] + st.hist[3] + st.hist[4];
+    std::printf("%s: %d cases, %zu (token, slot) rows, %llu outputs against the exact twin: ulp 0 %llu (%.4f%%), 1 %llu, "
+                "2 %llu, 3-4 %llu, 5+ %llu; max |diff| %.3g, max |diff|/|exact| %.3g; %llu beyond the reordering bound, "
+                "%llu NaN/inf class differences; f32 %llu checked, %llu beyond 2^-16 sum|wx|, max |err|/sum|wx| %.3g; "
+                "%zu differ across runs/grids; batch invariance %zu differ; %zu bad values, %.0f s\n", mode, c.cases,
+                c.rows, st.outputs, st.hist[0], fin ? 100.0 * st.hist[0] / fin : 0.0, st.hist[1], st.hist[2],
+                st.hist[3], st.hist[4], st.max_abs, st.max_rel, st.more_bad, st.cls_bad, st.f32_n, st.f32_bad,
+                st.f32_max_rel, st.det, st.invar, c.bad,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    std::fflush(stdout);
+    /* Timing: gate_up + down a pass, the served WMMA twin, the tiled form and the twin's own kernel. */
+    std::printf("p1 time: gate_up + down a pass (hipEvent, median of 5), us a local expert-row\n");
+    for (int M : { 256, 1024, 2048, 4096 }) {
+        if (M > mmax) continue;
+        const P1Routing r = real ? p1_routing("real", M, 0, 12, rng) : p1_routing("skewed", M, 0, 0, rng);
+        const P1Pass p = p1_pass(r, 0, M);
+        const int T = M * kTop;
+        Dev d_so((size_t)T * 4), d_of((kNe + 1) * 4), d_x((size_t)M * kEmbd * 2), d_a((size_t)T * kFf * 2);
+        Dev gy((size_t)T * 2 * kFf * 2), dy((size_t)T * kEmbd * 2), tg(kNe * sizeof(void*)), td(kNe * sizeof(void*));
+        d_so.put(p.sorted.data());
+        d_of.put(p.off.data());
+        HC(hipMemset(d_x.p, 0x3c, d_x.n));
+        HC(hipMemset(d_a.p, 0x3c, d_a.n));
+        for (int fm = 0; fm < 2; ++fm) {   /* every entry block_mxfp4, then every entry packed */
+            std::vector<int> forms(kNe, fm);
+            std::vector<void*> a = p1_table(c.gu, forms, c.noread), b = p1_table(c.dn, forms, c.noread);
+            tg.put(a.data());
+            td.put(b.data());
+            for (int form : { 2, 1, 0 }) {
+                if (form == 0 && M > 1024) continue;   /* the twin's own kernel costs seconds a call up there */
+                const double gt = p1_time(c, [&] { return p1_form(c, form, 0, d_x.p, M, kEmbd, tg.p, 2 * kFf, d_so.p,
+                                                                  d_of.p, T, gy.p, false); }, 5);
+                const double dt = p1_time(c, [&] { return p1_form(c, form, 0, d_a.p, T, kFf, td.p, kEmbd, d_so.p,
+                                                                  d_of.p, T, dy.p, true); }, 5);
+                std::printf("p1 time: M %4d %-8s rank 0 %-12s %-6s local %5d live %2d busiest %4d: gate_up %9.1f down "
+                            "%9.1f us = %7.2f us an expert-row\n", M, r.name.c_str(),
+                            form == 2 ? "P1 WMMA" : form == 1 ? "P1 tiled" : "P1 twin", fm ? "packed" : "block", p.local,
+                            p.live, p.busiest, gt, dt, p.local ? (gt + dt) / p.local : 0.0);
+                std::fflush(stdout);
+            }
+        }
+    }
+    (void)hipStreamDestroy(c.s);
+    rc |= c.bad ? 1 : 0;
+    if (rc)
+        std::printf("%s: FAIL: %zu bad values in %d cases (beyond the reordering bound, NaN/inf classes, f32, T3/T4, "
+                    "determinism, batch invariance or waves; see FAIL and the counts above)\n", mode, c.bad, c.cases);
+    else
+        std::printf("%s: PASS: %s on %s at M 17..%d: %llu outputs within f32 reordering of the exact twin (%.4f%% "
+                    "bit-equal, max %llu at 2+ ulp, all within the bound), f32 within 2^-16 sum|wx| (max %.3g), the "
+                    "same bytes across runs and grids, one token's rows the same bits at M %d..%d, skipped rows "
+                    "untouched, tail zeros, waves equal to one launch (%d cases)\n", mode, ds41p1::kTwinRow,
+                    ds41p1::kWmmaMark, Ms.back() <= mmax ? Ms.back() : mmax, st.outputs,
+                    fin ? 100.0 * st.hist[0] / fin : 0.0, st.hist[2] + st.hist[3] + st.hist[4], st.f32_max_rel,
+                    inv.front(), inv.back(), c.cases);
+    return rc;
+}
+
 /* ================================================================== `aux` / `auxrt`: the aux expert worker
  *
  * The worker (core/place/aux_expert_worker.h; work/aux/SPEC.md §14.1) relaunches a rank's decode chain for the
@@ -4268,7 +4700,7 @@ int aux_swap(const Lib& lib, int rounds) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | lsparse [C] [W:r...] | bal [C] [ROUTES] | p1 [MMAX] [ROUTES] | p1tiled [MMAX] [ROUTES] | sweep [trials] | sweep0 [trials] | aux OUT [trials] | auxtall OUT [MMAX] [trials] | auxrt [jobs] | auxswap [rounds]\n", argv[0]); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | lsparse [C] [W:r...] | bal [C] [ROUTES] | p1 [MMAX] [ROUTES] | p1tiled [MMAX] [ROUTES] | p1wmma [MMAX] [ROUTES] | sweep [trials] | sweep0 [trials] | aux OUT [trials] | auxtall OUT [MMAX] [trials] | auxrt [jobs] | auxswap [rounds]\n", argv[0]); return 2; }
     /* `tall`: the switch before the plugin's row table and its sparse launchers first read it, and
      * the routed GEMM as the A/B's servers run it (no live tail); the other modes as the loop's
      * measured runs ran it. */
@@ -4276,10 +4708,14 @@ int main(int argc, char** argv) {
      * `sweep` keeps an LCP already in the environment (its heights) instead of setting EXACT_TALL. */
     /* Every mode but `p1` runs without prefill Phase 1's switch (its twin replaces the LCP twin `lcp` checks). */
     if (std::strcmp(argv[2], ds41p1::kCheckMode) && std::strcmp(argv[2], ds41p1::kTiledCheckMode) &&
-        std::strcmp(argv[2], "auxtall"))
+        std::strcmp(argv[2], ds41p1::kWmmaCheckMode) && std::strcmp(argv[2], "auxtall"))
         unsetenv(ds41p1::kEnv);
+    /* The WMMA twin (inexact): on for `p1wmma` only, beside the tiled switch as a Qw arm has it. */
+    if (!std::strcmp(argv[2], ds41p1::kWmmaCheckMode)) setenv(ds41p1::kWmmaEnv, "1", 1);
+    else unsetenv(ds41p1::kWmmaEnv);
     /* The register-tiled twin: on for `p1tiled`, off for `p1`; `auxtall` keeps the window's (its line says which). */
-    if (!std::strcmp(argv[2], ds41p1::kTiledCheckMode)) setenv(ds41p1::kTiledEnv, "1", 1);
+    if (!std::strcmp(argv[2], ds41p1::kTiledCheckMode) || !std::strcmp(argv[2], ds41p1::kWmmaCheckMode))
+        setenv(ds41p1::kTiledEnv, "1", 1);
     else if (std::strcmp(argv[2], "auxtall")) unsetenv(ds41p1::kTiledEnv);
     if (!std::strcmp(argv[2], "auxtall")) {
         /* `auxtall`: LCP=2048 and P1, as the server of an AxrN arm has them (the worker's rows above 16 are the P1
@@ -4289,7 +4725,8 @@ int main(int argc, char** argv) {
         unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
         unsetenv("RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE");
         g_lcp = 2048;
-    } else if (!std::strcmp(argv[2], ds41p1::kCheckMode) || !std::strcmp(argv[2], ds41p1::kTiledCheckMode)) {
+    } else if (!std::strcmp(argv[2], ds41p1::kCheckMode) || !std::strcmp(argv[2], ds41p1::kTiledCheckMode) ||
+               !std::strcmp(argv[2], ds41p1::kWmmaCheckMode)) {
         /* `p1 [MMAX] [ROUTES]`: LCP=2048 and the switch, as a P1 arm's server has them (`p1tiled`: and kTiledEnv). */
         setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "2048", 1);
         setenv(ds41p1::kEnv, "1", 1);
@@ -4388,6 +4825,14 @@ int main(int argc, char** argv) {
         }
         if (ws.empty()) ws = { { 32769, 1 }, { 65537, 2 }, { 131073, 1 }, { 262145, 2 }, { 524289, 1 } };
         return long_sparse_check(lib, ws);
+    }
+    if (!std::strcmp(argv[2], ds41p1::kWmmaCheckMode)) {
+        const int mmax = argc > 3 ? std::atoi(argv[3]) : ds41p1::kTwinMaxRows;
+        if (mmax < 17 || mmax > ds41p1::kTwinMaxRows) {
+            std::fprintf(stderr, "%s MMAX: 17 .. %d\n", argv[2], ds41p1::kTwinMaxRows);
+            return 2;
+        }
+        return p1w_check(lib, mmax, argc > 4 ? argv[4] : nullptr);
     }
     if (!std::strcmp(argv[2], ds41p1::kCheckMode) || !std::strcmp(argv[2], ds41p1::kTiledCheckMode)) {
         const int mmax = argc > 3 ? std::atoi(argv[3]) : ds41p1::kTwinMaxRows;

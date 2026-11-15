@@ -1588,6 +1588,328 @@ __global__ __launch_bounds__(kMxThreads) void mx_p1t_kernel(MxGemvArgs A) {
     mx_p1t_body<RN, RM>(A);
 }
 
+/* ================================================================== P1's WMMA twin (p1w): opt-in fast prefill
+ *
+ * RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=1 beside P1 (r4d_ds41_tall.h): the P1 twin's calls on this kernel, ahead of the
+ * register-tiled switch. NOT the decode band's bits, by design: the same values and products, another f32
+ * summation order.
+ *   - Weights: each code's table value kv[nibble] (kMxValues: the doubled e2m1, 0 .. 12, every one exact in bf16)
+ *     goes into the B fragment as bf16, its block's scale d = 2^(e - 128) (mx_e8m0_half) left out. A block whose
+ *     scale is outside [2^-126, 2^124] (e < 2 or e > 252, where kv * d would be subnormal or overflow in f32) has
+ *     d folded into its B values instead (kv * d, still exact in bf16, an infinity where the exact path's weight is
+ *     one) and its scale taken as 1, so the products stay the exact path's there too.
+ *   - Activations: the bf16 rows as they are (staged in LDS, never converted or quantized).
+ *   - Sums: a 32-value block is two v_wmma_f32_16x16x16_bf16 from a zero accumulator (every product exact in f32),
+ *     then acc = fma(d, block sum, acc) -- d a power of two, so that is the block sum scaled and added, one
+ *     rounding -- block after block in increasing K order; the bf16 output rounded once from acc (mx_put), as the
+ *     exact path rounds its sum. A dropped slot stores 0.0f, a marked entry whose header is not a packed [N, K]
+ *     weight's gives NaN rows, the skip mark, the live-tail ranges and T4 are the twin's (mx_moe's p1 branch).
+ *   - Order per output: fixed. A work item is (live expert, 64 of its rows as four 16-row tiles, 256 weight rows:
+ *     8 waves x two 16-column tiles), K in chunks of 256 (8 blocks) staged once for the item's rows; no split-K, no
+ *     tile shape that depends on M, and a WMMA output row depends only on its own activation row. So a row's bits
+ *     are the same whatever M, the chunk, the grid, the expert's other rows or the other requests in the pass
+ *     (batch-invariant), and two runs of the same call give the same bits.
+ * Fragments (wave32, gfx12; r4d_ds41_ggml.hip's WMMA notes): A lane L is row L % 16, B lane L column L % 16, lane
+ * half h = L / 16 holds eight K values -- which eight is the kernel's choice as long as A and B agree. Here K step s
+ * (0, 1) of a block, half h, takes the code dword q = 2s + h of the block's 16 code bytes: B element pair p is the
+ * table entry of byte p of q (two bf16 values, the byte's low nibble first). block_mxfp4's byte b holds values b
+ * (low) and b + 16 (high), so its rows are staged with values b and b + 16 side by side (position 2b, 2b + 1 of the
+ * block); the packed form's byte i holds values 2i, 2i + 1, so its rows are staged as they are. D lane L is column
+ * L % 16, rows 8 (L / 16) + e. */
+constexpr int kP1wMt = 4, kP1wNt = 2;   /* 16-row tiles an item, 16-column tiles a wave */
+constexpr int kP1wKc = 256;             /* values a K chunk: 8 blocks (a packed round is 4 chunks) */
+constexpr int kP1wXp = kP1wKc + 8;      /* bf16 a staged row (528 bytes: rows 4 banks apart) */
+constexpr int kP1wGrid = 1024;          /* blocks a call at most (the items are spread over them) */
+
+typedef __bf16 mx_v8bf __attribute__((ext_vector_type(8)));
+typedef float mx_v8f __attribute__((ext_vector_type(8)));
+
+__device__ __forceinline__ mx_v8f mx_p1w_mma(r4d_u32x4 a, r4d_u32x4 b, mx_v8f c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(__builtin_bit_cast(mx_v8bf, a),
+                                                             __builtin_bit_cast(mx_v8bf, b), c);
+}
+/* A slot's activation row (mx_moe_tok), by a per-thread load. */
+__device__ __forceinline__ int mx_p1w_tok(const MxGemvArgs& A, int i) {
+    const int flat = A.sorted[i];
+    if (flat < 0) return -1;
+    const int tok = A.a_sorted ? i : flat / A.top_k;
+    return tok < A.AR ? tok : -1;
+}
+/* The packed weight's raw round g (n R + r), as an index into its raw bytes, or -1: a lower bound over the
+ * ascending index (per lane: each lane's weight row is its own). */
+__device__ __forceinline__ int mx_p1w_raw(const MxPk2& v, uint32_t g) {
+    int lo = 0, hi = v.n_exc;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (mx_d32(v.idx + 4LL * mid) < g) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < v.n_exc && mx_d32(v.idx + 4LL * lo) == g ? lo : -1;
+}
+/* Four table entries: the B fragment of one K step (code dword q). */
+__device__ __forceinline__ r4d_u32x4 mx_p1w_b(const uint32_t* tab, uint32_t q) {
+    r4d_u32x4 b;
+    b[0] = tab[q & 0xFFu];
+    b[1] = tab[(q >> 8) & 0xFFu];
+    b[2] = tab[(q >> 16) & 0xFFu];
+    b[3] = tab[q >> 24];
+    return b;
+}
+/* A fragment's bf16 values times d, back to bf16 (exact: kv * d is a power of two times at most two bits). */
+__device__ __forceinline__ void mx_p1w_fold(r4d_u32x4& b, float d) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t lo = __float_as_uint(__uint_as_float(b[i] << 16) * d) >> 16;
+        const uint32_t hi = __float_as_uint(__uint_as_float(b[i] & 0xFFFF0000u) * d) >> 16;
+        b[i] = lo | (hi << 16);
+    }
+}
+
+template <int MT, int NT>
+__device__ __forceinline__ void mx_p1w_body(const MxGemvArgs& A, float* y32) {
+    constexpr int BM = 16 * MT, BN = kMxWaves * 16 * NT;
+    static_assert(BM == 64, "the live rows of a tile are two ballots");
+    R4D_DYN_LDS(r4d_u32x4, mx_lds);
+    __shared__ uint32_t s_tab[256];   /* byte -> two bf16 table values, the low nibble's low */
+    __shared__ int s_nlive_v;
+    __shared__ int s_tok[BM];
+    uint8_t* const mx_smem = (uint8_t*)mx_lds;
+    const int tid = (int)threadIdx.x, lane = tid & 31, wave = mx_uni(tid >> 5);
+    const int h = lane >> 4, c16 = lane & 15;
+    for (int b = tid; b < 256; b += kMxThreads)
+        s_tab[b] = (__float_as_uint(kMxValues[b & 15]) >> 16) | ((__float_as_uint(kMxValues[b >> 4]) >> 16) << 16);
+    int* const live_e = (int*)(mx_smem + A.live_off);
+    int* const live_s = live_e + A.n_expert;
+    int* const live_t = live_s + A.n_expert;
+    int* const tpre = (int*)(mx_smem + A.bal_off);
+    uint16_t* const xs = (uint16_t*)(mx_smem + A.x_off);
+    /* The experts with rows, ascending, as mx_p1t_body finds them (the skip mark: none). */
+    if (wave == 0) {
+        int cnt = 0;
+        for (int e0 = 0; e0 < A.n_expert; e0 += 32) {
+            const int e = e0 + lane;
+            const int ec = e < A.n_expert ? e : A.n_expert - 1;
+            int s = 0, t = 0;
+            mx_vp2_range(A, ec, &s, &t);
+            const bool sk = ((uintptr_t)A.wtab[ec] & 2u) != 0;
+            const bool nz = e < A.n_expert && t > s && !sk;
+            const uint32_t bal = __builtin_amdgcn_ballot_w32(nz);
+            if (nz) {
+                const int at = cnt + __builtin_popcount(bal & ((1u << lane) - 1u));
+                live_e[at] = e;
+                live_s[at] = s;
+                live_t[at] = t;
+            }
+            cnt += __builtin_popcount(bal);
+        }
+        if (lane == 0) s_nlive_v = cnt;
+    }
+    __syncthreads();
+    const int nlive = s_nlive_v;
+    if (tid == 0) {
+        tpre[0] = 0;
+        for (int j = 0; j < nlive; ++j) tpre[j + 1] = tpre[j] + (live_t[j] - live_s[j] + BM - 1) / BM;
+    }
+    __syncthreads();
+    const int ncg = (A.N + BN - 1) / BN;
+    const int n_items = tpre[nlive] * ncg;
+    const uint32_t* const tab = s_tab;
+    for (int it = (int)blockIdx.x; it < n_items; it += (int)gridDim.x) {
+        const int g = it / ncg;
+        int lo = 0, hi = nlive;
+        while (hi - lo > 1) {
+            const int mid = (lo + hi) >> 1;
+            if (tpre[mid] <= g) lo = mid; else hi = mid;
+        }
+        const int li = lo, ntl = tpre[li + 1] - tpre[li];
+        const int loc = it - tpre[li] * ncg, cg = loc / ntl, tile = loc - cg * ntl;
+        const int e = mx_uni(live_e[li]), rs = mx_uni(live_s[li]), re = mx_uni(live_t[li]);
+        const uint8_t* wb = mx_uni_ptr(A.wtab[e]);
+        const bool pk = ((uintptr_t)wb & 1u) != 0;
+        wb = (const uint8_t*)((uintptr_t)wb & ~(uintptr_t)1);
+        MxPk2 pv{};
+        if (pk) pv = mx_pk2_open(wb, A.N, A.K);
+        const int p0 = rs + tile * BM, mc = min(BM, re - p0);
+        __syncthreads();   /* the last item's readers of s_tok and the staged rows are done */
+        if (tid < BM) s_tok[tid] = tid < mc ? mx_p1w_tok(A, p0 + tid) : -1;
+        __syncthreads();
+        const uint32_t m0 = __builtin_amdgcn_ballot_w32(s_tok[lane] >= 0);
+        const uint32_t m1 = __builtin_amdgcn_ballot_w32(s_tok[lane + 32] >= 0);
+        const int c0 = cg * BN;
+        if ((m0 | m1) == 0 || (pk && !pv.ok)) {   /* block-uniform: zeros (dropped slots), or NaN rows */
+            for (int i = tid; i < mc * BN; i += kMxThreads) {
+                const int m = i / BN, n = c0 + (i - m * BN);
+                if (n >= A.N) continue;
+                const float v = s_tok[m] >= 0 ? __uint_as_float(0x7fc00000u) : 0.0f;
+                mx_put(A.y + (long long)(p0 + m) * A.y_ld + n, v);
+                if (y32) y32[(long long)(p0 + m) * A.N + n] = v;
+            }
+            continue;
+        }
+        const int last = m1 ? 63 - __builtin_clz(m1) : 31 - __builtin_clz(m0);
+        const int nmt = last / 16 + 1;   /* 16-row tiles up to the last live row */
+        const int nw = c0 + wave * 16 * NT;   /* the wave's first weight row */
+        int ncol[NT], nrow[NT];
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            ncol[t] = nw + 16 * t + c16;
+            nrow[t] = ncol[t] < A.N ? ncol[t] : A.N - 1;
+        }
+        mx_v8f acc[MT][NT];
+#pragma unroll
+        for (int i = 0; i < MT; ++i)
+#pragma unroll
+            for (int t = 0; t < NT; ++t) acc[i][t] = (mx_v8f)(0.0f);
+        const mx_v8f zero = (mx_v8f)(0.0f);
+        for (int k0 = 0; k0 < A.K; k0 += kP1wKc) {   /* every wave takes part in the barriers */
+            const int k1 = min(k0 + kP1wKc, A.K), nb = (k1 - k0) >> 5;
+            __syncthreads();
+            /* Stage rows [0, 16 nmt) of the chunk: a unit is (row, block j, quarter q), values 8q .. 8q + 7 and
+             * 16 + 8q .. 16 + 8q + 7 of block j; a dropped slot (and a row past mc) a row of zeros. */
+            for (int u = tid; u < 16 * nmt * nb * 2; u += kMxThreads) {
+                const int m = u / (2 * nb), r = u - m * 2 * nb, j = r >> 1, q = r & 1;
+                const int tok = s_tok[m];
+                uint32_t xl[4] = { 0u, 0u, 0u, 0u }, xh[4] = { 0u, 0u, 0u, 0u };
+                if (tok >= 0) {
+                    const uint16_t* xr = A.x + (long long)tok * A.x_ld + k0 + 32 * j + 8 * q;
+                    mx_x8raw(xr, A.x_al != 0, xl);
+                    mx_x8raw(xr + 16, A.x_al != 0, xh);
+                }
+                uint16_t* d = xs + m * kP1wXp + 32 * j;
+                if (pk) {
+                    r4d_u32x4 vl, vh;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) { vl[i] = xl[i]; vh[i] = xh[i]; }
+                    *(r4d_u32x4*)(void*)(d + 8 * q) = vl;
+                    *(r4d_u32x4*)(void*)(d + 16 + 8 * q) = vh;
+                } else {
+                    r4d_u32x4 o0, o1;
+                    o0[0] = __builtin_amdgcn_perm(xh[0], xl[0], 0x05040100u);
+                    o0[1] = __builtin_amdgcn_perm(xh[0], xl[0], 0x07060302u);
+                    o0[2] = __builtin_amdgcn_perm(xh[1], xl[1], 0x05040100u);
+                    o0[3] = __builtin_amdgcn_perm(xh[1], xl[1], 0x07060302u);
+                    o1[0] = __builtin_amdgcn_perm(xh[2], xl[2], 0x05040100u);
+                    o1[1] = __builtin_amdgcn_perm(xh[2], xl[2], 0x07060302u);
+                    o1[2] = __builtin_amdgcn_perm(xh[3], xl[3], 0x05040100u);
+                    o1[3] = __builtin_amdgcn_perm(xh[3], xl[3], 0x07060302u);
+                    *(r4d_u32x4*)(void*)(d + 16 * q) = o0;
+                    *(r4d_u32x4*)(void*)(d + 16 * q + 8) = o1;
+                }
+            }
+            __syncthreads();
+            if (nw >= A.N) continue;   /* wave-uniform: no weight row of this wave */
+            const int rr = k0 >> 10;   /* the packed round of the chunk (a chunk never straddles two) */
+            int slot[NT];
+#pragma unroll
+            for (int t = 0; t < NT; ++t)
+                slot[t] = pk && pv.n_exc > 0 ? mx_p1w_raw(pv, (uint32_t)nrow[t] * (uint32_t)pv.R + (uint32_t)rr) : -1;
+            /* A block's words for the wave's columns: block_mxfp4's five aligned dwords over the block, or the
+             * packed form's four code dwords and its scale byte (the 2-bit code's, or the raw round's). */
+            auto load = [&](int V, uint32_t (&w)[NT][5]) {
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    if (pk) {
+                        const r4d_u32x4 c = *(mx_gu128)(const void*)(pv.codes + (long long)nrow[t] * (A.K / 2) + (long long)V * 16);
+                        w[t][0] = c[0]; w[t][1] = c[1]; w[t][2] = c[2]; w[t][3] = c[3];
+                        const int jr = V & 31;
+                        if (slot[t] >= 0) {
+                            w[t][4] = *(mx_gu8)(const void*)(pv.raw + 32LL * slot[t] + jr);
+                        } else {
+                            const bool full = rr < pv.RF;
+                            const int byi = full ? (jr & 7) : (pv.tbl ? jr % pv.tbl : 0);
+                            const int sh = full ? 2 * (jr >> 3) : (pv.tbl ? 2 * (jr / pv.tbl) : 0);
+                            const uint32_t by = *(mx_gu8)(const void*)(pv.pk + (long long)nrow[t] * pv.PB + 8 * rr + byi);
+                            w[t][4] = pv.e0 + ((by >> sh) & 3u);
+                        }
+                    } else {
+                        const uint8_t* a = (const uint8_t*)((uintptr_t)(wb + (long long)nrow[t] * A.w_ld + (long long)V * 17) & ~(uintptr_t)3);
+#pragma unroll
+                        for (int i = 0; i < 5; ++i) w[t][i] = mx_d32(a + 4 * i);
+                    }
+                }
+            };
+            uint32_t cur[NT][5], nxt[NT][5];
+            load(k0 >> 5, cur);
+            for (int j = 0; j < nb; ++j) {
+                const int V = (k0 >> 5) + j;
+                load(j + 1 < nb ? V + 1 : V, nxt);   /* a block ahead (the last one read again, unused) */
+                r4d_u32x4 b0[NT], b1[NT];
+                float dd[NT];
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    uint32_t q0, q1, ex;
+                    if (pk) {
+                        q0 = h ? cur[t][1] : cur[t][0];
+                        q1 = h ? cur[t][3] : cur[t][2];
+                        ex = cur[t][4];
+                    } else {
+                        /* Mx<MX_FP4>::load's funnel: e at byte s of the window, qs from byte s + 1. */
+                        const int s = (int)((uintptr_t)(wb + (long long)nrow[t] * A.w_ld + (long long)V * 17) & 3u);
+                        ex = (cur[t][0] >> (8 * s)) & 0xFFu;
+                        const bool next = s == 3;
+                        const int sh = (s + 1) & 3;
+                        uint32_t qs[4];
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const uint32_t l = next ? cur[t][i + 1] : cur[t][i];
+                            const uint32_t u = next ? cur[t][i + 1 < 4 ? i + 2 : 4] : cur[t][i + 1];
+                            qs[i] = mx_funnel(l, u, sh);
+                        }
+                        q0 = h ? qs[1] : qs[0];
+                        q1 = h ? qs[3] : qs[2];
+                    }
+                    b0[t] = mx_p1w_b(tab, q0);
+                    b1[t] = mx_p1w_b(tab, q1);
+                    float d = mx_e8m0_half(ex);
+                    if (ex < 2u || ex > 252u) {   /* kv * d subnormal or past f32: folded, exact in bf16 */
+                        mx_p1w_fold(b0[t], d);
+                        mx_p1w_fold(b1[t], d);
+                        d = 1.0f;
+                    }
+                    dd[t] = d;
+                }
+#pragma unroll
+                for (int i = 0; i < MT; ++i) {
+                    if (i >= nmt) continue;   /* wave-uniform */
+                    const uint16_t* xa = xs + (16 * i + c16) * kP1wXp + 32 * j + 8 * h;
+                    const r4d_u32x4 a0 = *(const r4d_u32x4*)(const void*)xa;
+                    const r4d_u32x4 a1 = *(const r4d_u32x4*)(const void*)(xa + 16);
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        mx_v8f p = mx_p1w_mma(a0, b0[t], zero);
+                        p = mx_p1w_mma(a1, b1[t], p);
+#pragma unroll
+                        for (int k = 0; k < 8; ++k) acc[i][t][k] = __builtin_fmaf(dd[t], p[k], acc[i][t][k]);
+                    }
+                }
+#pragma unroll
+                for (int t = 0; t < NT; ++t)
+#pragma unroll
+                    for (int i = 0; i < 5; ++i) cur[t][i] = nxt[t][i];
+            }
+        }
+        if (nw >= A.N) continue;   /* wave-uniform */
+        /* D lane L: column ncol, rows 8 h + k of each tile; a dropped slot (or a tile past the last live row) 0. */
+#pragma unroll
+        for (int i = 0; i < MT; ++i)
+#pragma unroll
+            for (int t = 0; t < NT; ++t)
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    const int m = 16 * i + 8 * h + k;
+                    if (m >= mc || ncol[t] >= A.N) continue;
+                    const float v = i < nmt && s_tok[m] >= 0 ? acc[i][t][k] : 0.0f;
+                    mx_put(A.y + (long long)(p0 + m) * A.y_ld + ncol[t], v);
+                    if (y32) y32[(long long)(p0 + m) * A.N + ncol[t]] = v;
+                }
+    }
+}
+
+template <int MT, int NT>
+__global__ __launch_bounds__(kMxThreads) void mx_p1w_kernel(MxGemvArgs A, float* y32) {
+    mx_p1w_body<MT, NT>(A, y32);
+}
+
 /* ================================================================== tiled (prefill) */
 constexpr int kTN = 128, kTP = 132;   /* tile columns (weight rows), LDS row floats of Ws */
 
@@ -2072,10 +2394,13 @@ constexpr int kP1Grid = 512;
 /* RADIANCE_EXPERIMENTAL_DS41_P1_TILED (r4d_ds41_tall.h): the P1 twin's served calls on mx_p1t_kernel. Read once (the
  * row table states it at startup, r4d_rows.cpp). */
 bool mx_p1_tiled() { return r4d_ds41_p1_tiled(); }
+/* RADIANCE_EXPERIMENTAL_DS41_P1_WMMA (r4d_ds41_tall.h): the P1 twin's served calls on mx_p1w_kernel (inexact by design,
+ * opt-in), ahead of the tiled switch. Read once. */
+bool mx_p1_wmma() { return r4d_ds41_p1_wmma(); }
 
 int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned long long* probe=nullptr,int force=-1,
            bool vp=false, bool tall=false, int vpvar=-1, int balf=-1, bool p1=false, const MxP1Opts* po=nullptr,
-           int p1t=-1) {
+           int p1t=-1, float* y32=nullptr) {
     if (!a || a->n_t < 5) return R4D_NO(RAD_E_INVAL);
     const RadTensor *A_ = r4d_opt(a, 0), *W = r4d_opt(a, 1), *so = r4d_opt(a, 2), *of = r4d_opt(a, 3),
                     *Y = r4d_opt(a, 4);
@@ -2157,8 +2482,10 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
     if (p1 && gemv && table && ty == MX_FP4) {
         if (probe || force >= 0) return R4D_NO(RAD_E_UNSUPPORTED);
         const MxP1Opts o = po ? *po : MxP1Opts{};
-        /* `p1t`: a checker's form for the call (0 the twin's kernel, 1 the register-tiled one); else the switch. */
-        const bool tiled = p1t >= 0 ? p1t == 1 : mx_p1_tiled();
+        /* `p1t`: a checker's form for the call (0 the twin's kernel, 1 the register-tiled one, 2 the WMMA one); else
+         * the switches (WMMA first). */
+        const int form = p1t >= 0 ? p1t : mx_p1_wmma() ? 2 : mx_p1_tiled() ? 1 : 0;
+        const bool tiled = form == 1;
         /* `p1_tail` 0 (the card expert stager's wave relaunches under RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE): no
          * tail fill this call. The layer's own launch of the same op, earlier on the stream into the same output
          * over the same offsets, filled [off[n_expert], T) with zeros, and no call writes those slots (each writes
@@ -2172,6 +2499,30 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
         A.y = (uint16_t*)Y->data; A.y_ld = y_ld;
         A.sorted = (const int32_t*)so->data; A.off = (const int32_t*)of->data;
         A.M = (int)T; A.N = (int)N; A.K = (int)K;
+        if (form == 2) {
+            /* mx_p1w_kernel: items of 64 rows x 256 weight rows, K in chunks of kP1wKc staged for the item's rows,
+             * spread over at most kP1wGrid blocks (`grid` a checker's count). Dynamic LDS: the live experts'
+             * records, the tile prefix, then a chunk's rows as bf16. The tile shape and the K order are fixed:
+             * nothing here depends on M but how many items there are. */
+            constexpr int BM = 16 * kP1wMt, BN = kMxWaves * 16 * kP1wNt;
+            A.XM = BM; A.XLM = 0; A.KC = kP1wKc; A.XR = 0;
+            A.n_expert = (int)ne; A.top_k = (int)top_k; A.a_sorted = a_sorted ? 1 : 0; A.AR = (int)AR;
+            A.live_end = 1;
+            A.x_al = mx_al16(A_->data, x_ld) ? 1 : 0;
+            A.live_off = kMxVp2Live;
+            A.bal_off = (int)(kMxVp2Live + mx_r16(12LL * ne));
+            A.x_off = (int)(A.bal_off + mx_r16(4LL * (ne + 1)));
+            const long long lds = A.x_off + (long long)BM * kP1wXp * 2;
+            const long long ncg = (N + BN - 1) / BN;
+            const long long items = ((T + BM - 1) / BM + L) * ncg;   /* at least the live tiles' items */
+            const unsigned grid = o.grid > 0 ? (unsigned)(o.grid < 65535 ? o.grid : 65535)
+                                             : (unsigned)(items < kP1wGrid ? items : kP1wGrid);
+            const int rc = R4D_EMIT(s, (mx_p1w_kernel<kP1wMt, kP1wNt>), dim3(grid), dim3(kMxThreads), (unsigned)lds, A,
+                                    y32);
+            if (rc != RAD_OK || !tail_fill) return rc;
+            /* T4: the slots routed to other ranks, [off[ne], T), are zeros after every call. */
+            return mx_tail_zero(s, A.y, A.y_ld, A.off, A.n_expert, A.M, A.N, nullptr);
+        }
         if (tiled) {
             /* mx_p1t_kernel: tiles of kP1tRm rows, K in chunks of kP1tKc staged for a tile's rows (no whole row is
              * staged), 8 kP1tRn weight rows an item, the items spread over at most kP1tGrid blocks (`grid` a
@@ -2343,13 +2694,23 @@ extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1(const RadArgs* a, RadStream s
  * twin's kernel, mx_vp2_kernel's kVpP1 form; 1 the register-tiled mx_p1t_kernel), on `grid` blocks (0 the
  * launcher's choice), so a check holds the two to each other and to the decode band byte for byte and times both. */
 extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_form(const RadArgs* a, RadStream s, int form, int grid) {
-    if (form < 0 || form > 1 || grid < 0) return RAD_E_INVAL;
+    if (form < 0 || form > 2 || grid < 0) return RAD_E_INVAL;
     MxP1Opts o;
     o.grid = grid;
     return mx_moe(a, s, true, false, nullptr, -1, false, true, -1, -1, true, &o, form);
 }
 /* Checker-only: 1 when the served P1 twin takes the register-tiled kernel (the switch, read once), else 0. */
 extern "C" int r4d_ds41_p1_tiled_on() { return mx_p1_tiled() ? 1 : 0; }
+/* Checker-only: 1 when the served P1 twin takes the WMMA kernel (RADIANCE_EXPERIMENTAL_DS41_P1_WMMA, read once), else 0. */
+extern "C" int r4d_ds41_p1_wmma_on() { return mx_p1_wmma() ? 1 : 0; }
+/* Checker-only: the WMMA P1 twin (form 2) on `grid` blocks (0 the launcher's), its outputs also as f32 into y32 (T x N,
+ * contiguous) before the bf16 rounding: the accumulation a check holds to an f64 sum. */
+extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_wmma_f32(const RadArgs* a, RadStream s, float* y32, int grid) {
+    if (!y32 || grid < 0) return RAD_E_INVAL;
+    MxP1Opts o;
+    o.grid = grid;
+    return mx_moe(a, s, true, false, nullptr, -1, false, true, -1, -1, true, &o, 2, y32);
+}
 /* Checker-only: the same with its work split forced for the call (r4d_ds41_mxfp4.h), always on the twin's own kernel
  * (mx_vp2_kernel's kVpP1 form), whatever RADIANCE_EXPERIMENTAL_DS41_P1_TILED says. */
 extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_opts(const RadArgs* a, RadStream s, int grid, int item_kib,

@@ -573,5 +573,45 @@ class PrefillHashReference(unittest.TestCase):
         self.assertEqual(rc, 2, text)
 
 
+
+class InexactArmTest(unittest.TestCase):
+    """A Qw arm (the WMMA P1 twin, inexact by design): never the reference, its differences counted and labelled."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def arm(self, name, texts):
+        rows = [{"name": n, "text": t, "timings": {"predicted_ms": 1000.0, "predicted_n": 10,
+                                                   "predicted_per_second": 10.0}} for n, t in texts]
+        with open(os.path.join(self.dir, name + ".json"), "w") as f:
+            json.dump({"requests": rows}, f)
+
+    def compare(self, *arms):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ab_requests.compare(self.dir, list(arms))
+        return out.getvalue()
+
+    def test_a_qw_arm_first_is_not_the_reference(self):
+        self.arm("all-Lc2048-P1-Qt-Qw", [("p1", "a"), ("p2", "x")])
+        self.arm("all-Lc2048-P1-Qt", [("p1", "a"), ("p2", "b")])
+        self.arm("all-Lc2048-P1", [("p1", "a"), ("p2", "b")])
+        text = self.compare("all-Lc2048-P1-Qt-Qw", "all-Lc2048-P1-Qt", "all-Lc2048-P1")
+        self.assertIn("all-Lc2048-P1-Qt-Qw: differ from reference: 1 of 2 (inexact arm, Qw)", text)
+        # The exact arms are held to each other, not to the Qw arm: every cell of theirs "same".
+        p2 = [l for l in text.splitlines() if l.startswith("p2")][0]
+        self.assertEqual(p2.count("same"), 2, text)
+        self.assertEqual(p2.count("DIFF"), 1, text)
+
+    def test_qw_names(self):
+        self.assertTrue(ab_requests.inexact("all-P1-Qw"))
+        self.assertTrue(ab_requests.inexact("all-Qw-Lc2048.before"))
+        self.assertFalse(ab_requests.inexact("all-P1-Qw2"))   # QwN is the wave size, exact
+        self.assertFalse(ab_requests.inexact("all-P1-Qt"))
+
 if __name__ == "__main__":
     unittest.main()

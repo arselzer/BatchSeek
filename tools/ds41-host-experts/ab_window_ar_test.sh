@@ -47,7 +47,7 @@ lcp_check() { return 0; }
 # Other independently tested instruments also guard KLD in the integration harness.
 n128_server_gate() { return 0; }
 vp_server_gate() { return 0; }
-qsp_gate() { return 0; }; qt_gate() { return 0; }; qz_gate() { return 0; }
+qsp_gate() { return 0; }; qt_gate() { return 0; }; qw_gate() { return 0; }; qz_gate() { return 0; }
 ARGS=()
 ag_rows_server_check() { return 0; }
 kill() { return 1; }

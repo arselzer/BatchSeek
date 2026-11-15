@@ -5,6 +5,7 @@
 #include "../../arch/deepseek41/ds41_index_memory.h"
 #include "place/router_predictor.h"
 #include "ds41_host_experts.h"
+#include "device/device.h"
 
 #include <sys/prctl.h>
 
@@ -1726,6 +1727,18 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
                                     "libr4d.so built with the register-tiled twin, with %s=1 and %s=1 in its "
                                     "environment", ds41p1::kTiledEnv, h, ds41p1::kTwinRow, ds41p1::kTiledMark,
                                     ds41p1::kEnv, ds41p1::kTiledEnv);
+                            return RAD_E_INVAL;
+                        }
+                    }
+                    /* The WMMA twin (ds41p1::kWmmaEnv, inexact by design): the row must say it takes that form. */
+                    if (high && ds41p1::wmma_state() == 1) {
+                        const KernelRow* row = b.dom[RAD_DOMAIN_DEVICE].row;
+                        const char* says = row && row->info ? row->info->computes : nullptr;
+                        if (!says || !std::strstr(says, ds41p1::kWmmaMark)) {
+                            RAD_ERR("%s=1 refused: op %zu's %s does not run %s (its row does not name it): load a "
+                                    "libr4d.so built with the WMMA twin, with %s=1 and %s=1 in its environment",
+                                    ds41p1::kWmmaEnv, h, ds41p1::kTwinRow, ds41p1::kWmmaMark, ds41p1::kEnv,
+                                    ds41p1::kWmmaEnv);
                             return RAD_E_INVAL;
                         }
                     }
@@ -4923,6 +4936,11 @@ int FileStager::p1_init(const Program& prog) {
                     ds41p1::kEnv);
             return RAD_E_INVAL;
         }
+        if (const char* wv = std::getenv(ds41p1::kWmmaEnv); ds41p1::env_state(wv) != 0) {
+            RAD_ERR("%s=%s refused: it chooses the P1 twin's kernel, and %s is not on", ds41p1::kWmmaEnv, wv,
+                    ds41p1::kEnv);
+            return RAD_E_INVAL;
+        }
         return RAD_OK;
     }
     auto refuse = [&](const std::string& why) {
@@ -4942,6 +4960,20 @@ int FileStager::p1_init(const Program& prog) {
     if (t.lend_heat > 0 && t.lend <= 0 && t.lend_arena <= 0 && t.lend_slab <= 0)
         return refuse(fmt("%s=%d moves lent slots between units, and none is lent (%s, %s or %s)", ds41p1::kLendHeatEnv,
                           t.lend_heat, ds41p1::kLendEnv, ds41p1::kLendArenaEnv, ds41p1::kLendSlabEnv));
+    /* The WMMA twin (..._P1_WMMA, inexact by design): gfx12's v_wmma_f32_16x16x16_bf16 on every card, and not
+     * beside the host verify, which would count each rounding difference as a differing row. */
+    if (t.wmma) {
+        if (t.verify > 0)
+            return refuse(fmt("%s=1 beside the host verify (%s=%d): the WMMA twin is not the CPU's bits by design, so "
+                              "every verified row would differ", ds41p1::kWmmaEnv, ds41p1::kVerifyEnv, t.verify));
+        for (int d = 0; d < rad_dev_count(); ++d) {
+            RadDeviceProps dp{};
+            if (rad_dev_props(d, &dp) < 0) continue;
+            if (std::strncmp(dp.arch, "gfx12", 5) != 0)
+                return refuse(fmt("%s=1 needs gfx12's bf16 WMMA (RDNA4), and device %d reports %s", ds41p1::kWmmaEnv,
+                                  d, dp.arch[0] ? dp.arch : "no architecture"));
+        }
+    }
     /* Decode passes on the cards (..._P1_DECODE_ROWS): a pass is at most the chunk, so a threshold above it would
      * never arm; and a split pass (the two-batch overlap, sched/tbo.h) issues each routed layer's expert ops
      * twice, which the card path refuses (it takes a layer's rows in one launch). */

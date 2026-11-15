@@ -395,9 +395,17 @@ def by_receipt(data):
     return [(tuple(g[0]), sorted(g[2], key=order.get)) for g in groups]
 
 
+def inexact(a):
+    """An arm whose replies are not the exact engine's by design (a Qw part: the WMMA P1 twin, an f32 summation order
+    of its own). Its texts are reported against the reference, never used as one, and never read as an exactness
+    result."""
+    return "-Qw-" in "-" + a.replace(".before", "") + "-"
+
+
 def ref_arm(data, cols, n):
-    """The arm request n is compared against: the first of `cols` that sent it."""
-    return next(a for a in cols if n in data[a])
+    """The arm request n is compared against: the first of `cols` that sent it, an exact arm before any inexact one."""
+    sent = [a for a in cols if n in data[a]]
+    return next((a for a in sent if not inexact(a)), sent[0])
 
 
 def compare(d, arms):
@@ -411,8 +419,10 @@ def compare(d, arms):
                 names[0], names[-1], len(names), cols[0]))
         print("%-12s" % "request" + "".join("%18s" % a for a in cols))
         tot = {a: [0.0, 0] for a in cols}
+        inx = {a: [0, 0] for a in cols if inexact(a)}   # texts that differ, texts compared
         for n in names:
-            ref = data[ref_arm(data, cols, n)][n]
+            ra = ref_arm(data, cols, n)
+            ref = data[ra][n]
             cells = []
             for a in cols:
                 r = data[a].get(n)
@@ -420,6 +430,9 @@ def compare(d, arms):
                     cells.append("%18s" % "-")
                     continue
                 same = r["text"] == ref["text"]
+                if a in inx and a != ra and ref["text"] is not None:
+                    inx[a][0] += 0 if same else 1
+                    inx[a][1] += 1
                 tps = r["timings"].get("predicted_per_second") or 0.0
                 tot[a][0] += r["timings"].get("predicted_ms") or 0.0
                 tot[a][1] += r["timings"].get("predicted_n") or 0
@@ -427,6 +440,8 @@ def compare(d, arms):
             print("%-12s" % n + "".join(cells))
         print("%-12s" % "decode" + "".join(
             "%12.2f tok/s" % (tot[a][1] / tot[a][0] * 1e3 if tot[a][0] else 0.0) for a in cols))
+        for a, (k, m) in inx.items():
+            print("%s: differ from reference: %d of %d (inexact arm, Qw)" % (a, k, m))
 
 
 def prompt_tokens(t):

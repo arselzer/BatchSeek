@@ -100,6 +100,7 @@ struct Tunables {
     bool swiglu_span = false;
     bool tiled = false;                                         /* ds41p1::kTiledEnv: the register-tiled twin */
     bool tail_once = false;                                     /* ds41p1::kTailOnceEnv: waves skip the tail fill */
+    bool wmma = false;                                          /* ds41p1::kWmmaEnv: the WMMA twin (inexact) */
 };
 /* The tunables from `get` (getenv for the engine): each a whole number in its range (wave 1-16,
  * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, lend_arena 0-64,

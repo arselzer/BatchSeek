@@ -106,6 +106,27 @@ inline bool r4d_ds41_p1_tiled() {
     return on;
 }
 
+/* RADIANCE_EXPERIMENTAL_DS41_P1_WMMA (tools/ds41-host-experts/ds41_p1.h kWmmaEnv): "1" beside P1 puts the P1 twin's
+ * calls on the matrix-core kernel (r4d_ds41_mxfp4.hip, mx_p1w_kernel; ahead of the register-tiled switch). OPT-IN AND
+ * NOT EXACT: every weight value (the e2m1 code, exact in bf16) and every bf16 activation is the exact twin's, and each
+ * 32-value block's products are summed by v_wmma_f32_16x16x16_bf16 in f32, then scaled by the block's e8m0 and added
+ * to the running f32 sum -- the same values and products, another f32 summation order, so an output may differ from
+ * the decode band's by f32 rounding (mostly identical bf16, rare 1-ulp). The order is fixed per output (16-row tiles,
+ * K blocks in increasing order, no split-K), so a row's bits depend neither on M, the grid, nor the other rows of the
+ * pass. The row keeps its name; its `computes` names the form (kR4dDs41P1WmmaMark), which the core requires when it
+ * is asked for. Anything else, or "1" without P1, is off here (the core refuses an invalid value, the switch without
+ * P1, and a device that is not gfx12). Read once. */
+constexpr const char* kR4dDs41P1WmmaEnv  = "RADIANCE_EXPERIMENTAL_DS41_P1_WMMA";
+constexpr const char* kR4dDs41P1WmmaMark = "the WMMA P1 twin (inexact: f32 summation order)";
+
+inline bool r4d_ds41_p1_wmma() {
+    static const bool on = [] {
+        const char* e = std::getenv(kR4dDs41P1WmmaEnv);
+        return e && e[0] == '1' && e[1] == '\0' && r4d_ds41_p1();
+    }();
+    return on;
+}
+
 /* The twin's bound on M: kR4dDs41P1MaxRows under P1, kR4dDs41LcpMax under LCP, kR4dDs41TallRows under EXACT_TALL
  * alone. */
 inline int r4d_ds41_tall_rows() {

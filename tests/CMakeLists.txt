@@ -845,6 +845,13 @@ if(R4D_EMU_BUILT)
   add_test(NAME r4d_emu_ds41p1_tiled COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1 tiled)
   set_tests_properties(r4d_emu_ds41p1_tiled PROPERTIES LABELS "r4d_emu;slow" TIMEOUT 3600
                        ENVIRONMENT "RADIANCE_EXPERIMENTAL_DS41_LCP=2048;RADIANCE_EXPERIMENTAL_DS41_P1=1;RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1")
+  # The WMMA form (RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=1 beside P1, LCP and the tiled switch, as a Qw arm has them;
+  # inexact by design): the served twin is mx_p1w_kernel, held to the exact twin within f32 reordering (bf16 equal
+  # or 1 ulp, or within the cancellation bound; f32 within 2^-16 sum|wx| of the f64 sum), T3/T4, the same bytes on
+  # every grid and rerun, and one token's rows the same bits in passes of 1, 7, 64 and 1896 tokens.
+  add_test(NAME r4d_emu_ds41p1_wmma COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1 wmma)
+  set_tests_properties(r4d_emu_ds41p1_wmma PROPERTIES LABELS "r4d_emu;slow" TIMEOUT 3600
+                       ENVIRONMENT "RADIANCE_EXPERIMENTAL_DS41_LCP=2048;RADIANCE_EXPERIMENTAL_DS41_P1=1;RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1;RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=1")
 endif()
 
 # The aux expert worker's launches (core/place/aux_expert_worker.h, work/aux/SPEC.md §15.5) on the emulator: gemv_vp

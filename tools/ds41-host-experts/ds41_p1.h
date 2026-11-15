@@ -323,6 +323,28 @@ inline int tiled_state() {
     return s;
 }
 
+/* ---- the WMMA twin (fast prefill, inexact) ----------------------------------------------------------
+ *
+ * kWmmaEnv: "1" beside kEnv puts the twin row's calls on libr4d's matrix-core kernel (r4d_ds41_mxfp4.hip,
+ * mx_p1w_kernel), ahead of kTiledEnv. NOT EXACT, by design and opt-in only: the weights (e2m1 codes, exact in
+ * bf16) and the bf16 activations are the exact twin's; each 32-value block's products are summed in f32 by
+ * v_wmma_f32_16x16x16_bf16, scaled by the block's e8m0 and added to the running f32 sum, so only the f32 summation
+ * order differs from T1's decode band (the bf16 outputs mostly identical, rare 1-ulp differences; replies are not
+ * byte-identical to the exact engine). T1 is relaxed to that; T2-T6 hold unchanged, and each output's order is
+ * fixed (16-row tiles, K blocks ascending, no split-K): batch-invariant at the kernel, whatever M, the grid or the
+ * other rows. The core refuses the switch without P1, an invalid value, beside the host verify (kVerifyEnv, which
+ * would count every rounding difference), on a device whose arch is not gfx12, or with a libr4d whose P1 row does
+ * not name kWmmaMark; each rank says kLogWmma at startup. The window measures a Qw arm only on the libr4d.so its
+ * device check (kWmmaCheckMode) passed on, and never reads its replies as an exactness result. */
+constexpr const char* kWmmaEnv       = "RADIANCE_EXPERIMENTAL_DS41_P1_WMMA";
+constexpr const char* kWmmaMark      = "the WMMA P1 twin (inexact: f32 summation order)";
+constexpr const char* kLogWmma       = "ds41 p1: WMMA twin on (inexact), rank";   /* each rank, at startup */
+constexpr const char* kWmmaCheckMode = "p1wmma";
+inline int wmma_state() {
+    static const int s = env_state(std::getenv(kWmmaEnv));
+    return s;
+}
+
 /* ---- the tail filled once a layer --------------------------------------------------------------
  *
  * kTailOnceEnv: "1" beside kEnv makes the stager's wave relaunches of gate_up and down pass the twin's parameter

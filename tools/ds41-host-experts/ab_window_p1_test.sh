@@ -390,13 +390,21 @@ QZ=$FAST-Qz
 QTQZ=$FAST-Qsp-Qt-Qz
 QZNOP=$REF-Qz
 ARMS="$ARMS $QT $QTQSP $QTNOP $QZ $QTQZ $QZNOP"
+# Qw: the WMMA P1 twin (inexact by design) on the N256-like preset (Qsp-Qt-Qz), beside Qv, without P1, with Kld (no
+# reference yet in the loop: skipped; with KLD_REF set: --kld-ref), and the wave part Qw2 (unchanged: the wave size).
+QW=$FAST-Qsp-Qt-Qz-Qw
+QWV=$FAST-Qw-Qv8
+QWNOP=$REF-Qw
+QWKLD=$FAST-Qw-Kld
+QW2=$FAST-Qw2
+ARMS="$ARMS $QW $QWV $QWNOP $QWKLD $QW2"
 run_loop() {   # actual balance-oracle bound; every model action remains stubbed
  (
   set +u
   log() { echo "LOG: $*"; }
   power_set() { :; }; power_restore() { :; }
   vpack_gate() { return 0; }
-  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; echo "  ARM_QD: ${ARM_QD:-}"; echo "  ARM_QY: ${ARM_QY:-}"; echo "  ARM_QYF: ${ARM_QYF:-}"; echo "  ARM_QT: ${ARM_QT:-}"; }
+  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; echo "  ARM_QD: ${ARM_QD:-}"; echo "  ARM_QY: ${ARM_QY:-}"; echo "  ARM_QYF: ${ARM_QYF:-}"; echo "  ARM_QT: ${ARM_QT:-}"; echo "  ARM_QW: ${ARM_QW:-}"; }
   HX_THREADS=16 SILU=/dev/null RHOME=$H RADIANCE_HOME_DIR2=$H MIRROR=$T
   PROMPTS=$T/prompts.json
   unset RADIANCE_TUNE
@@ -406,6 +414,9 @@ run_loop() {   # actual balance-oracle bound; every model action remains stubbed
   BAL_OK=1 BAL_WHY=test BAL_SUM=$SUM BAL_LIB=$LIB BAL_MAX_M=$1 P1_OK=1 P1_WHY=test P1_SUM=$SUM P1_LIB=$LIB
   if [[ ${2:-} == no-p1t ]]; then P1T_OK="" P1T_WHY="no p1tiled check (test)" P1T_SUM="" P1T_LIB=""
   else P1T_OK=1 P1T_WHY=test P1T_SUM=$SUM P1T_LIB=$LIB; fi
+  if [[ ${2:-} == no-p1w ]]; then P1W_OK="" P1W_WHY="no p1wmma check (test)" P1W_SUM="" P1W_LIB=""
+  else P1W_OK=1 P1W_WHY=test P1W_SUM=$SUM P1W_LIB=$LIB; fi
+  KLD_REF=${3:-}
   OUT=$T/out; mkdir -p "$OUT"; CANCEL_FILE=/nonexistent/cancel; CANCEL=$CANCEL_FILE
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
@@ -418,6 +429,7 @@ run_loop() {   # actual balance-oracle bound; every model action remains stubbed
 mkdir -p "$T/out"
 echo 'p1: PASS: moe_gemm_ggml_mxfp4_gemv_tall_p1 at M 17..4096: ... splits and full/span SwiGLU waves of 1-3 equal to one launch, also with the tail filled once (52 cases)' > "$T/out/devcheck-p1.log"
 echo 'p1tiled: PASS: moe_gemm_ggml_mxfp4_gemv_tall_p1 served on the register-tiled P1 twin at M 17..4096: ... equal to one launch, also with the tail filled once (54 cases)' > "$T/out/devcheck-p1tiled.log"
+echo '{"prompt": "a test document"}' > "$T/out/kld-corpus.jsonl"
 out=$(run_loop 4096)
 echo "$out" > "$T/loop.txt"
 section() { awk -v a="ARM $1" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt"; }
@@ -663,6 +675,49 @@ for a in "$COLD4K" "$PC4K"; do
 done
 grep -qxF "ARM $BIG" <<< "$short_out" && ok 'Mb+Lc2048 still runs on its M2048 balance receipt' ||
   bad 'the shorter balance receipt incorrectly stopped Mb+Lc2048'
+
+# ---- 8c. Qw (the WMMA P1 twin, inexact by design): the switch at 1 on the preset arm with Qsp, Qt and Qz as they are;
+# every other arm states it 0 (Qw2 too: the wave size, ..._P1_WAVE=2); Qw without P1, beside Qv, and with Kld before a
+# reference skipped; with a reference, a Qw Kld arm scores against it (--kld-ref) instead of recording; without a
+# p1wmma receipt refused; the startup gate (every rank's marker, none on a plain arm).
+sec=$(section "$QW")
+if [[ -z "$sec" ]]; then bad "the Qw arm $QW was not launched: $(grep -m3 "arm $QW" "$T/loop.txt")"
+else
+  has "Qw" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_WMMA 1
+  for v in RADIANCE_EXPERIMENTAL_DS41_P1_TILED RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN; do
+    has "Qw on the Qsp-Qt-Qz preset" "$sec" "$v" 1
+  done
+  for v in RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA; do
+    has "Qw as the fast arm" "$sec" "$v" "$(val "$fast" "$v")"
+  done
+  grep -qx "  ARM_QW: 1" <<< "$sec" && ok "Qw: the arm is gated on its startup markers (ARM_QW=1)" || bad "Qw: ARM_QW is '$(grep '  ARM_QW:' <<< "$sec")'"
+fi
+for a in "$REF" "$FAST" "$QT" "$QTQZ" "$QD200" "$QW2"; do
+  has "no Qw part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_P1_WMMA 0
+done
+has "Qw2 is the wave size" "$(section "$QW2")" RADIANCE_EXPERIMENTAL_DS41_P1_WAVE 2
+qdskip "$QWNOP" "Qw needs P1; the arm is skipped"
+qdskip "$QWV" "Qw beside Qv8 (the host verify.*skipped"
+qdskip "$QWKLD" "Qw with Kld scores against the window's Kld reference, and none has been recorded yet.*skipped"
+ref_out=$(run_loop 4096 "" "$T/out/kld-plain")
+sec=$(awk -v a="ARM $QWKLD" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' <<< "$ref_out")
+if [[ -z "$sec" ]]; then bad "the Qw Kld arm was not launched with a reference: $(grep -m2 "arm $QWKLD" <<< "$ref_out")"
+elif grep -q -- "--kld-ref $T/out/kld-plain --kld-out $T/out/kld-$QWKLD.json" <<< "$sec" && ! grep -q -- "--kld-record" <<< "$sec"; then
+  ok "Qw with Kld: scored against the reference (--kld-ref, --kld-out), not recorded"
+else bad "Qw with Kld: $(grep '  ARGS:' <<< "$sec")"; fi
+nop1w_out=$(run_loop 4096 no-p1w)
+if grep -qxF "ARM $QW" <<< "$nop1w_out"; then bad "a Qw arm launched without a p1wmma receipt"
+elif grep -qF "arm $QW: Qw refused: no p1wmma check (test)" <<< "$nop1w_out"; then ok 'Qw refused without a p1wmma receipt'
+else bad "no p1wmma refusal for arm $QW: $(grep -m1 "arm $QW: " <<< "$nop1w_out")"; fi
+grep -qxF "ARM $FAST" <<< "$nop1w_out" && ok 'the fast arm runs without a p1wmma receipt' || bad 'the fast arm needed a p1wmma receipt'
+eval "$(sed -n '/^qw_gate() {/,/^}/p' "$W")"
+for r in 0 1 2 3; do echo "ds41 p1: WMMA twin on (inexact), rank $r (RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=1): every P1 twin call"; done > "$T/qw.log"
+qw_gate "$T/qw.log" 1 > /dev/null && ok "qw_gate: every rank's marker passes a Qw arm" || bad "qw_gate refused four markers"
+qw_gate "$T/qw.log" "" > /dev/null && bad "qw_gate passed a plain arm with WMMA markers" || ok "qw_gate: a plain arm with the markers is not measured"
+sed -i '/rank 2/d' "$T/qw.log"
+why=$(qw_gate "$T/qw.log" 1) && bad "qw_gate passed three markers" || { [[ $why == *"rank 2 lacks"* ]] && ok "qw_gate: a missing rank's marker is named" || bad "qw_gate: $why"; }
+: > "$T/qw.log"
+qw_gate "$T/qw.log" "" > /dev/null && ok "qw_gate: a plain arm without markers passes" || bad "qw_gate refused a plain arm"
 
 (( fail )) && { echo "ab_window_p1_test: FAILED (loop output in $T/loop.txt, removed on exit)"; exit 1; }
 echo "ab_window_p1_test: all checks passed"

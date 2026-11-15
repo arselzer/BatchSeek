@@ -185,6 +185,18 @@
 # which the layer's own launches did; same bytes. Needs P1 and the `p1` oracle's "also with the tail filled once"
 # PASS line (and, with Qt, the `p1tiled` one's); measured only if every rank logs "ds41 p1: tail filled once a
 # layer, rank R" once at startup and at exit counts "wave tail fills skipped N", N > 0 (any other arm neither).
+# Qw (bare, no number; QwN stays the wave size): the WMMA P1 twin, an opt-in fast prefill that is NOT exact
+# (RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=1; ds41_p1.h kWmmaEnv; every other arm states 0): the P1 twin's calls on libr4d's
+# mx_p1w_kernel (v_wmma_f32_16x16x16_bf16 over the exact bf16 weights and activations, each block's e8m0 applied once
+# to its f32 sum: another f32 summation order). Needs P1; skipped beside Qv (the engine refuses the host verify with
+# it), Axr (the aux worker's taller passes would run it unchecked) and F5 (external exact references). A Qw arm runs
+# only on the libr4d.so (sha256) on which `p1wmma` in DEVICE_CHECKS passed (ds41_mxfp4_device_check TALL_LIBR4D
+# p1wmma P1_CHECK_M P1_ROUTES on card 0, "p1wmma: PASS" its last line; devcheck-p1wmma.log), and is measured only if
+# every rank logs "ds41 p1: WMMA twin on (inexact), rank R" once at startup (any other arm only without it). Its
+# replies are inexact by design: the comparisons report "differ from reference: k of n (inexact arm, Qw)", never use
+# a Qw arm as the reference, and nothing gates on them; its Kh hashes are left out of the hash groups. A Qw arm with
+# Kld scores the engine against the window's Kld reference (--kld-ref, the engine's own KL report: mean, median,
+# p99.., top-1 agreement, PPL) instead of recording, so a plain Kld arm must run before it in the window.
 # QdN: decode passes on the cards (..._P1_DECODE_ROWS=N, 17 to N_Lc; every other arm states 0): a pure
 # decode pass of N rows or more (decode rows only, no draft, speculation or cut) arms the card path for its
 # routed layers as a prefill pass of the threshold's rows does, and takes the lent slots back as one does;
@@ -774,8 +786,17 @@ kld_finish() {   # name; the run is SERVER_PID
   if ! extra_why=$(vp_server_gate "$OUT/$name.server.log" "${ARM_VP:-}" "$([[ " ${ARGS[*]} " == *" --draft-bank "* ]] && echo 1)") ||
      ! extra_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" exit) ||
      ! extra_why=$(qt_gate "$OUT/$name.server.log" "${ARM_QT:-}") ||
+     ! extra_why=$(qw_gate "$OUT/$name.server.log" "${ARM_QW:-}") ||
      ! extra_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" exit); then
     log "arm $name: $extra_why; Kld not measured"; return 1
+  fi
+  # Qw (inexact by design): its run scored the engine against KLD_REF (--kld-ref); the engine's KL report is the
+  # result. Never the reference, never compared byte for byte.
+  if [[ -n "${ARM_QW:-}" ]]; then
+    log "arm $name: KL of the WMMA twin (inexact arm, Qw) against the reference $KLD_REF:"
+    grep -E 'kld: (KLD mean|top-1 agreement|  )|kld: .* against ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+    grep -qE 'kld: KLD mean' "$OUT/$name.server.log" || { log "arm $name: no KL report in the server log"; return 1; }
+    return 0
   fi
   if [[ -z "$KLD_REF" ]]; then
     # The reference must be a plain 16-token arm's bits: a feature arm first (the plain one failed
@@ -990,6 +1011,19 @@ qt_gate() {   # log, requested switch: the register-tiled twin's startup marker 
   for rank in 0 1 2 3; do
     count=$(grep -cE "ds41 p1: register-tiled twin on, rank $rank \\(RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1\\)" "$f")
     if [[ $count != 1 ]]; then echo "Qt, but rank $rank lacks one 'ds41 p1: register-tiled twin on' startup marker"; return 1; fi
+  done
+  return 0
+}
+
+qw_gate() {   # log, requested switch: the WMMA twin's startup marker on every rank, or on none
+  local f=$1 on=$2 rank count
+  if [[ -z "$on" ]]; then
+    if grep -q 'ds41 p1: WMMA twin on' "$f"; then echo 'no Qw part, but the WMMA twin is on'; return 1; fi
+    return 0
+  fi
+  for rank in 0 1 2 3; do
+    count=$(grep -cE "ds41 p1: WMMA twin on \(inexact\), rank $rank \(RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=1\)" "$f")
+    if [[ $count != 1 ]]; then echo "Qw, but rank $rank lacks one 'ds41 p1: WMMA twin on (inexact)' startup marker"; return 1; fi
   done
   return 0
 }
@@ -1354,6 +1388,7 @@ EOF2
     log "arm $name: $qsp_why; not measured"; stop_server; return 1
   fi
   if ! qsp_why=$(qt_gate "$OUT/$name.server.log" "${ARM_QT:-}") ||
+     ! qsp_why=$(qw_gate "$OUT/$name.server.log" "${ARM_QW:-}") ||
      ! qsp_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" start); then
     log "arm $name: $qsp_why; not measured"; stop_server; return 1
   fi
@@ -2054,6 +2089,42 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" p1tiled "* ]]; then
     else
       P1T_WHY="the register-tiled P1 twin device check did not pass on $TL:$p1t_bad"
       log "$P1T_WHY no Qt arm is measured"
+    fi
+  fi
+fi
+# The Qw arms' gate (RADIANCE_EXPERIMENTAL_DS41_P1_WMMA), like Qt's: a Qw arm runs only on the libr4d.so (sha256) on
+# which ds41_mxfp4_device_check `p1wmma` passed in this window (the WMMA twin served and held to the exact twin within
+# f32 reordering, deterministic and batch-invariant; the check sets LCP=2048, P1=1, the tiled switch and the switch).
+P1W_OK="" P1W_LIB="" P1W_SUM=""
+P1W_WHY="no WMMA P1 twin device check in this window (DEVICE_CHECKS=p1wmma with TALL_CHECK and TALL_LIBR4D)"
+if [[ " ${DEVICE_CHECKS:-1} " == *" p1wmma "* ]]; then
+  TL=${TALL_LIBR4D:-} TC=${TALL_CHECK:-} PM=${P1_CHECK_M:-4096} PR=${P1_ROUTES:-}
+  if [[ ! -x "$TC" || ! -f "$TL" ]]; then
+    P1W_WHY="TALL_CHECK=$TC is not an executable or TALL_LIBR4D=$TL is not a file"
+    log "WMMA P1 twin device check: $P1W_WHY; no Qw arm is measured"
+  elif ! [[ $PM =~ ^[0-9]+$ ]] || (( 10#$PM < 17 || 10#$PM > 4096 )); then
+    P1W_WHY="P1_CHECK_M=$PM is not in 17..4096"
+    log "WMMA P1 twin device check: $P1W_WHY; no Qw arm is measured"
+  elif [[ -n "$PR" && ! -f "$PR" ]]; then
+    P1W_WHY="P1_ROUTES=$PR is not a file"
+    log "WMMA P1 twin device check: $P1W_WHY; no Qw arm is measured"
+  else
+    log "WMMA P1 twin device check on card 0 with $TL ($TC), M up to $PM${PR:+, routes $PR}"
+    ( export HIP_VISIBLE_DEVICES=0
+      unset RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_P1_TILED RADIANCE_EXPERIMENTAL_DS41_P1_WMMA
+      timeout 2400 "$TC" "$TL" p1wmma $((10#$PM)) $PR >"$OUT/devcheck-p1wmma.log" 2>&1
+      echo "p1wmma exit $?" >>"$OUT/devcheck-p1wmma.log" )
+    grep -E '^p1wmma:|^p1wmma invariance:|^p1 time:|exit' "$OUT/devcheck-p1wmma.log" | tail -30 | tee -a "$OUT/window.log"
+    p1w_bad=""
+    grep -qx "p1wmma exit 0" "$OUT/devcheck-p1wmma.log" || p1w_bad+=" p1wmma exited non-zero;"
+    [[ "$(grep -E '^p1wmma: (PASS|FAIL)' "$OUT/devcheck-p1wmma.log" | tail -1)" == "p1wmma: PASS"* ]] || p1w_bad+=" its last p1wmma line is not PASS;"
+    grep -qE '^PASS: row table: .*served form: the WMMA P1 twin' "$OUT/devcheck-p1wmma.log" || p1w_bad+=" its row table did not name the WMMA twin;"
+    if [[ -z "$p1w_bad" ]]; then
+      P1W_OK=1 P1W_LIB=$TL P1W_SUM=$(sha256sum "$TL" 2>/dev/null | cut -d' ' -f1)
+      log "WMMA P1 twin device check passed on $TL, sha256 ${P1W_SUM:0:16}: Qw arms on it are measured (inexact by design)"
+    else
+      P1W_WHY="the WMMA P1 twin device check did not pass on $TL:$p1w_bad"
+      log "$P1W_WHY no Qw arm is measured"
     fi
   fi
 fi
@@ -3308,7 +3379,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" sg="" pcn=""
-  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qsp="" qt="" qz="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qsp="" qt="" qw="" qz="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl=""
   ctp=""   # Ctp / CtpN: the prefill chain trace (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL)
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
@@ -3521,6 +3592,7 @@ for a in $ARMS; do
       P1)      p1=1 ;;                                                  # prefill Phase 1: card experts in large chunks (needs Lc)
       Qsp)     qsp=1 ;;                                                 # each P1 wave's covering sorted-slot SwiGLU span
       Qt)      qt=1 ;;                                                  # the register-tiled P1 twin (..._P1_TILED=1)
+      Qw)      qw=1 ;;                                                  # the WMMA P1 twin, inexact (..._P1_WMMA=1; QwN is the wave)
       Qz)      qz=1 ;;                                                  # the twin's tail filled once a layer (..._P1_TAIL_ONCE=1)
       Qw[0-9]*|Qi[0-9]*|Qr[0-9]*|Qa[0-9]*|Qv[0-9]*|Qm[0-9]*|Ql[0-9]*|Qh[0-9]*|Qe[0-9]*|Qd[0-9]*)   # ...wave / in flight / ready / read-ahead / verify / threshold / lent slots / its hold / lent arena slots / decode passes
                qn=${p:2}
@@ -4068,6 +4140,27 @@ for a in $ARMS; do
       fi
     fi
   fi
+  # Qw: the WMMA P1 twin (inexact by design), stated in every arm (0 off); with P1, on the libr4d.so `p1wmma` passed on.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=${qw:-0})
+  if [[ -n "$qw" ]]; then
+    [[ -n "$p1" ]] || { log "arm $a: Qw needs P1; the arm is skipped"; skip=1; }
+    [[ -n "$qv" && "$qv" != 0 ]] && { log "arm $a: Qw beside Qv$qv (the host verify would count every rounding difference; the engine refuses it); the arm is skipped"; skip=1; }
+    [[ -z "$axr" ]] || { log "arm $a: Qw beside Axr$axr: the aux worker's taller passes would run the WMMA twin, which no auxtall check covers; the arm is skipped"; skip=1; }
+    [[ -z "$f5" ]] || { log "arm $a: Qw beside $f5 (its phases are held to exact external references); the arm is skipped"; skip=1; }
+    if [[ -n "$kld" && -z "$KLD_REF" ]]; then
+      log "arm $a: Qw with Kld scores against the window's Kld reference, and none has been recorded yet (run a plain Kld arm first); the arm is skipped"; skip=1
+    fi
+    if [[ -z "$skip" ]]; then
+      IFS=: read -r -a homes <<< "$ARM_HOME"
+      lib=""
+      for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { lib=$h/kernels/libr4d.so; break; }; done
+      if [[ -z "$P1W_OK" ]]; then
+        log "arm $a: Qw refused: $P1W_WHY"; skip=1
+      elif [[ -z "$lib" || "$(sha256sum "$lib" 2>/dev/null | cut -d' ' -f1)" != "$P1W_SUM" ]]; then
+        log "arm $a: Qw refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the p1wmma check passed on ($P1W_LIB, sha256 ${P1W_SUM:0:16})"; skip=1
+      fi
+    fi
+  fi
   # Qz: the tail filled once a layer, stated in every arm (0 off); with P1 and the oracle's tail-once waves.
   env+=(RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=${qz:-0})
   if [[ -n "$qz" ]]; then
@@ -4186,7 +4279,11 @@ for a in $ARMS; do
       log "arm $a: no kld corpus; the arm is skipped"; skip=1
     fi
     rm -rf "$OUT/kld-$a"
-    ARGS=(--max-model-len "${KLD_LEN:-2048}" "${ARGS[@]}" --kld-record "$OUT/kld-$a" --kld-corpus "$OUT/kld-corpus.jsonl")
+    if [[ -n "$qw" ]]; then   # inexact: scored against the reference's tokens, the engine's own KL report
+      ARGS=(--max-model-len "${KLD_LEN:-2048}" "${ARGS[@]}" --kld-ref "$KLD_REF" --kld-out "$OUT/kld-$a.json")
+    else
+      ARGS=(--max-model-len "${KLD_LEN:-2048}" "${ARGS[@]}" --kld-record "$OUT/kld-$a" --kld-corpus "$OUT/kld-corpus.jsonl")
+    fi
   fi
   env+=(RADIANCE_EXPERIMENTAL_DS41_AR_ROWS=${ar_rows:-0})
   ARM_AR_ROWS=$ar_rows ARM_AR_CAP=0
@@ -4287,7 +4384,7 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
   if [[ -n "$ARM_TIMEOUT" ]] && ! [[ $ARM_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]]; then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QSP=$qsp ARM_QT=$qt ARM_QZ=$qz ARM_LH=$lh
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QSP=$qsp ARM_QT=$qt ARM_QW=$qw ARM_QZ=$qz ARM_LH=$lh
   ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr ARM_SL=$sl ARM_CTX=$arm_ctx
   if [[ -n "$sl" && $arm_ctx =~ ^[0-9]{1,9}$ ]] && (( sl > 10#$arm_ctx )); then
     log "arm $a: Sl$sl is past the arm's --max-model-len $((10#$arm_ctx)) (the server refuses it); the arm is skipped"; skip=1
@@ -4456,7 +4553,9 @@ declare -A BY_PROMPTS=() KH_BY_PROMPTS=()
 for a in $ARMS; do
   u=$(tr '-' '\n' <<< "$a" | grep -m1 -E '^U.+')
   BY_PROMPTS[${u:-held-out}]+="$a "
-  [[ "-$a-" == *-Kh-* ]] && KH_BY_PROMPTS[${u:-held-out}]+="$a "
+  if [[ "-$a-" == *-Kh-* && "-$a-" == *-Qw-* ]]; then
+    log "prefill hashes: $a is a Qw arm (inexact by design); its hashes are left out of the comparisons"
+  elif [[ "-$a-" == *-Kh-* ]]; then KH_BY_PROMPTS[${u:-held-out}]+="$a "; fi
 done
 if (( ${#BY_PROMPTS[@]} > 1 )); then
   for u in "${!BY_PROMPTS[@]}"; do

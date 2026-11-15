@@ -10584,8 +10584,12 @@ const std::vector<TallTwin>& tall_twins() {
                                   "written as zeros)"
                           : lcp ? " tokens (RADIANCE_EXPERIMENTAL_DS41_LCP)"
                                 : " tokens (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL)") +
-                         ", each output the decode band's bits" +
-                         (p1 && r4d_ds41_p1_tiled()
+                         (p1 && r4d_ds41_p1_wmma() ? "" : ", each output the decode band's bits") +
+                         (p1 && r4d_ds41_p1_wmma()
+                              ? std::string("; ") + kR4dDs41P1WmmaMark + " (" + kR4dDs41P1WmmaEnv +
+                                    "=1: v_wmma_f32_16x16x16_bf16 a 32-value block, its e8m0 applied once; NOT the "
+                                    "decode band's bits, an opt-in fast prefill)"
+                          : p1 && r4d_ds41_p1_tiled()
                               ? std::string("; ") + kR4dDs41P1TiledMark + " (" + kR4dDs41P1TiledEnv +
                                     "=1: 4 weight rows x 8 activation rows a wave, K in chunks of 1024)"
                               : std::string());
@@ -10594,7 +10598,11 @@ const std::vector<TallTwin>& tall_twins() {
                       "1024 experts";
             t.push_back(std::move(h));
         }
-        if (p1 && r4d_ds41_p1_tiled() && !t.empty())
+        if (p1 && r4d_ds41_p1_wmma() && !t.empty())
+            std::fprintf(stderr, "libr4d: %s=1: %s takes %s (mx_p1w_kernel: 64 rows x 256 weight rows a block on "
+                         "v_wmma_f32_16x16x16_bf16, each block's e8m0 applied once to its f32 sum; inexact by design)\n",
+                         kR4dDs41P1WmmaEnv, kR4dDs41P1Row, kR4dDs41P1WmmaMark);
+        else if (p1 && r4d_ds41_p1_tiled() && !t.empty())
             std::fprintf(stderr, "libr4d: %s=1: %s takes %s (mx_p1t_kernel: 4 weight rows x 8 activation rows a "
                          "wave, K in chunks of 1024, each output the decode band's sum operation for operation)\n",
                          kR4dDs41P1TiledEnv, kR4dDs41P1Row, kR4dDs41P1TiledMark);
