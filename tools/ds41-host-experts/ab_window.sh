@@ -405,6 +405,9 @@ restore() {
   local left; left=$(bin_pids under "${LEFTOVER_ROOT:-/home/as/ds41-claude-build/}")
   # shellcheck disable=SC2086
   [[ -n "$left" ]] && reap_pids "before $NAME restarts" $left
+  # QFN_KEEP_STOPPED=1 (a night of back-to-back windows): production stays stopped for the next window; the
+  # sequencer that set it owns the stop (work/qfn_stopped_by) and restores production at its end.
+  if [[ "${QFN_KEEP_STOPPED:-0}" == 1 ]]; then log "QFN_KEEP_STOPPED=1: leaving $NAME stopped for the next window"; return 0; fi
   log "restoring $NAME"
   local t=0 state
   while :; do
@@ -1169,7 +1172,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   until curl -s -m 3 "http://127.0.0.1:$PORT/stats" >/dev/null 2>&1; do
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then log "arm $name: server exited during startup"; SERVER_PID=; aux_tenant_cleanup; return 1; fi
     sleep 2; t=$((t + 2))
-    if (( t > 600 )); then log "arm $name: no server after 600 s"; stop_server; return 1; fi
+    if (( t > ${AB_START_TIMEOUT_S:-600} )); then log "arm $name: no server after ${AB_START_TIMEOUT_S:-600} s"; stop_server; return 1; fi
   done
   log "arm $name: serving after ${t}s"
   # AxF: the first tenant leaves 20 s after "serving" (the server acquires 5 s later); 60 s after "serving" a second
@@ -1850,21 +1853,27 @@ EOF2
   grep -E 'end-of-request snapshots: [0-9]+ reserved' "$OUT/$name.server.log" | tail -1 | tee -a "$OUT/window.log"   # Pce/Pcl: stored, hits, store
 }
 
+QFN_WAS_STOPPED=""
 if [[ "$("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null)" != running ]]; then
-  log "QFN ($NAME) is not running before the window; not starting one"; exit 4
+  # QFN_ALREADY_STOPPED=1: the previous back-to-back window left it stopped (QFN_KEEP_STOPPED); go on without a stop.
+  if [[ "${QFN_ALREADY_STOPPED:-0}" == 1 ]]; then log "QFN_ALREADY_STOPPED=1: $NAME is already stopped (a back-to-back window)"; QFN_WAS_STOPPED=1
+  else log "QFN ($NAME) is not running before the window; not starting one"; exit 4; fi
 fi
-log "waiting for 30 s of QFN idleness"
+[[ -z "$QFN_WAS_STOPPED" ]] && log "waiting for 30 s of QFN idleness"
 # QFN_FORCE_STOP=1 (the owner's go to stop production even while it serves): skip the 30-s idleness wait; the stop
 # below still lets running requests drain for up to 60 s and the restore brings production back.
-if [[ "${QFN_FORCE_STOP:-0}" == 1 ]]; then log "QFN_FORCE_STOP=1: not waiting for QFN idleness"
+if [[ -n "$QFN_WAS_STOPPED" ]]; then :
+elif [[ "${QFN_FORCE_STOP:-0}" == 1 ]]; then log "QFN_FORCE_STOP=1: not waiting for QFN idleness"
 elif ! idle_for 30 600; then log "QFN not idle within 10 min; no window"; exit 3; fi
 "${DOCKER[@]}" inspect "$NAME" --format 'before: {{.Id}} {{.State.Status}} {{.State.StartedAt}} {{.Config.Image}}' >>"$OUT/window.log" 2>&1
 trap restore EXIT
 trap 'exit 130' INT TERM HUP
 echo $$ > /home/as/ds41-claude-build/work/qfn_stopped_by   # the QFN watchdog leaves a live owner's stop alone
-log "stopping $NAME"
-"${DOCKER[@]}" stop -t 60 "$NAME" >>"$OUT/window.log" 2>&1
-sleep 5
+if [[ -z "$QFN_WAS_STOPPED" ]]; then
+  log "stopping $NAME"
+  "${DOCKER[@]}" stop -t 60 "$NAME" >>"$OUT/window.log" 2>&1
+  sleep 5
+fi
 AR_AG_SHARED_WINDOW_ACTIVE=1
 AG_ROWS_WINDOW_ACTIVE=1
 AR_ROWS_WINDOW_ACTIVE=1   # the AR checker also verifies QFN's actual exited state
@@ -1905,8 +1914,11 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" lcp "* ]]; then
       ( export HIP_VISIBLE_DEVICES=0
         unset RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL RADIANCE_EXPERIMENTAL_DS41_LCP
         [[ $f == sweep ]] && export RADIANCE_EXPERIMENTAL_DS41_LCP=$LC
-        timeout 1800 "$TC" "$TL" $m >"$OUT/devcheck-lcp-$f.log" 2>&1
-        echo "$f exit $?" >>"$OUT/devcheck-lcp-$f.log" )
+        key=$(dc_key "$TC" "$TL" -- $m "LCP=${RADIANCE_EXPERIMENTAL_DS41_LCP:-}")
+        if ! dc_reuse "$OUT/devcheck-lcp-$f.log" "$key"; then
+          timeout 1800 "$TC" "$TL" $m >"$OUT/devcheck-lcp-$f.log" 2>&1
+          echo "$f exit $?" >>"$OUT/devcheck-lcp-$f.log"; printf '%s' "$key" > "$OUT/devcheck-lcp-$f.log.key"
+        fi )
       grep -E '^(PASS|FAIL)|exit|norm rows' "$OUT/devcheck-lcp-$f.log" | tail -10 | tee -a "$OUT/window.log"
       grep -qx "$f exit 0" "$OUT/devcheck-lcp-$f.log" || lcp_bad+=" $f exited non-zero;"
       grep -q '^FAIL' "$OUT/devcheck-lcp-$f.log" && lcp_bad+=" $f printed FAIL;"
@@ -1974,8 +1986,11 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" bal "* ]]; then
     log "balanced gemv device check on card 0 with $TL ($TC), up to $LC tokens${BAL_ROUTES:+, routes $BAL_ROUTES}"
     ( export HIP_VISIBLE_DEVICES=0
       unset RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE
-      timeout 1800 "$TC" "$TL" bal "$LC" ${BAL_ROUTES:-} >"$OUT/devcheck-bal.log" 2>&1
-      echo "bal exit $?" >>"$OUT/devcheck-bal.log" )
+      key=$(dc_key "$TC" "$TL" ${BAL_ROUTES:-} -- bal "$LC" ${BAL_ROUTES:-})
+      if ! dc_reuse "$OUT/devcheck-bal.log" "$key"; then
+        timeout 1800 "$TC" "$TL" bal "$LC" ${BAL_ROUTES:-} >"$OUT/devcheck-bal.log" 2>&1
+        echo "bal exit $?" >>"$OUT/devcheck-bal.log"; printf '%s' "$key" > "$OUT/devcheck-bal.log.key"
+      fi )
     grep -E '^(PASS|FAIL)|exit|^bal: ' "$OUT/devcheck-bal.log" | tail -6 | tee -a "$OUT/window.log"
     if grep -qx "bal exit 0" "$OUT/devcheck-bal.log" && grep -q '^PASS: bal: ' "$OUT/devcheck-bal.log" &&
        BAL_MAX_M=$(bal_receipt_bound "$OUT/devcheck-bal.log" "$LC") &&
@@ -3026,6 +3041,24 @@ fi
 
 HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
 CANCEL=${CANCEL_FILE:-/home/as/ds41-claude-build/work/cancel_window}
+
+# Device-check receipts reused within one build (DEVCHECK_REUSE_DIR: an earlier window's output dir). A check's log is
+# copied instead of rerun only when that window stored the same key beside it: the SHA-256 of the check binary, the
+# library and any input file, and the check's arguments. Any other case runs the check, and stores its key.
+dc_key() {   # check binary, library, input files..., -- args...
+  local k="" f
+  while (( $# )) && [[ $1 != -- ]]; do k+="$(sha256sum "$1" 2>/dev/null | cut -c1-64) "; shift; done
+  [[ ${1:-} == -- ]] && shift
+  printf '%s| %s' "$k" "$*"
+}
+dc_reuse() {   # log file, key
+  local f=$1 key=$2 src
+  [[ -n "${DEVCHECK_REUSE_DIR:-}" ]] || return 1
+  src="$DEVCHECK_REUSE_DIR/$(basename "$f")"
+  [[ -f "$src" && -f "$src.key" && "$(cat "$src.key")" == "$key" ]] || return 1
+  cp "$src" "$f" && printf '%s' "$key" > "$f.key" &&
+    log "device check $(basename "$f"): reused from $DEVCHECK_REUSE_DIR (same check binary, library, inputs and arguments)"
+}
 
 # A chain trace's file base: chain-<arm>, or chain-<sha1 of the arm, 16 hex> when chain-<arm>.stamps.csv would pass the
 # file system's 255-byte name limit (the engine drops a trace it cannot open); the long form is noted in chain-names.txt.

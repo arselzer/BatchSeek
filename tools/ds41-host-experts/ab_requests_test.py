@@ -269,6 +269,35 @@ class HarnessTurns(unittest.TestCase):
             srv.server_close()
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_thinking_frames_the_official_system_line_and_ends_with_think(self):
+        srv, url = serve(Model())
+        d = tempfile.mkdtemp(prefix="abreq-think-")
+        try:
+            reqs = [{"name": "th-1", "family": "th",
+                     "request": {"max_tokens": 4, "temperature": 0, "stream": False, "thinking": True,
+                                 "chat_turns": [{"user": "a question"}]}},
+                    {"name": "nt-1", "family": "nt",
+                     "request": {"max_tokens": 4, "temperature": 0, "stream": False,
+                                 "chat_turns": [{"user": "a question"}]}}]
+            receipt = os.path.join(d, "receipt.json")
+            with open(receipt, "w") as f:
+                json.dump({"benchmark_requests": reqs}, f)
+            ab_requests.run(receipt, url, 99, os.path.join(d, "out.json"))
+            with open(os.path.join(d, "out.json")) as f:
+                rows = {r["name"]: r for r in json.load(f)["requests"]}
+            effort = ab_requests.tokenize(url, ab_requests.THINKING_SYSTEM)
+            q = ab_requests.tokenize(url, "a question")
+            self.assertIsNone(rows["th-1"]["error"])
+            self.assertEqual(rows["th-1"]["prompt_ids"],
+                             [ab_requests.BOS, ab_requests.SYSTEM] + effort + [ab_requests.USER] + q +
+                             [ab_requests.ASSISTANT, ab_requests.THINK])
+            self.assertEqual(rows["nt-1"]["prompt_ids"],
+                             [ab_requests.BOS, ab_requests.USER] + q + [ab_requests.ASSISTANT, ab_requests.END_THINK])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_a_sessions_cached_share_is_of_every_prompt_token_it_sent(self):
         """The server's prompt_n is the prompt less what the cache supplied: two turns of 1,000 and
         2,200 tokens, the second resuming at 1,000, sent 3,200 prompt tokens of which 1,000 (31.2%)
