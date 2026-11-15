@@ -7,6 +7,7 @@ trap 'rm -rf "$T"' EXIT
 fail=0
 ok() { echo "ok   $*"; }
 bad() { echo "FAIL $*"; fail=1; }
+eval "$(sed -n '/^ARM_PRESET_B2=/p;/^ARM_PRESET_B4=/p;/^arm_full() {/,/^}/p' "$W")"
 for fn in serving_cards serving_cards_ok ar_rows_parse ag_rows_parse ar_ag_shared_arm ar_ag_shared_receipt_ok ar_ag_shared_check ar_ag_shared_gate ram_budget_gate; do
   eval "$(sed -n "/^$fn() {/,/^}/p" "$W")"
   declare -F "$fn" >/dev/null || { bad "missing $fn"; exit 1; }

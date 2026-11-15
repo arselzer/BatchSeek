@@ -18,6 +18,7 @@
 # Exit 0 when every check passes.
 set -u
 W=${1:-$(dirname "$0")/ab_window.sh}
+eval "$(sed -n '/^ARM_PRESET_B2=/p;/^ARM_PRESET_B4=/p;/^arm_full() {/,/^}/p' "$W")"
 T=$(mktemp -d /tmp/ab-longctx-test-XXXXXX)
 trap 'rm -rf "$T"' EXIT
 fail=0
