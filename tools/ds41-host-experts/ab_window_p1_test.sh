@@ -41,6 +41,11 @@
 #      with the part, none without it); in the arm loop the fast arm with Qt (and with Qsp-Qt) is launched with
 #      the switch at 1 and every other switch as the fast arm, every arm without the part states it 0, Qt without
 #      P1 is skipped, and without a passing p1tiled receipt every Qt arm is refused while the fast arm still runs.
+#   9. Ee (the next Engram layer's rows read ahead, ..._ENGRAM_EARLY): ee_gate on synthetic logs (an Ee arm is
+#      measured only with rank 0's line, and at exit only when every rank's line counts its read-aheads, none
+#      refused and some started; an arm without the part only without either line); in the arm loop the fast
+#      arm with Ee (and with Qd64-Qy60-Ee) is launched with the switch and every other switch as without it,
+#      and arms without the part do not set it.
 # Exit 0 when every check passes.
 set -u
 W=${1:-$(dirname "$0")/ab_window.sh}
@@ -57,6 +62,8 @@ eval "$(sed -n '/^qd_gate() {/,/^}/p' "$W")"
 declare -F qd_gate >/dev/null || { echo "FAIL no qd_gate in $W"; exit 1; }
 eval "$(sed -n '/^qy_gate() {/,/^}/p' "$W")"
 declare -F qy_gate >/dev/null || { echo "FAIL no qy_gate in $W"; exit 1; }
+eval "$(sed -n '/^ee_gate() {/,/^}/p' "$W")"
+declare -F ee_gate >/dev/null || { echo "FAIL no ee_gate in $W"; exit 1; }
 OUT=$T/logs
 mkdir -p "$OUT"
 log() { echo "LOG: $*" >> "$OUT/window.log"; }
@@ -378,6 +385,9 @@ CTP=$FAST-Ctp
 CTP2=$FAST-Qd64-Ct16-Ctp2
 CTPNOP=$REF-Ctp
 CTP0=$FAST-Ctp0
+EE=$FAST-Ee
+EEQY=$FAST-Qd64-Qy60-Ee
+QY60=$FAST-Qd64-Qy60
 ARMS="$REF $NEW $NEWG $SHORTM $Q17 $OVERL $GNOL $LNOP $BIG $BIGG $BIGM $ENOP $COLD4K $PC4K $NOINT4K $LOWINT4K $NOPC4K $OVER4K"
 ARMS="$ARMS $FAST $SG8 $SGA8 $SG15 $SG16 $N2SG7 $N2SG8 $N8SG2 $SG0"
 ARMS="$ARMS $QD200 $QD4096 $QD16 $QDTB $QDNOP"
@@ -390,13 +400,14 @@ QZ=$FAST-Qz
 QTQZ=$FAST-Qsp-Qt-Qz
 QZNOP=$REF-Qz
 ARMS="$ARMS $QT $QTQSP $QTNOP $QZ $QTQZ $QZNOP"
+ARMS="$ARMS $EE $EEQY $QY60"
 run_loop() {   # actual balance-oracle bound; every model action remains stubbed
  (
   set +u
   log() { echo "LOG: $*"; }
   power_set() { :; }; power_restore() { :; }
   vpack_gate() { return 0; }
-  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; echo "  ARM_QD: ${ARM_QD:-}"; echo "  ARM_QY: ${ARM_QY:-}"; echo "  ARM_QYF: ${ARM_QYF:-}"; echo "  ARM_QT: ${ARM_QT:-}"; }
+  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; echo "  ARM_QD: ${ARM_QD:-}"; echo "  ARM_QY: ${ARM_QY:-}"; echo "  ARM_QYF: ${ARM_QYF:-}"; echo "  ARM_QT: ${ARM_QT:-}"; echo "  ARM_EE: ${ARM_EE:-}"; }
   HX_THREADS=16 SILU=/dev/null RHOME=$H RADIANCE_HOME_DIR2=$H MIRROR=$T
   PROMPTS=$T/prompts.json
   unset RADIANCE_TUNE
@@ -655,6 +666,50 @@ noz_out=$(run_loop 4096)
 if grep -qxF "ARM $QZ" <<< "$noz_out"; then bad "a Qz arm launched without the oracle's tail-once waves"
 elif grep -qF "arm $QZ: Qz needs the p1 oracle's tail-once waves" <<< "$noz_out"; then ok 'Qz refused without the tail-once oracle line'
 else bad "no tail-once refusal for arm $QZ: $(grep -m1 "arm $QZ: " <<< "$noz_out")"; fi
+
+# ---- 8. Ee: ee_gate on synthetic logs, then the arm loop.
+ee_line='radiance: deepseek41: Engram rows early (RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY=1): after each Engram layer'"'"'s host gather the next one'"'"'s table rows are asked for on a helper thread, each rank 1/4 of the step'"'"'s rows; the gathers themselves are unchanged'
+ee_stats() { echo "radiance: deepseek41: rank $1: Engram rows early: $2 read-aheads started, 3 with nothing to ask for, 0 past the pass's last layer, $3 refused"; }
+mk ee "$lc_line" "$ee_line"
+mk eeoff "$lc_line"
+{ cat "$OUT/ee.server.log"; for r in 0 1 2 3; do ee_stats $r 120 0; done; } > "$OUT/eeexit.server.log"
+{ cat "$OUT/ee.server.log"; for r in 0 1 2 3; do ee_stats $r 0 0; done; } > "$OUT/eeidle.server.log"
+{ cat "$OUT/ee.server.log"; for r in 0 1 2 3; do ee_stats $r 120 $((r == 2)); done; } > "$OUT/eeref.server.log"
+{ cat "$OUT/ee.server.log"; ee_stats 0 120 0; echo "radiance: deepseek41: rank 1: Engram rows early: lots"; } > "$OUT/eeodd.server.log"
+{ cat "$OUT/eeoff.server.log"; ee_stats 0 5 0; } > "$OUT/eestray.server.log"
+eeexpect() {   # want(0/1) what log EE stage
+  local want=$1 what=$2 rc
+  ee_gate "$OUT/$3.server.log" "$4" "$5" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$what"; else bad "$what: exit $rc, want $want"; fi
+}
+eeexpect 0 "Ee, its line"                                   ee      1  start
+eeexpect 1 "Ee, no line"                                    eeoff   1  start
+eeexpect 1 "no Ee part on a server that reads early"        ee      "" start
+eeexpect 0 "no Ee part, no line"                            eeoff   "" start
+eeexpect 0 "Ee at exit: every rank started read-aheads"     eeexit  1  exit
+eeexpect 1 "Ee at exit: none started (never acted)"         eeidle  1  exit
+eeexpect 1 "Ee at exit: a refused read-ahead"               eeref   1  exit
+eeexpect 1 "Ee at exit: a rank's line without its counts"   eeodd   1  exit
+eeexpect 1 "Ee at exit: no rank line"                       ee      1  exit
+eeexpect 1 "no Ee part at exit, but a rank line"            eestray "" exit
+eeexpect 0 "no Ee part at exit, no line"                    eeoff   "" exit
+for x in "$EE $FAST" "$EEQY $QY60"; do
+  read -r a b <<< "$x"
+  sec=$(section "$a"); base=$(section "$b")
+  if [[ -z "$sec" ]]; then bad "the Ee arm $a was not launched: $(grep -m3 "arm $a" "$T/loop.txt")"; continue; fi
+  if [[ -z "$base" ]]; then bad "the arm $b was not launched: $(grep -m3 "arm $b" "$T/loop.txt")"; continue; fi
+  has "Ee ($a)" "$sec" RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY 1
+  grep -qx "  ARM_EE: 1" <<< "$sec" && ok "Ee: the arm is gated on its lines (ARM_EE=1)" || bad "Ee: ARM_EE is '$(grep '  ARM_EE:' <<< "$sec")'"
+  # Every other line the arm states, as the arm without Ee.
+  if diff <(grep -v -e 'ENGRAM_EARLY' -e '^  ARM_EE:' -e "^ARM " -e 'CHAIN_TRACE_OUT' <<< "$sec") \
+          <(grep -v -e 'ENGRAM_EARLY' -e '^  ARM_EE:' -e "^ARM " -e 'CHAIN_TRACE_OUT' <<< "$base") >/dev/null; then
+    ok "Ee ($a): every other switch and argument as $b"
+  else bad "Ee ($a): differs from $b beyond the switch: $(diff <(grep -v ENGRAM_EARLY <<< "$sec") <(grep -v ENGRAM_EARLY <<< "$base") | head -4 | tr '\n' ' ')"; fi
+done
+for a in "$REF" "$FAST" "$QD200" "$QY60" "$QY25"; do
+  has "no Ee part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY ""
+  grep -qx "  ARM_EE: " <<< "$(section "$a")" && ok "no Ee part ($a): ARM_EE empty" || bad "no Ee part ($a): ARM_EE is '$(grep '  ARM_EE:' <<< "$(section "$a")")'"
+done
 
 short_out=$(run_loop 2048)
 for a in "$COLD4K" "$PC4K"; do

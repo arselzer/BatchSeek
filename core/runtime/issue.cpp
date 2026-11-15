@@ -990,6 +990,9 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
      * (runtime/rowprefetch.h). After the join, since the ids may be a device op's output. Timed
      * with the op when profiling: it is the op's own read. */
     RowPrefetch rowpf{};
+    /* An early read-ahead (rad_row_read_ahead) stops before any host gather asks for its own rows:
+     * one helper hinting at a time, since the asking does not scale across threads. */
+    if (dom == RAD_DOMAIN_HOST && p.row_gather) row_early_done();
     if (dom == RAD_DOMAIN_HOST && p.row_gather && row_prefetch_on_ &&
         !(ip.row && ip.row->fetches_rows)) {
         row_prefetch_plan(ip.args, opd, n_opd, t, &rowpf);
@@ -1478,6 +1481,80 @@ void Ctx::row_prefetch_done() {
     rowpf_pages_ += rowpf_worker_->finish();
 }
 
+/* rad_row_read_ahead (abi/rad_runtime.h): the read-ahead a host row gather `h` would ask for at
+ * its issue, over these operands, started now on rowpf_early_ and returned from at once. Nothing
+ * is launched, joined or written: the operands are resolved as the issue would resolve them (host
+ * buffers and whole weights; anything else is left out, and an ids operand that is not a host
+ * buffer reads nothing), and the hints are the issue's own, so the gather's bytes cannot change.
+ * 1 started, 0 nothing to ask for (off, recording, not on the host, no mapped table, a kernel that
+ * fetches its rows itself), < 0 a malformed call. */
+int Ctx::row_read_ahead(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
+    if (!program_ || step_status_ < 0) return 0;
+    if (h == RAD_NULL_HANDLE || (size_t)h >= plans_.size() || !opd || n_opd < 1 ||
+        n_opd > MAX_OPERANDS)
+        return RAD_E_INVAL;
+    const OpPlan& p = plans_[h];
+    if (!p.row_gather) return RAD_E_INVAL;
+    /* A recorded pass replays its host ops, never this call: leave the tape alone. */
+    if (!row_prefetch_on_ || rec_) return 0;
+    if (n == RAD_N_BATCH) n = batch_ ? batch_->n_tok : 0;
+    if (n <= 0) return 0;
+    const int dom = (int)op_domain_[h].load(std::memory_order_relaxed);
+    if (dom != RAD_DOMAIN_HOST) return 0;
+    const int64_t* hi = band_table_.data() + p.band_off;
+    int b = 0;
+    while (b < p.n_bands && n > hi[b]) ++b;
+    if (b == p.n_bands) return RAD_E_SHAPE;
+    const IssuePlan& ip = issue_table_[(size_t)p.plan_off + (size_t)b * RAD_N_DOMAINS + (size_t)dom];
+    if (!ip.launch || (ip.row && ip.row->fetches_rows)) return 0;
+    RadTensor t[MAX_OPERANDS];
+    for (int i = 0; i < n_opd; ++i) {
+        const RadOperand& o = opd[i];
+        RadTensor& tt = t[i];
+        tt = RadTensor{};
+        if (o.kind == RAD_OPK_BUF) {
+            const uint32_t bh = o.handle;
+            if (bh == RAD_NULL_HANDLE || (size_t)bh >= buf_tmpl_.size()) return RAD_E_INVAL;
+            if (!buf_host_[bh]) continue;   /* not readable here; an ids operand then reads nothing */
+            tt = buf_tmpl_[bh];
+            if (o.offset) {
+                int64_t d;
+                if (!byte_delta(buf_bits_[bh], o.offset, &d)) return RAD_E_ALIGN;
+                tt.data = static_cast<char*>(tt.data) + d;
+            }
+            if (o.rows > 0) tt.shape[0] = o.rows;
+            narrow_cols(o, &tt);
+            if (!operand_fits(tt, o.offset, buf_tmpl_[bh])) return RAD_E_SHAPE;
+        } else if (o.kind == RAD_OPK_WEIGHT) {
+            const uint32_t wh = o.handle;
+            if (wh == RAD_NULL_HANDLE || (size_t)wh >= w_tmpl_.size()) return RAD_E_INVAL;
+            /* The template's pointer: row_prefetch_plan takes only whole weights on the mapped
+             * tier, which never move (a resident copy would be read through resolve_weight). */
+            if (o.offset || o.rows > 0 || o.cols > 0) continue;
+            tt = w_tmpl_[wh];
+        }
+    }
+    RowPrefetch rp{};
+    row_prefetch_plan(ip.args, opd, n_opd, t, &rp);
+    if (!rp.n || !t[0].data) return 0;
+    const int64_t have = rad_tensor_numel(&t[0]);
+    const int64_t m = have > 0 && have < n ? have : n;
+    if (m <= 0) return 0;
+    row_early_done();
+    if (!rowpf_early_) rowpf_early_ = std::make_unique<RowPrefetchWorker>();
+    rowpf_early_->start(rp, t[0], m, t);
+    rowpf_early_live_ = true;
+    ++rowpf_early_calls_;
+    return 1;
+}
+
+/* Stop the early read-ahead at its next run and wait until it no longer reads its ids. */
+void Ctx::row_early_done() {
+    if (!rowpf_early_live_) return;
+    rowpf_early_live_ = false;
+    rowpf_early_pages_ += rowpf_early_->finish();
+}
+
 /* Whether any operand is untracked by the host arena, so the join must drain the stream. */
 bool Ctx::host_join_drains(const RadOperand* opd, int n_opd) const {
     for (int i = 0; i < n_opd; ++i) {
@@ -1507,6 +1584,7 @@ int Ctx::host_join_wait(bool drain) {
 
 int Ctx::abort_step(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n, int status) {
     row_prefetch_done();   /* no helper outlives the op that started it */
+    row_early_done();
     const OpInfo&   o     = *plans_[h].info;
     const char*     kname = ip.row && ip.row->info ? ip.row->info->name : "<unnamed>";
     const char*     pname = ip.row ? ip.row->plugin.c_str() : "<unknown plugin>";
@@ -1585,6 +1663,10 @@ extern "C" {
 int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd, int64_t n) {
     if (!c) rad::fatal("rad_issue: null RadCtx");
     return static_cast<rad::Ctx*>(c)->issue(op, opd, n_opd, n);
+}
+
+int rad_row_read_ahead(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd, int64_t n) {
+    return c ? static_cast<rad::Ctx*>(c)->row_read_ahead(op, opd, n_opd, n) : RAD_E_INVAL;
 }
 
 int rad_step_fail(RadCtx* c, const char* what) {

@@ -573,6 +573,13 @@ lcp_check() {   # name
     return 1
   fi
   [[ -n "${ARM_QY:-}" ]] && grep -m1 -E 'ds41 p1: hybrid decode on' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # Ee: rank 0's Engram-early line at startup, in an Ee arm only (ee_gate).
+  local ee_why
+  if declare -F ee_gate >/dev/null && ! ee_why=$(ee_gate "$OUT/$name.server.log" "${ARM_EE:-}" start); then
+    log "arm $name: $ee_why; not measured"
+    return 1
+  fi
+  [[ -n "${ARM_EE:-}" ]] && grep -m1 -E 'deepseek41: Engram rows early' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # QlK: rank 0's "ds41 p1: lent ring: K of the ring's" line at startup, in a Ql arm only.
   local lend_lines
   lend_lines=$(grep -c 'ds41 p1: lent ring: ' "$OUT/$name.server.log")
@@ -938,6 +945,37 @@ qd_gate() {   # log, Qd threshold, chunk, start/exit
   done < <(grep -E 'ds41 p1 stats, rank [0-9]+: ' "$f")
   (( ranks > 0 )) || { echo "Qd$qd, but no 'ds41 p1 stats, rank' line at exit"; return 1; }
   (( armed > 0 )) || { echo "Qd$qd, but no rank armed a decode pass (every decode step below $qd rows?): the switch never acted"; return 1; }
+  return 0
+}
+
+# Ee (RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY): at start rank 0's "deepseek41: Engram rows early
+# (RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY=1)" line in an Ee arm, none in any other; at exit every rank's
+# "rank R: Engram rows early: N read-aheads started, ..." line, none refused, and some rank started one (the
+# switch acted). Arguments: the log, the arm's flag (empty: no Ee part), start/exit. 0 when the arm may be
+# measured; else 1, the reason on stdout.
+ee_gate() {   # log, Ee (non-empty: on), start/exit
+  local f=$1 ee=$2 stage=${3:-start} n started=0 refused=0 ranks=0 line a r
+  n=$(grep -c 'deepseek41: Engram rows early (RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY=1)' "$f")
+  if [[ -z "$ee" ]]; then
+    if (( n > 0 )) || grep -q 'deepseek41: rank [0-9]*: Engram rows early: ' "$f"; then
+      echo "no Ee part, but the server reads Engram rows early (the knob set for the window?)"; return 1
+    fi
+    return 0
+  fi
+  if (( n == 0 )); then
+    echo "Ee, but the server log has no 'Engram rows early (RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY=1)' line ($(grep -m1 -E 'ENGRAM_EARLY|Engram rows early' "$f"))"; return 1
+  fi
+  [[ "$stage" == exit ]] || return 0
+  while IFS= read -r line; do
+    ranks=$((ranks + 1))
+    a=$(sed -nE 's/.*Engram rows early: ([0-9]+) read-aheads started, .*/\1/p' <<< "$line")
+    r=$(sed -nE 's/.*, ([0-9]+) refused$/\1/p' <<< "$line")
+    if [[ -z "$a" || -z "$r" ]]; then echo "Ee, but a rank's Engram-early line without its counts ($line)"; return 1; fi
+    started=$((started + a)); refused=$((refused + r))
+  done < <(grep -E 'deepseek41: rank [0-9]+: Engram rows early: ' "$f")
+  (( ranks > 0 )) || { echo "Ee, but no 'rank R: Engram rows early:' line at exit"; return 1; }
+  (( refused == 0 )) || { echo "Ee, but $refused read-ahead(s) refused (a malformed call)"; return 1; }
+  (( started > 0 )) || { echo "Ee, but no rank started a read-ahead: the switch never acted"; return 1; }
   return 0
 }
 
@@ -1728,6 +1766,13 @@ EOF2
     log "arm $name: $qd_exit_why; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
+  # Ee at exit: every rank's read-ahead line, some started (ee_gate).
+  local ee_exit_why
+  if declare -F ee_gate >/dev/null && ! ee_exit_why=$(ee_gate "$OUT/$name.server.log" "${ARM_EE:-}" exit); then
+    log "arm $name: $ee_exit_why; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+  fi
+  [[ -n "${ARM_EE:-}" ]] && grep -E 'deepseek41: rank [0-9]+: Engram rows early: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # QyP / QyfP at exit: some rank split a decode pass (qy_gate).
   local qy_exit_why
   if declare -F qy_gate >/dev/null && ! qy_exit_why=$(qy_gate "$OUT/$name.server.log" "${ARM_QY:-}" "${ARM_QYF:-}" exit); then
@@ -3290,7 +3335,10 @@ for a in $ARMS; do
 # reply's end-of-generation token, which the reply (and the next request) otherwise waits out,
 # ~0.26 s when the cache lacks its experts (RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP; exact: the
 # passes that run are the ones that ran; the shutdown's "post-stop passes" line counts both).
-# the RAM cache's profile-hot units get N second chances before eviction; Ei a routed layer's card
+# the RAM cache's profile-hot units get N second chances before eviction; Ee behind an Engram layer's host
+# gather the next Engram layer's table rows are asked for on a helper thread, each rank its quarter, so the
+# drive reads them beside the layers between (RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY; exact: the gathers
+# and their bytes are unchanged, the call only advises pages; ee_gate checks its lines); Ei a routed layer's card
 # ops (gate_up, swiglu, down, shared expert) issued ahead of its counts sync, the CPU's share chosen
 # at its gather (RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE; needs all, M16 and B1); Fl the counts and
 # the CPU's rows fetched in one ranged copy instead of four (RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST;
@@ -3395,7 +3443,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$(arm_full "$a")"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" sg="" pcn=""
-  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qsp="" qt="" qz="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qsp="" qt="" qz="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr="" ee=""
   ctp=""   # Ctp / CtpN: the prefill chain trace (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL)
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
@@ -3437,6 +3485,7 @@ for a in $ARMS; do
       H)       ARM_HOME=${RADIANCE_HOME_DIR2:?H needs RADIANCE_HOME_DIR2} ;;
       H3)      ARM_HOME=${RADIANCE_HOME_DIR3:?H3 needs RADIANCE_HOME_DIR3} ;;
       Es)      env+=(RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT=1) ;;   # engram_kv rows split over the ranks
+      Ee)      ee=1; env+=(RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY=1) ;;   # the next Engram layer's rows read ahead (ee_gate)
       Pa)      env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1) ;;   # next layer's attention weights into the on-die cache
       Pm[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MIB=${p#Pm}) ;;   # on-die reads: a budget, use order
       Pl?*)    env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SET=${p#Pl}) ;;   # on-die reads: these, in order
@@ -4379,7 +4428,7 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
   if [[ -n "$ARM_TIMEOUT" ]] && ! [[ $ARM_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]]; then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QSP=$qsp ARM_QT=$qt ARM_QZ=$qz ARM_LH=$lh
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QSP=$qsp ARM_QT=$qt ARM_QZ=$qz ARM_LH=$lh ARM_EE=$ee
   ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr ARM_SL=$sl ARM_CTX=$arm_ctx ARM_CR=$cr
   if [[ -n "$cr" ]]; then
     crk=${ARM_CONC:-${AB_CONCURRENCY:-1}}

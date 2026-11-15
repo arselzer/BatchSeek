@@ -192,6 +192,10 @@ struct RadCtx {
     std::vector<StageRec> stages;
     /* kv_stage_next: after which issue index the next layer's copy was handed over. */
     std::vector<StageRec> stages_next;
+    /* rad_row_read_ahead calls, each with the issue index it came after (RecIssue::lane unused);
+     * `read_ahead_rc` is what the fake returns. */
+    std::vector<std::pair<size_t, RecIssue>> read_aheads;
+    int                   read_ahead_rc = 1;
 };
 
 /* -------------------------------------------------------------------- the declare-side ABI */
@@ -521,6 +525,15 @@ extern "C" int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd,
     r.lane = c->lane;
     c->issues.push_back(r);
     return RAD_OK;
+}
+/* A read-ahead of a later gather's rows, recorded where it was asked; never an issue. */
+extern "C" int rad_row_read_ahead(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd, int64_t n) {
+    RecIssue r;
+    r.op = op;
+    r.n  = n;
+    for (int i = 0; i < n_opd; ++i) r.opd.push_back(opd[i]);
+    c->read_aheads.push_back({ c->issues.size(), r });
+    return c->read_ahead_rc;
 }
 /* The second lane, recorded: each issue's lane, and each join's position among the issues. */
 extern "C" int rad_lane(RadCtx* c, int lane) {
