@@ -345,6 +345,43 @@ inline int wmma_state() {
     return s;
 }
 
+/* ---- the dense GEMMs and the sparse attention on the fast forms ---------------------------------------
+ *
+ * kDenseTiledEnv: "1" puts gemm_nt_bf16f8 (the FP8-stored dense linears) above 64 rows on libr4d's LDS-tiled form
+ * (r4d_gemm_bf16f8_nt_m64.hip, r4d_gemm_bf16f8_nt_tiled_kernel). EXACT by construction: the same WMMA operands,
+ * chains and slice sums as gemm_bf16f8_nt_m64, so every output is that kernel's bits at every height (as
+ * gemm_bf16_nt_tiled is gemm_bf16_nt_m64's). The window measures a Qg arm only on the libr4d.so its device check
+ * (kDenseTiledCheckMode, byte equality) passed on.
+ *
+ * kAttnWmmaEnv: "1" puts attn_sparse_sink at every height on libr4d's matrix-core form (r4d_ds41_sparse.hip,
+ * ds41_attn_fast_kernel). NOT EXACT, by design and opt-in only: q.k summed by v_wmma_f32_16x16x16_bf16 (exact
+ * products, another order), then the exact kernel's scale, max, glibc expf and key-order sum p; sum p k on WMMA over
+ * p as three exact bf16 pieces (another order, and no per-product rounding). A row's bits depend only on the row, and
+ * every height takes it, so it is batch-invariant at the kernel and the engine. The window measures a Qx arm only
+ * on the libr4d.so its device check (kAttnWmmaCheckMode) passed on, and never reads its replies as an exactness
+ * result.
+ *
+ * Both: 1 on, unset / empty / 0 off, anything else refused by the core; only beside LCP (they act on the tall
+ * passes LCP admits; the core checks every resolved row names the form, kDenseTiledMark / kAttnWmmaMark, and refuses
+ * the switch otherwise); each rank says kLogDenseTiled / kLogAttnWmma at startup. libr4d's own constants
+ * (r4d_ds41_tall.h) must agree; ds41_mxfp4_device_check static_asserts that. */
+constexpr const char* kDenseTiledEnv       = "RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED";
+constexpr const char* kDenseTiledMark      = "the tiled bf16f8 GEMM above 64 rows (exact: the m64 kernel's bits)";
+constexpr const char* kLogDenseTiled       = "ds41 dense: tiled bf16f8 GEMM on (exact), rank";
+constexpr const char* kDenseTiledCheckMode = "dtiled";
+constexpr const char* kAttnWmmaEnv         = "RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA";
+constexpr const char* kAttnWmmaMark        = "the WMMA sparse attention at every height (inexact: f32 summation order)";
+constexpr const char* kLogAttnWmma         = "ds41 attn: WMMA sparse attention on (inexact), rank";
+constexpr const char* kAttnWmmaCheckMode   = "attnwm";
+inline int dense_tiled_state() {
+    static const int s = env_state(std::getenv(kDenseTiledEnv));
+    return s;
+}
+inline int attn_wmma_state() {
+    static const int s = env_state(std::getenv(kAttnWmmaEnv));
+    return s;
+}
+
 /* ---- the tail filled once a layer --------------------------------------------------------------
  *
  * kTailOnceEnv: "1" beside kEnv makes the stager's wave relaunches of gate_up and down pass the twin's parameter

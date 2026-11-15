@@ -161,6 +161,10 @@ static_assert(p1_same_str(ds41p1::kTiledEnv, kR4dDs41P1TiledEnv), "the tiled swi
 static_assert(p1_same_str(ds41p1::kTiledMark, kR4dDs41P1TiledMark), "the tiled row's mark");
 static_assert(p1_same_str(ds41p1::kWmmaEnv, kR4dDs41P1WmmaEnv), "the WMMA switch's name");
 static_assert(p1_same_str(ds41p1::kWmmaMark, kR4dDs41P1WmmaMark), "the WMMA row's mark");
+static_assert(p1_same_str(ds41p1::kDenseTiledEnv, kR4dDs41DenseTiledEnv), "the dense tiled switch's name");
+static_assert(p1_same_str(ds41p1::kDenseTiledMark, kR4dDs41DenseTiledMark), "the dense tiled row's mark");
+static_assert(p1_same_str(ds41p1::kAttnWmmaEnv, kR4dDs41AttnWmmaEnv), "the attention switch's name");
+static_assert(p1_same_str(ds41p1::kAttnWmmaMark, kR4dDs41AttnWmmaMark), "the attention row's mark");
 
 #define HC(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::fprintf(stderr, "%s: %s\n", #x, hipGetErrorString(e_)); std::exit(2); } } while (0)
 
@@ -4764,8 +4768,340 @@ int aux_swap(const Lib& lib, int rounds) {
     return 1;
 }
 
+/* ================================================================== attnwm (the fast sparse attention)
+ *
+ * RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA's form (r4d_ds41_sparse.hip, ds41_attn_fast_kernel; inexact by design: only the
+ * q.k and sum p k sums' order and the p k products' roundings move) against the exact kernels (`form` 1, what LCP
+ * serves at every height), both through attn_sparse_sink's own entry, over sparse_fix's chunks (window keys, the
+ * compressed selections with misses) at 16 and 32 heads:
+ *   - every output's NaN / inf class equal to the exact kernel's;
+ *   - the bf16 ulp distance histogram over all outputs;
+ *   - against an f64 reference (sampled rows, and every row with an output more than 4 ulp from the exact kernel's):
+ *     |out - ref| <= 2^-8 |ref| + 2^-12 sum_k p_k |k_d| / den for both forms (the second term is the f32 sums'
+ *     scale: cancellation can move a small output by more ulps than its size suggests);
+ *   - batch invariance: the rows launched alone, 16 at a time and as suffixes give the same bytes as in the chunk,
+ *     and a rerun gives the same bytes;
+ *   - edge chunks: a short context (missing window keys and selections), large scores (p down to underflow), a
+ *     large sink, NaN / inf in q and in a key;
+ *   - with the switch set, the engine's form (`form` 0) is the fast one at 1 row and at the chunk;
+ *   - us a launch, exact against fast, at 16 heads. */
+struct AttnDev {
+    const SparseFix& f;
+    Dev q, wc, wbt, cc, cbt, sel, pos, sink, wu, cu;
+    explicit AttnDev(const SparseFix& x)
+        : f(x), q(x.q.size() * 2), wc(x.wc.size() * 2), wbt(x.wbt.size() * 4), cc(x.cc.size() * 2),
+          cbt(x.cbt.size() * 4), sel(x.sel.size() * 4), pos(x.pos.size() * 4), sink(x.sink.size() * 4), wu(4), cu(8) {
+        q.put(x.q.data()); wc.put(x.wc.data()); wbt.put(x.wbt.data()); cc.put(x.cc.data()); cbt.put(x.cbt.data());
+        sel.put(x.sel.data()); pos.put(x.pos.data()); sink.put(x.sink.data());
+    }
+};
+/* Rows [r0, r1) as one launch in `form` into out's rows r0.. (device, bf16 rows of H * D). */
+int attn_form(const Lib& L, hipStream_t s, AttnDev& d, int r0, int r1, int form, void* out) {
+    const SparseFix& f = d.f;
+    const int n = r1 - r0;
+    const int32_t cu[2] = { 0, n }, used = f.pos[(size_t)r1 - 1] + 1;
+    HC(hipMemcpyAsync(d.wu.p, &used, 4, hipMemcpyHostToDevice, s));
+    HC(hipMemcpyAsync(d.cu.p, cu, 8, hipMemcpyHostToDevice, s));
+    char* qp = (char*)d.q.p + (size_t)r0 * f.H * f.D * 2;
+    char* op = (char*)out + (size_t)r0 * f.H * f.D * 2;
+    RadTensor t[11] = { tensor(qp, RAD_BF16, { n, f.H * f.D }),
+                        tensor(d.wc.p, RAD_BF16, { (int64_t)f.nwbt, 1, f.bs, f.D }),
+                        tensor(d.wbt.p, RAD_I32, { 1, f.nwbt }), tensor(d.wu.p, RAD_I32, { 1 }),
+                        tensor(d.cc.p, RAD_BF16, { (int64_t)f.ncbt, 1, f.cbs, f.D / f.ratio }),
+                        tensor(d.cbt.p, RAD_I32, { 1, f.ncbt }),
+                        tensor((char*)d.sel.p + (size_t)r0 * f.topk * 4, RAD_I32, { n, f.topk }),
+                        tensor((char*)d.pos.p + (size_t)r0 * 4, RAD_I32, { n }), tensor(d.cu.p, RAD_I32, { 2 }),
+                        tensor(d.sink.p, RAD_F32, { f.H }), tensor(op, RAD_BF16, { n, f.H * f.D }) };
+    std::vector<RadParam> p = { pi("M", n), pi("heads", f.H), pi("dim", f.D), pi("window", f.win), pi("ratio", f.ratio),
+                                pi("topk", f.topk), pf("scale", 0.04419417382415922), ps("dtype", "bf16") };
+    if (form) p.push_back(pi("form", form));
+    RadArgs a{};
+    a.t = t; a.n_t = 11; a.p = p.data(); a.n_p = (int)p.size();
+    const int rc = L.attn(&a, (RadStream)s);
+    return rc < 0 ? rc : 0;
+}
+/* Row m's f64 reference and bound term at head h (the keys as the launch of the whole chunk sees them). */
+void attn_ref(const SparseFix& f, int m, int h, std::vector<double>& ref, std::vector<double>& mag) {
+    const int D = f.D, p = f.pos[(size_t)m];
+    std::vector<const uint16_t*> keys;
+    for (int k = 0; k < f.win; ++k) {
+        const long j = (long)p - f.win + 1 + k;
+        if (j < 0 || j / f.bs >= f.nwbt) continue;
+        const int blk = f.wbt[(size_t)(j / f.bs)];
+        keys.push_back(&f.wc[((size_t)blk * f.bs + (size_t)(j % f.bs)) * D]);
+    }
+    for (int i = 0; i < f.topk; ++i) {
+        const long c = f.sel[(size_t)m * f.topk + i];
+        if (c < 0 || (c * f.ratio) / f.cbs >= f.ncbt) continue;
+        const int blk = f.cbt[(size_t)((c * f.ratio) / f.cbs)];
+        keys.push_back(&f.cc[((size_t)blk * f.cbs + (size_t)((c * f.ratio) % f.cbs)) * (D / f.ratio)]);
+    }
+    const uint16_t* q = &f.q[((size_t)m * f.H + h) * D];
+    std::vector<double> v(keys.size());
+    double mx = -1e30;
+    for (size_t k = 0; k < keys.size(); ++k) {
+        double sum = 0;
+        for (int d = 0; d < D; ++d) sum += (double)bf16_to_f32(q[d]) * (double)bf16_to_f32(keys[k][d]);
+        v[k] = sum * 0.04419417382415922;
+        if (v[k] > mx) mx = v[k];
+    }
+    double den = std::exp((double)f.sink[(size_t)h] - mx);
+    ref.assign((size_t)D, 0.0);
+    mag.assign((size_t)D, 0.0);
+    for (size_t k = 0; k < keys.size(); ++k) {
+        const double pk = std::exp(v[k] - mx);
+        den += pk;
+        for (int d = 0; d < D; ++d) {
+            const double x = (double)bf16_to_f32(keys[k][d]);
+            ref[(size_t)d] += pk * x;
+            mag[(size_t)d] += pk * std::fabs(x);
+        }
+    }
+    for (int d = 0; d < D; ++d) { ref[(size_t)d] /= den; mag[(size_t)d] /= den; }
+}
+int bf16_ord(uint16_t b) { return (b & 0x8000) ? -(int)(b & 0x7fff) : (int)b; }
+bool bf16_nan(uint16_t b) { return (b & 0x7fff) > 0x7f80; }
+bool bf16_inf(uint16_t b) { return (b & 0x7fff) == 0x7f80; }
+
+struct AwStats {
+    long long outs = 0, eq = 0, u1 = 0, u2 = 0, u4 = 0, u16 = 0, ubig = 0, cls = 0, checked = 0, over = 0, over_x = 0;
+    int maxu = 0;
+    double use = 0, use_x = 0;   /* the largest |err| / bound, fast and exact */
+};
+
+/* Fast against exact over one chunk; true if every check passed. `special`: classes compared, the bound skipped for
+ * non-finite outputs (and for rows carrying a NaN / inf input). */
+bool attnwm_chunk(const Lib& L, hipStream_t s, const SparseFix& f, const char* what, AwStats& st, bool invariance,
+                  long long* inv_rows, bool bound = true) {
+    AttnDev d(f);
+    const size_t n = (size_t)f.M * f.H * f.D;
+    Dev ofast(n * 2), oex(n * 2), o2(n * 2);
+    HC(hipMemsetAsync(ofast.p, 0xAA, n * 2, s));
+    HC(hipMemsetAsync(oex.p, 0x55, n * 2, s));
+    if (attn_form(L, s, d, 0, f.M, 2, ofast.p) < 0 || attn_form(L, s, d, 0, f.M, 1, oex.p) < 0) {
+        std::printf("  FAIL %s: a launch was refused\n", what);
+        return false;
+    }
+    HC(hipStreamSynchronize(s));
+    std::vector<uint16_t> hf(n), hx(n);
+    ofast.get(hf.data());
+    oex.get(hx.data());
+    bool ok = true;
+    AwStats c;
+    std::vector<int> extra;
+    for (int m = 0; m < f.M; ++m) {
+        bool far = false;
+        for (size_t i = (size_t)m * f.H * f.D; i < (size_t)(m + 1) * f.H * f.D; ++i) {
+            const uint16_t a = hf[i], b = hx[i];
+            ++c.outs;
+            if (bf16_nan(a) || bf16_nan(b) || bf16_inf(a) || bf16_inf(b)) {
+                if (bf16_nan(a) != bf16_nan(b) || (bf16_inf(a) || bf16_inf(b)) && a != b) {
+                    if (c.cls < 4) std::printf("  %s: row %d value %zu class differs: fast %04x exact %04x\n", what, m,
+                                               i % ((size_t)f.H * f.D), a, b);
+                    ++c.cls;
+                } else ++c.eq;
+                continue;
+            }
+            const int u = std::abs(bf16_ord(a) - bf16_ord(b));
+            c.maxu = std::max(c.maxu, u);
+            if (u == 0) ++c.eq; else if (u == 1) ++c.u1; else if (u == 2) ++c.u2; else if (u <= 4) ++c.u4;
+            else if (u <= 16) { ++c.u16; far = true; } else { ++c.ubig; far = true; }
+        }
+        if (far && extra.size() < 64) extra.push_back(m);
+    }
+    /* The f64 bound: sampled rows plus every row with a far output (up to 64). */
+    std::vector<int> rows = { 0, f.M / 3, f.M / 2, f.M - 1 };
+    std::mt19937_64 rr(77u + (uint32_t)f.M);
+    for (int i = 0; i < 12; ++i) rows.push_back((int)(rr() % (uint64_t)f.M));
+    rows.insert(rows.end(), extra.begin(), extra.end());
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    std::vector<double> ref, mag;
+    if (!bound) rows.clear();
+    for (int m : rows)
+        for (int h = 0; h < f.H; ++h) {
+            attn_ref(f, m, h, ref, mag);
+            for (int dd = 0; dd < f.D; ++dd) {
+                const size_t i = ((size_t)m * f.H + h) * f.D + dd;
+                if (!std::isfinite(ref[(size_t)dd]) || bf16_nan(hf[i]) || bf16_inf(hf[i]) || bf16_nan(hx[i]) || bf16_inf(hx[i]))
+                    continue;
+                const double bound = 0x1p-8 * std::fabs(ref[(size_t)dd]) + 0x1p-12 * mag[(size_t)dd] + 1e-38;
+                const double ef = std::fabs((double)bf16_to_f32(hf[i]) - ref[(size_t)dd]) / bound;
+                const double ex = std::fabs((double)bf16_to_f32(hx[i]) - ref[(size_t)dd]) / bound;
+                ++c.checked;
+                c.use = std::max(c.use, ef);
+                c.use_x = std::max(c.use_x, ex);
+                if (ef > 1) {
+                    if (c.over < 4) std::printf("  %s: row %d head %d col %d fast %.9g exact %.9g ref %.9g (bound %.3g)\n",
+                                                what, m, h, dd, bf16_to_f32(hf[i]), bf16_to_f32(hx[i]), ref[(size_t)dd], bound);
+                    ++c.over;
+                }
+                if (ex > 1) ++c.over_x;
+            }
+        }
+    if (c.cls || c.over || c.over_x) ok = false;
+    /* Batch invariance and determinism of the fast form: a rerun, rows alone, 16 at a time, and suffixes. */
+    long long inv_bad = 0;
+    if (invariance) {
+        std::vector<uint16_t> h2(n);
+        auto cmp_rows = [&](int r0, int r1) {
+            o2.get(h2.data());
+            long long b = 0;
+            for (size_t i = (size_t)r0 * f.H * f.D; i < (size_t)r1 * f.H * f.D; ++i) b += h2[i] != hf[i];
+            return b;
+        };
+        HC(hipMemsetAsync(o2.p, 0x33, n * 2, s));
+        if (attn_form(L, s, d, 0, f.M, 2, o2.p) < 0) return false;
+        HC(hipStreamSynchronize(s));
+        inv_bad += cmp_rows(0, f.M);
+        for (int cut : { 1, 16 }) {
+            if (cut == 1 && f.M > 512) continue;   /* one launch a row: at 512 rows and below */
+            HC(hipMemsetAsync(o2.p, 0x33, n * 2, s));
+            for (int r0 = 0; r0 < f.M; r0 += cut)
+                if (attn_form(L, s, d, r0, std::min(f.M, r0 + cut), 2, o2.p) < 0) return false;
+            HC(hipStreamSynchronize(s));
+            inv_bad += cmp_rows(0, f.M);
+            *inv_rows += f.M;
+        }
+        for (int r0 : { 1, f.M / 2, f.M - 1 }) {
+            if (r0 <= 0 || r0 >= f.M) continue;
+            HC(hipMemsetAsync(o2.p, 0x33, n * 2, s));
+            if (attn_form(L, s, d, r0, f.M, 2, o2.p) < 0) return false;
+            HC(hipStreamSynchronize(s));
+            inv_bad += cmp_rows(r0, f.M);
+            *inv_rows += f.M - r0;
+        }
+        if (inv_bad) { ok = false; std::printf("  FAIL %s: %lld values differ across launch splits / reruns\n", what, inv_bad); }
+    }
+    std::printf("attnwm: %-34s H=%2d M=%4d: %lld outputs, %.4f%% bit-equal, ulp 1:%lld 2:%lld 3-4:%lld 5-16:%lld >16:%lld "
+                "(max %d), class differences %lld; f64 bound: %lld checked, %lld over (fast, max use %.3f), %lld over "
+                "(exact, max use %.3f)%s\n",
+                what, f.H, f.M, c.outs, 100.0 * (double)c.eq / (double)std::max(1ll, c.outs), c.u1, c.u2, c.u4, c.u16,
+                c.ubig, c.maxu, c.cls, c.checked, c.over, c.use, c.over_x, c.use_x,
+                invariance ? (inv_bad ? "; batch invariance FAILED" : "; rerun, single rows, launches of 16, suffixes: equal") : "");
+    std::fflush(stdout);
+    st.outs += c.outs; st.eq += c.eq; st.u1 += c.u1; st.u2 += c.u2; st.u4 += c.u4; st.u16 += c.u16; st.ubig += c.ubig;
+    st.cls += c.cls; st.checked += c.checked; st.over += c.over; st.over_x += c.over_x;
+    st.maxu = std::max(st.maxu, c.maxu); st.use = std::max(st.use, c.use); st.use_x = std::max(st.use_x, c.use_x);
+    return ok;
+}
+
+int attnwm_check(const Lib& L, int mmax) {
+    if (!L.attn) { std::printf("attnwm: FAIL: the plugin lacks r4d_rad_ds41_attn_sparse_sink\n"); return 1; }
+    int rc = 0;
+    /* The row table: the switch is set for this mode; the attention row must name the form. */
+    {
+        const RadKernelInfo* row = nullptr;
+        for (int i = 0; L.count && L.at && i < L.count(); ++i) {
+            const RadKernelInfo* k = L.at(i);
+            if (k && k->name && !std::strcmp(k->name, "ds41_attn_sparse_sink_d512_bf16")) row = k;
+        }
+        if (!row || !row->computes || !std::strstr(row->computes, ds41p1::kAttnWmmaMark)) {
+            std::printf("attnwm: FAIL: row table: ds41_attn_sparse_sink_d512_bf16 does not name %s\n", ds41p1::kAttnWmmaMark);
+            rc = 1;
+        } else
+            std::printf("PASS: row table: ds41_attn_sparse_sink_d512_bf16 names %s (served form: the WMMA sparse attention)\n",
+                        ds41p1::kAttnWmmaMark);
+    }
+    hipStream_t s;
+    HC(hipStreamCreate(&s));
+    AwStats st;
+    long long inv_rows = 0;
+    bool ok = rc == 0;
+    std::vector<int> Ms = { 1, 16, 17, 48, 49, 64, 256, 1024, 1770, 2048, 4096 };
+    for (int H : { 16, 32 })
+        for (int M : Ms) {
+            if (M > mmax || (H == 32 && M > 2048)) continue;
+            const SparseFix f = sparse_fix(M, H, 4400u + (uint32_t)M + 100u * (uint32_t)H);
+            ok &= attnwm_chunk(L, s, f, "chunk", st, M <= 256 || M == 1770 || M == mmax, &inv_rows);
+        }
+    /* Edge chunks at 16 heads, 256 rows. */
+    {
+        SparseFix f = sparse_fix(256, 16, 5501u);
+        f.P0 = 5;   /* a short context: the window's first keys and most selections missing */
+        for (int m = 0; m < f.M; ++m) f.pos[(size_t)m] = f.P0 + m;
+        for (int m = 0; m < f.M; ++m) {
+            const int reach = (f.pos[(size_t)m] + 1) / f.ratio;
+            for (int i = 0; i < f.topk; ++i) {
+                int32_t& c = f.sel[(size_t)m * f.topk + i];
+                c = i < reach && (i % 3) ? (int32_t)((i * 7 + m) % std::max(1, reach)) : -1;
+            }
+        }
+        ok &= attnwm_chunk(L, s, f, "edge: short context", st, true, &inv_rows);
+    }
+    {
+        SparseFix f = sparse_fix(256, 16, 5502u);
+        /* scores spread over hundreds: p down to f32 underflow, the pieces of p into bf16 subnormals. Classes and
+         * ulps only: here the bound would measure the scores' own f32 error, which both forms carry. */
+        for (auto& v : f.q) v = f32_to_bf16(bf16_to_f32(v) * 128.f);
+        ok &= attnwm_chunk(L, s, f, "edge: large scores (no f64 bound)", st, false, &inv_rows, false);
+    }
+    {
+        SparseFix f = sparse_fix(256, 16, 5503u);
+        for (auto& v : f.sink) v = 12.f;
+        ok &= attnwm_chunk(L, s, f, "edge: large sinks", st, false, &inv_rows);
+    }
+    {
+        SparseFix f = sparse_fix(256, 16, 5504u);
+        f.q[(size_t)(3 * f.H + 2) * f.D + 7] = 0x7f80;                 /* +inf in row 3, head 2 */
+        f.q[(size_t)(5 * f.H + 4) * f.D + 9] = 0x7fc0;                 /* NaN in row 5, head 4 */
+        f.wc[(size_t)7 * f.D + 100] = 0xffc0;                          /* NaN in one window key */
+        ok &= attnwm_chunk(L, s, f, "edge: NaN / inf inputs", st, false, &inv_rows);
+    }
+    /* The engine's form, with the switch set: the fast one at 1 row and at the chunk. */
+    long long served_bad = 0;
+    for (int M : { 1, std::min(mmax, 1770) }) {
+        const SparseFix f = sparse_fix(M, 16, 6600u + (uint32_t)M);
+        AttnDev d(f);
+        const size_t n = (size_t)M * f.H * f.D;
+        Dev o0(n * 2), o2(n * 2);
+        if (attn_form(L, s, d, 0, M, 0, o0.p) < 0 || attn_form(L, s, d, 0, M, 2, o2.p) < 0) { served_bad = -1; break; }
+        HC(hipStreamSynchronize(s));
+        std::vector<uint16_t> a(n), b(n);
+        o0.get(a.data());
+        o2.get(b.data());
+        for (size_t i = 0; i < n; ++i) served_bad += a[i] != b[i];
+    }
+    if (served_bad) { ok = false; std::printf("attnwm: FAIL: the engine's form is not the fast one (%lld)\n", served_bad); }
+    /* Time at 16 heads. */
+    hipEvent_t e0, e1;
+    HC(hipEventCreate(&e0));
+    HC(hipEventCreate(&e1));
+    for (int M : { 16, 64, 256, 1024, 1770, 2048, 4096 }) {
+        if (M > mmax) continue;
+        const SparseFix f = sparse_fix(M, 16, 7700u + (uint32_t)M);
+        AttnDev d(f);
+        Dev o((size_t)M * f.H * f.D * 2);
+        auto run = [&](int form) {
+            std::vector<float> t;
+            for (int i = 0; i < 2; ++i) (void)attn_form(L, s, d, 0, M, form, o.p);
+            for (int r = 0; r < 5; ++r) {
+                HC(hipEventRecord(e0, s));
+                for (int i = 0; i < 5; ++i) (void)attn_form(L, s, d, 0, M, form, o.p);
+                HC(hipEventRecord(e1, s));
+                HC(hipEventSynchronize(e1));
+                float ms = 0;
+                HC(hipEventElapsedTime(&ms, e0, e1));
+                t.push_back(200.f * ms);
+            }
+            std::sort(t.begin(), t.end());
+            return (double)t[2];
+        };
+        const double tx = run(1), tf = run(2);
+        std::printf("attnwm time: H=16 M=%4d: exact %9.1f us, fast %9.1f us, %.2fx\n", M, tx, tf, tx / tf);
+    }
+    HC(hipStreamDestroy(s));
+    std::printf("attnwm: %s: %lld outputs against the exact kernels, %.4f%% bit-equal, ulp 1:%lld 2:%lld 3-4:%lld 5-16:%lld "
+                ">16:%lld (max %d), %lld class differences; %lld outputs against f64 within 2^-8|ref| + 2^-12 sum p|k|/den "
+                "(fast max use %.3f, exact %.3f, %lld / %lld over); batch-invariant over %lld relaunched rows; the engine's "
+                "form served\n",
+                ok ? "PASS" : "FAIL", st.outs, 100.0 * (double)st.eq / (double)std::max(1ll, st.outs), st.u1, st.u2, st.u4,
+                st.u16, st.ubig, st.maxu, st.cls, st.checked, st.use, st.use_x, st.over, st.over_x, inv_rows);
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | lsparse [C] [W:r...] | bal [C] [ROUTES] | p1 [MMAX] [ROUTES] | p1tiled [MMAX] [ROUTES] | p1wmma [MMAX] [ROUTES] | sweep [trials] | sweep0 [trials] | aux OUT [trials] | auxtall OUT [MMAX] [trials] | auxrt [jobs] | auxswap [rounds]\n", argv[0]); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | lsparse [C] [W:r...] | bal [C] [ROUTES] | p1 [MMAX] [ROUTES] | p1tiled [MMAX] [ROUTES] | p1wmma [MMAX] [ROUTES] | attnwm [MMAX] | sweep [trials] | sweep0 [trials] | aux OUT [trials] | auxtall OUT [MMAX] [trials] | auxrt [jobs] | auxswap [rounds]\n", argv[0]); return 2; }
     /* `tall`: the switch before the plugin's row table and its sparse launchers first read it, and
      * the routed GEMM as the A/B's servers run it (no live tail); the other modes as the loop's
      * measured runs ran it. */
@@ -4782,7 +5118,16 @@ int main(int argc, char** argv) {
     if (!std::strcmp(argv[2], ds41p1::kTiledCheckMode) || !std::strcmp(argv[2], ds41p1::kWmmaCheckMode))
         setenv(ds41p1::kTiledEnv, "1", 1);
     else if (std::strcmp(argv[2], "auxtall")) unsetenv(ds41p1::kTiledEnv);
-    if (!std::strcmp(argv[2], "auxtall")) {
+    /* The fast attention (inexact): on for `attnwm` only (the engine's form is then checked to be it). */
+    if (!std::strcmp(argv[2], ds41p1::kAttnWmmaCheckMode)) setenv(ds41p1::kAttnWmmaEnv, "1", 1);
+    else unsetenv(ds41p1::kAttnWmmaEnv);
+    if (!std::strcmp(argv[2], ds41p1::kAttnWmmaCheckMode)) {
+        /* `attnwm [MMAX]`: LCP=2048 as the window's Lc servers have it (the exact form the scalar kernels at every
+         * height). */
+        setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "2048", 1);
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
+        g_lcp = 2048;
+    } else if (!std::strcmp(argv[2], "auxtall")) {
         /* `auxtall`: LCP=2048 and P1, as the server of an AxrN arm has them (the worker's rows above 16 are the P1
          * twin's); the live tail left as the window has it, as for `aux`. */
         setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "2048", 1);
@@ -4890,6 +5235,11 @@ int main(int argc, char** argv) {
         }
         if (ws.empty()) ws = { { 32769, 1 }, { 65537, 2 }, { 131073, 1 }, { 262145, 2 }, { 524289, 1 } };
         return long_sparse_check(lib, ws);
+    }
+    if (!std::strcmp(argv[2], ds41p1::kAttnWmmaCheckMode)) {
+        const int mmax = argc > 3 ? std::atoi(argv[3]) : 4096;
+        if (mmax < 64 || mmax > 4096) { std::fprintf(stderr, "attnwm MMAX: 64 .. 4096\n"); return 2; }
+        return attnwm_check(lib, mmax);
     }
     if (!std::strcmp(argv[2], ds41p1::kWmmaCheckMode)) {
         const int mmax = argc > 3 ? std::atoi(argv[3]) : ds41p1::kTwinMaxRows;

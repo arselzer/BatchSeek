@@ -10621,6 +10621,59 @@ const std::vector<TallTwin>& tall_twins() {
 
 }  /* namespace */
 
+/* ================================================================================ the fast forms' marks
+ *
+ * RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED=1 and RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA=1 (r4d_ds41_tall.h) choose a kernel
+ * inside an existing row (gemm_bf16f8_nt_m64's launcher, attn_sparse_sink's), so the row set and every index stay
+ * as they are. Under either switch the row's `computes` names the form it now runs (kR4dDs41DenseTiledMark,
+ * kR4dDs41AttnWmmaMark), which the core requires when it is asked for (FileStager::lcp_init), and libr4d says so
+ * once on stderr. Without the switches nothing changes. */
+namespace {
+
+struct FastMark {
+    int         index;
+    RadKernelInfo info;
+    std::string computes;
+};
+
+const std::vector<FastMark>& fast_marks() {
+    static const std::vector<FastMark> v = [] {
+        std::vector<FastMark> t;
+        const bool dense = r4d_ds41_dense_tiled(), attn = r4d_ds41_attn_wmma();
+        if (!dense && !attn) return t;
+        const int n = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
+        for (int i = 0; i < n; ++i) {
+            const RadKernelInfo& k = kKernels[(size_t)i];
+            std::string add;
+            if (dense && !std::strcmp(k.name, "gemm_bf16f8_nt_m64"))
+                add = std::string("; ") + kR4dDs41DenseTiledMark + " (" + kR4dDs41DenseTiledEnv +
+                      "=1: M > 64, N >= 128, K % 64: gemm_bf16_nt_tiled's 128 x 128 / 64 x 64 blocks over the stored "
+                      "form, packets staged in LDS; the same operands, chains and slice sums)";
+            else if (attn && !std::strcmp(k.name, "ds41_attn_sparse_sink_d512_bf16"))
+                add = std::string("; ") + kR4dDs41AttnWmmaMark + " (" + kR4dDs41AttnWmmaEnv +
+                      "=1: q.k on v_wmma_f32_16x16x16_bf16, the exact kernel's scale, max, glibc expf and key-order "
+                      "sum p; sum p k on WMMA over p as three exact bf16 pieces; NOT libref's bits)";
+            if (add.empty()) continue;
+            FastMark m;
+            m.index = i;
+            m.info = k;
+            m.computes = std::string(k.computes) + add;
+            t.push_back(std::move(m));
+        }
+        for (FastMark& m : t) m.info.computes = m.computes.c_str();
+        if (dense)
+            std::fprintf(stderr, "libr4d: %s=1: gemm_bf16f8_nt_m64 above 64 rows takes %s\n", kR4dDs41DenseTiledEnv,
+                         kR4dDs41DenseTiledMark);
+        if (attn)
+            std::fprintf(stderr, "libr4d: %s=1: ds41_attn_sparse_sink_d512_bf16 takes %s (ds41_attn_fast_kernel; "
+                         "inexact by design)\n", kR4dDs41AttnWmmaEnv, kR4dDs41AttnWmmaMark);
+        return t;
+    }();
+    return v;
+}
+
+}  /* namespace */
+
 extern "C" int rad_kernel_count(void) {
     return (int)(sizeof(kKernels) / sizeof(kKernels[0])) + (int)host_twins().size() +
            (int)tall_twins().size();
@@ -10629,7 +10682,11 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
     if (i < 0 || i >= rad_kernel_count()) return nullptr;
     const int n = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
     const int twins = (int)host_twins().size();
-    if (i < n) return &kKernels[(size_t)i];
+    if (i < n) {
+        for (const FastMark& m : fast_marks())
+            if (m.index == i) return &m.info;
+        return &kKernels[(size_t)i];
+    }
     if (i < n + twins) return &host_twins()[(size_t)(i - n)].info;
     return &tall_twins()[(size_t)(i - n - twins)].info;
 }

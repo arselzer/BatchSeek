@@ -127,6 +127,49 @@ inline bool r4d_ds41_p1_wmma() {
     return on;
 }
 
+/* RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED (tools/ds41-host-experts/ds41_p1.h kDenseTiledEnv): "1" puts gemm_nt_bf16f8
+ * (the FP8-stored dense linears) above 64 rows on the LDS-tiled form (r4d_gemm_bf16f8_nt_m64.hip,
+ * r4d_gemm_bf16f8_nt_tiled_kernel: gemm_bf16_nt_tiled's 128 x 128 / 64 x 64 blocks with the weight's E4M3 packets
+ * staged in LDS and expanded to bf16 per fragment). EXACT: every WMMA operand is the m64 kernel's (the same fp8
+ * expansion), each slice is one chain from zero over its k steps in ascending order and the slices are summed from
+ * 0.f in ascending order with SK from the same law, so every output is gemm_bf16f8_nt_m64's bits (as
+ * gemm_bf16_nt_tiled is gemm_bf16_nt_m64's). Taller passes only, N >= 128, K % 64, 16-byte activation rows, never
+ * the chained launch. The row keeps its name; its `computes` names the form (kR4dDs41DenseTiledMark), which the core
+ * requires when the switch is set. Anything else is off. Read once. */
+constexpr const char* kR4dDs41DenseTiledEnv  = "RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED";
+constexpr const char* kR4dDs41DenseTiledMark = "the tiled bf16f8 GEMM above 64 rows (exact: the m64 kernel's bits)";
+
+inline bool r4d_ds41_dense_tiled() {
+    static const bool on = [] {
+        const char* e = std::getenv(kR4dDs41DenseTiledEnv);
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    return on;
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA (tools/ds41-host-experts/ds41_p1.h kAttnWmmaEnv): "1" puts attn_sparse_sink at
+ * EVERY height on the matrix-core form (r4d_ds41_sparse.hip, ds41_attn_fast_kernel). OPT-IN AND NOT EXACT: the
+ * scores' q.k products (bf16 x bf16, exact in f32) are summed by v_wmma_f32_16x16x16_bf16 in f32 (another order),
+ * then everything the exact kernel does after the dot is done the same way: the scale multiply, the max floored at
+ * -1e30, p = glibc's expf(s - max) (the same table and polynomial), sum p in key order from 0, exp(sink - max), the
+ * division and one bf16 rounding. sum p k takes each f32 p as three bf16 pieces (hi + mid + lo == p exactly) whose
+ * products with the bf16 key are exact, summed by WMMA in f32: the exact kernel rounds each p k product to f32
+ * first, so that sum differs by summation order and the products' roundings (each within 2^-24 |p k|). A row's
+ * bits depend only on the row (a workgroup a 16-head tile and row, no split over keys): batch-invariant at the
+ * kernel and, since every height takes it, at the engine. Passes the form cannot take (no 16-byte q / out rows, or
+ * a row's keys beyond its LDS) stay on the exact kernels. The row keeps its name; its `computes` names the form
+ * (kR4dDs41AttnWmmaMark), which the core requires when the switch is set. Anything else is off. Read once. */
+constexpr const char* kR4dDs41AttnWmmaEnv  = "RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA";
+constexpr const char* kR4dDs41AttnWmmaMark = "the WMMA sparse attention at every height (inexact: f32 summation order)";
+
+inline bool r4d_ds41_attn_wmma() {
+    static const bool on = [] {
+        const char* e = std::getenv(kR4dDs41AttnWmmaEnv);
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    return on;
+}
+
 /* The twin's bound on M: kR4dDs41P1MaxRows under P1, kR4dDs41LcpMax under LCP, kR4dDs41TallRows under EXACT_TALL
  * alone. */
 inline int r4d_ds41_tall_rows() {

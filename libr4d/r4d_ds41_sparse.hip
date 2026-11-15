@@ -1425,6 +1425,248 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(DsAttnArg
     }
 }
 
+/* ================================================================== attn_sparse_sink, fast form
+ *
+ * RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA=1 (r4d_ds41_tall.h), every height. OPT-IN, NOT EXACT, but only in summation:
+ * the exact kernel's arithmetic everywhere except where a sum's order moves. A workgroup is a (16-head tile, row),
+ * four waves of 128 latent columns as ds41_attn_sparse_sink_wm_kernel:
+ *   scores  S^T = K Q^T on v_wmma_f32_16x16x16_bf16 over each wave's 128 columns (q.k products of two bf16
+ *           are exact in f32), the four partials summed in wave order; then the exact kernel's
+ *           v = have ? s * scale : -inf, written to LDS (16 x nkk f32), and the running max of
+ *           (-1e30 < v ? v : -1e30), so the max is the exact kernel's (a max has no order).
+ *   p       p = have ? expf(v - max) : 0 with glibc's expf (ds_expf_tab, the exact kernel's), in place.
+ *   den     sum p in key order from 0 (one lane a head), + expf(sink - max): the exact kernel's sum.
+ *   pk      O^T += K^T P^T, A = K^T by global_load_tr_b128, B = P^T from the p layout, p taken as three bf16
+ *           pieces hi + mid + lo, each the truncation of what is left, which equals p exactly for every p
+ *           at or above 2^-102 (the pieces' products with a bf16 key are exact); three WMMAs a tile.
+ *   out     o / den, one bf16 rounding (ds_bf16_bits), as the exact kernel.
+ * So an output differs from the exact kernel's only by the q.k sums' order (which moves v by f32 rounding) and
+ * the order and product roundings of sum p k. Each row's bits depend only on that row's q and keys: no split of
+ * a row over workgroups, the same tile order at any M, so the form is batch-invariant. */
+constexpr int kAfWaves = 4;
+constexpr int kAfSbufBytes = 2 * kAfWaves * 64 * 16;
+
+struct DsFastLds {
+    long kp, vmask, sbuf, sc, tab, smx, sden, total;
+};
+__host__ __device__ constexpr DsFastLds ds_fast_lds(int nkt) {
+    const long nkk = (long)nkt * 16;
+    DsFastLds l{};
+    l.kp = 0;
+    l.vmask = nkk * 8;
+    l.sbuf = (l.vmask + (long)nkt * 4 + 15) / 16 * 16;
+    l.sc = l.sbuf + kAfSbufBytes;
+    l.tab = l.sc + 16 * (nkk + 4) * 4;   /* a head's row pitch nkk + 4: the 16 heads' b128 reads on distinct banks */
+    l.smx = l.tab + 32 * 8;
+    l.sden = l.smx + 16 * 4;
+    l.total = l.sden + 16 * 4;
+    return l;
+}
+
+/* f32 p as three bf16 pieces, each the truncation of what is left: hi + mid + lo == p for every p whose pieces are
+ * normal (p >= 2^-102). Two values a dword, the lower key's in the low half (the score layout's pairing). */
+__device__ __forceinline__ void ds_split3(float p0, float p1, uint32_t& h, uint32_t& m, uint32_t& l) {
+    const uint32_t h0 = __float_as_uint(p0) & 0xffff0000u, h1 = __float_as_uint(p1) & 0xffff0000u;
+    const float r0 = p0 - __uint_as_float(h0), r1 = p1 - __uint_as_float(h1);
+    const uint32_t m0 = __float_as_uint(r0) & 0xffff0000u, m1 = __float_as_uint(r1) & 0xffff0000u;
+    const uint32_t l0 = __float_as_uint(r0 - __uint_as_float(m0)), l1 = __float_as_uint(r1 - __uint_as_float(m1));
+    h = __builtin_amdgcn_perm(h1, h0, 0x07060302u);
+    m = __builtin_amdgcn_perm(m1, m0, 0x07060302u);
+    l = __builtin_amdgcn_perm(l1, l0, 0x07060302u);
+}
+
+__global__ __launch_bounds__(128) void ds41_attn_fast_kernel(DsAttnArgs a) {
+    constexpr int D = kDsAttnD;
+    const int nkt = (a.nk + 15) >> 4, nkk = nkt * 16, scp = nkk + 4;
+    const DsFastLds L = ds_fast_lds(nkt);
+    const uint16_t** kp = (const uint16_t**)(r4d_ds41_sparse_dyn + L.kp);
+    uint32_t* vmask = (uint32_t*)(r4d_ds41_sparse_dyn + L.vmask);
+    float4* sbuf = (float4*)(r4d_ds41_sparse_dyn + L.sbuf);
+    float* sc = (float*)(r4d_ds41_sparse_dyn + L.sc);
+    unsigned long long* tab = (unsigned long long*)(r4d_ds41_sparse_dyn + L.tab);
+    float* smx = (float*)(r4d_ds41_sparse_dyn + L.smx);
+    float* sden = (float*)(r4d_ds41_sparse_dyn + L.sden);
+    const int tid = threadIdx.x, lane = tid & 31, hf = lane >> 4;
+    const int wave = __builtin_amdgcn_readfirstlane((int)(tid >> 5));
+    const int hh = lane & 15;                        /* this lane's head in the tile */
+    const int hl = blockIdx.x * 16 + hh;
+    const bool hok = hl < a.H;
+    const int c0 = wave * kWmCols;
+    const int kq = lane & 15;
+    const int ktr = 8 * hf + (lane & 7);
+    const int dtr = c0 + 8 * ((lane >> 3) & 1);
+    if (tid < 32) tab[tid] = kDsExp2fTab[tid];
+    for (long m = blockIdx.y; m < a.M; m += gridDim.y) {
+        /* ---- the row's keys in libref's order (the window, then the selections); a missing one reads the zero
+         * row, and a 16-bit mask a tile says which are keys */
+        const int s = ds_seq_of_row(a.cu, a.cs, a.S, m);
+        const long p = a.pos[m * a.ps];
+        long lr = (long)a.cu[(long)(s + 1) * a.cs] - 1;
+        lr = lr < 0 ? 0 : (lr >= a.M ? a.M - 1 : lr);
+        const long last = a.pos[lr * a.ps];
+        const long first = last + 1 - (long)a.wused[(long)s * a.wus];
+        for (int k0 = 0; k0 < nkk; k0 += 128) {
+            const int k = k0 + tid;
+            const uint16_t* ptr = nullptr;
+            if (k < a.win) {
+                const long j = p - a.win + 1 + k, r = j - first;
+                if (j >= 0 && r >= 0 && r / a.bs < a.nwbt) {
+                    const long blk = a.wbt[(long)s * a.wbtr + (r / a.bs) * a.wbtc];
+                    if (blk >= 0 && blk < a.nwblk) ptr = a.wc + (blk * a.bs + r % a.bs) * (long)D;
+                }
+            } else if (k < a.nk) {
+                const long c = a.sel[m * a.selr + (long)(k - a.win) * a.selc];
+                if (c >= 0 && (c * a.ratio) / a.cbs < a.ncbt) {
+                    const long blk = a.cbt[(long)s * a.cbtr + ((c * a.ratio) / a.cbs) * a.cbtc];
+                    if (blk >= 0 && blk < a.ncblk)
+                        ptr = a.cc + (blk * a.cbs + (c * a.ratio) % a.cbs) * (long)(D / a.ratio);
+                }
+            }
+            if (k < nkk) kp[k] = ptr ? ptr : kDsZeroKey;
+            const uint32_t b = (uint32_t)__builtin_amdgcn_ballot_w32(ptr != nullptr);
+            const int t0 = (k0 + wave * 32) >> 4;
+            if (lane == 0) {
+                if (t0 < nkt) vmask[t0] = b & 0xffffu;
+                if (t0 + 1 < nkt) vmask[t0 + 1] = b >> 16;
+            }
+        }
+        __syncthreads();
+
+        /* ---- scores: Q^T for this lane's head and the wave's columns (step i, half hf: columns
+         * c0 + 64 hf + 8 i .. + 7, the same split as the key rows) */
+        uint4 qf[8];
+        {
+            const uint16_t* qp = a.q + m * a.qr + (long)(hok ? hl : 0) * D + c0 + 64 * hf;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                qf[i] = *(const uint4*)(qp + 8 * i);
+                if (!hok) qf[i] = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+        float mx = -1e30f;
+        uint4 kn[8];
+        {
+            const uint16_t* pk = kp[kq] + c0 + 64 * hf;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) kn[i] = *(const uint4*)(pk + 8 * i);
+        }
+        for (int t = 0; t < nkt; ++t) {
+            ds_v8f sp = (ds_v8f)(0.0f);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) sp = ds_wmma(kn[i], qf[i], sp);
+            if (t + 1 < nkt) {
+                const uint16_t* pk = kp[(t + 1) * 16 + kq] + c0 + 64 * hf;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) kn[i] = *(const uint4*)(pk + 8 * i);
+            }
+            float4* sb = sbuf + (t & 1) * (kAfWaves * 64);
+            sb[wave * 64 + lane] = make_float4(sp[0], sp[1], sp[2], sp[3]);
+            sb[wave * 64 + 32 + lane] = make_float4(sp[4], sp[5], sp[6], sp[7]);
+            __syncthreads();
+            float x[8];
+            {
+                const float4 l0 = sb[lane], h0 = sb[32 + lane];
+                x[0] = l0.x; x[1] = l0.y; x[2] = l0.z; x[3] = l0.w;
+                x[4] = h0.x; x[5] = h0.y; x[6] = h0.z; x[7] = h0.w;
+#pragma unroll
+                for (int w = 1; w < kAfWaves; ++w) {
+                    const float4 l = sb[w * 64 + lane], h = sb[w * 64 + 32 + lane];
+                    x[0] += l.x; x[1] += l.y; x[2] += l.z; x[3] += l.w;
+                    x[4] += h.x; x[5] += h.y; x[6] += h.z; x[7] += h.w;
+                }
+            }
+            const uint32_t vm = vmask[t] >> (8 * hf);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                x[e] = ((vm >> e) & 1u) ? x[e] * a.scale : -kDsInf;
+                mx = fmaxf(mx, -1e30f < x[e] ? x[e] : -1e30f);
+            }
+            if (wave == 0) {
+                float4* o4 = (float4*)(sc + (long)hh * scp + t * 16 + 8 * hf);
+                o4[0] = make_float4(x[0], x[1], x[2], x[3]);
+                o4[1] = make_float4(x[4], x[5], x[6], x[7]);
+            }
+        }
+        mx = fmaxf(mx, ds_xor16(mx));
+        if (wave == 0 && lane < 16) smx[hh] = mx;
+        __syncthreads();
+
+        /* ---- p in place: the exact kernel's expf of the same difference, 0 for no key */
+        for (int i = tid; i < 16 * nkk; i += 128) {
+            const int h = i / nkk, k = i - h * nkk;
+            const bool have = (vmask[k >> 4] >> (k & 15)) & 1u;
+            float* e = sc + (long)h * scp + k;
+            *e = have ? ds_expf_tab(*e - smx[h], tab) : 0.0f;
+        }
+        __syncthreads();
+
+        /* ---- den, key order from 0 (wave 0, a lane a head), while the other waves start on sum p k */
+        if (wave == 0 && lane < 16) {
+            const float* ph = sc + (long)hh * scp;
+            float dn = 0.0f;
+            for (int k = 0; k < nkk; k += 4) {
+                const float4 v = *(const float4*)(ph + k);
+                dn = dn + v.x;
+                dn = dn + v.y;
+                dn = dn + v.z;
+                dn = dn + v.w;
+            }
+            sden[hh] = hok ? dn + ds_expf_tab(a.sink[(long)hl * a.sks] - mx, tab) : 1.0f;
+        }
+
+        /* ---- sum p k: lane L holds head L%16 at columns c0 + 16 j + 8 hf + e */
+        ds_v8f o[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) o[j] = (ds_v8f)(0.0f);
+        uint4 kt[8];
+        {
+            const uint16_t* pt = kp[ktr] + dtr;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) kt[j] = ds_load_tr(pt + 16 * j);
+        }
+        for (int t = 0; t < nkt; ++t) {
+            const float* pp = sc + (long)hh * scp + t * 16 + 8 * hf;
+            const float4 pa = *(const float4*)pp, pb = *(const float4*)(pp + 4);
+            uint32_t w0[4], w1[4], w2[4];
+            ds_split3(pa.x, pa.y, w0[0], w1[0], w2[0]);
+            ds_split3(pa.z, pa.w, w0[1], w1[1], w2[1]);
+            ds_split3(pb.x, pb.y, w0[2], w1[2], w2[2]);
+            ds_split3(pb.z, pb.w, w0[3], w1[3], w2[3]);
+            const uint4 ph = make_uint4(w0[0], w0[1], w0[2], w0[3]);
+            const uint4 pm = make_uint4(w1[0], w1[1], w1[2], w1[3]);
+            const uint4 pl = make_uint4(w2[0], w2[1], w2[2], w2[3]);
+            uint4 kc[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) kc[j] = kt[j];
+            if (t + 1 < nkt) {
+                const uint16_t* pt = kp[(t + 1) * 16 + ktr] + dtr;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) kt[j] = ds_load_tr(pt + 16 * j);
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j) o[j] = ds_wmma(kc[j], ph, o[j]);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) o[j] = ds_wmma(kc[j], pm, o[j]);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) o[j] = ds_wmma(kc[j], pl, o[j]);
+        }
+        __syncthreads();                             /* sden */
+        if (hok) {
+            const float dt = sden[hh];
+            uint16_t* op = a.out + m * a.outr + (long)hl * D + c0 + 8 * hf;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                uint32_t w[4];
+#pragma unroll
+                for (int q = 0; q < 4; ++q)
+                    w[q] = ds_bf16_bits(o[j][2 * q] / dt) | (ds_bf16_bits(o[j][2 * q + 1] / dt) << 16);
+                *(uint4*)(op + 16 * j) = make_uint4(w[0], w[1], w[2], w[3]);
+            }
+        }
+        __syncthreads();
+    }
+}
+
 /* ================================================================== index_score on WMMA
  *
  * Passes of more than kWmRows rows. A wave is a row and walks 16-entry tiles of its workgroup's
@@ -1850,12 +2092,30 @@ int attn_body(const RadArgs* a, RadStream stream) {
     s.nk = (int)(win + (comp ? topk : 0));
     s.nkp = (s.nk + 3) / 4 * 4;
     s.scale = scale;
+    /* The form: `form` 1 the exact kernels at every height (the device check's reference: what ..._EXACT_TALL
+     * serves), 2 the fast form (ds41_attn_fast_kernel, refused where it cannot run), 0 (the engine's) the fast
+     * form at every height under RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA where it fits, else as below. Whether it
+     * fits is a matter of the op's shape and its buffers' pitch and alignment, the same for every pass. */
+    const long long form = r4d_geti_or(a, "form", 0);
+    if (form < 0 || form > 2) return R4D_NO(RAD_E_INVAL);
+    {
+        const int nkt = (s.nk + 15) / 16;
+        const long lds = ds_fast_lds(nkt).total;
+        const bool fits = s.qr % 8 == 0 && s.outr % 8 == 0 && aligned(q.data, 16) && aligned(out.data, 16) &&
+                          lds <= 65536 && (H + 15) / 16 <= 65535;
+        if (form == 2 && !fits) return R4D_NO(RAD_E_UNSUPPORTED);
+        if (form == 2 || (form == 0 && fits && r4d_ds41_attn_wmma())) {
+            const unsigned gy = (unsigned)(s.M < 65535 ? s.M : 65535);
+            const dim3 grid((unsigned)((H + 15) / 16), gy);
+            return R4D_EMIT(stream, ds41_attn_fast_kernel, grid, dim3(128), (uint32_t)lds, s);
+        }
+    }
     /* Prefill heights on WMMA (16-byte q and out rows); the decode band on the scalar kernels
      * below (libref's bits), and every height under ..._EXACT_TALL. */
     {
         const int nkt = (s.nk + 15) / 16;
         const long lds = ds_wm_sbuf_off(nkt) + kWmSbufBytes;
-        if (s.M > kWmRows && !ds_exact_tall() && s.qr % 8 == 0 && s.outr % 8 == 0 && aligned(q.data, 16) &&
+        if (form != 1 && s.M > kWmRows && !ds_exact_tall() && s.qr % 8 == 0 && s.outr % 8 == 0 && aligned(q.data, 16) &&
             aligned(out.data, 16) && lds <= 65536 && (H + 15) / 16 <= 65535) {
             const unsigned gy = (unsigned)(s.M < 65535 ? s.M : 65535);
             const dim3 grid((unsigned)((H + 15) / 16), gy);
@@ -1867,7 +2127,7 @@ int attn_body(const RadArgs* a, RadStream stream) {
      * in the same order, so the bits do not depend on it. A tall pass under ..._EXACT_TALL takes
      * the decode band's own kernel, as a 16-token pass does. */
     const long rows = s.M;
-    if (rows <= kWmRows || ds_exact_tall()) {
+    if (rows <= kWmRows || ds_exact_tall() || form == 1) {
         const int rc = attn_dec_emit(stream, s);
         if (rc != RAD_E_UNSUPPORTED) return rc;
     }

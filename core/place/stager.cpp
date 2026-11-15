@@ -1662,6 +1662,10 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
     if (xt && *xt && std::strcmp(xt, "1") != 0)
         why = fmt("%s=%s beside it: large-chunk prefill keeps EXACT_TALL's pins at every height; leave it unset "
                   "(or empty) or 1", kExactTallEnv, xt);
+    else if (ds41p1::dense_tiled_state() < 0)
+        why = fmt("%s=%s: 1 is on, 0 / unset / empty off", ds41p1::kDenseTiledEnv, std::getenv(ds41p1::kDenseTiledEnv));
+    else if (ds41p1::attn_wmma_state() < 0)
+        why = fmt("%s=%s: 1 is on, 0 / unset / empty off", ds41p1::kAttnWmmaEnv, std::getenv(ds41p1::kAttnWmmaEnv));
     else if (T != C)
         why = fmt("--max-num-batched-tokens is %lld: give %lld, the chunk the switch was set for (a step of "
                   "another size would run passes the bands below were not checked at, or fewer rows a chunk)",
@@ -1681,7 +1685,7 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
         RAD_ERR("%s=%lld (large-chunk prefill) refused: %s", kLcpEnv, (long long)C, why.c_str());
         return RAD_E_INVAL;
     }
-    int n_moe = 0, n_twin = 0, n_ops = 0, n_split = 0, n_runs = 0;
+    int n_moe = 0, n_twin = 0, n_ops = 0, n_split = 0, n_runs = 0, n_dense = 0, n_attn = 0;
     int64_t reach = 0;
     /* The multi-kernel ops admitted, by family: ops and the kernels seen. */
     std::map<std::string, std::pair<int, std::vector<std::string>>> fams;
@@ -1696,6 +1700,26 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
          * gemm_nt_f32 over a rank's 96 of 384 columns) and the indexer's runs (row_part > 0). */
         if ((op.op == "gemm_nt_f32" || op.op == "gemm_nt_f32bf16") && N == 96) ++n_split;
         if (op.op == "index_score" && op.base.get_i("row_part", &part) && part > 0) ++n_runs;
+        /* The fast forms (ds41p1::kDenseTiledEnv, exact; ds41p1::kAttnWmmaEnv, inexact by design): libr4d picks
+         * them inside the op's own row, so the row must say it takes the form asked for, every band of it. */
+        const bool want_dense = ds41p1::dense_tiled_state() == 1 && op.op == "gemm_nt_bf16f8";
+        const bool want_attn = ds41p1::attn_wmma_state() == 1 && op.op == "attn_sparse_sink";
+        if (want_dense || want_attn) {
+            const char* env = want_dense ? ds41p1::kDenseTiledEnv : ds41p1::kAttnWmmaEnv;
+            const char* mark = want_dense ? ds41p1::kDenseTiledMark : ds41p1::kAttnWmmaMark;
+            for (const Band& b : op.bands) {
+                const KernelRow* row = b.dom[RAD_DOMAIN_DEVICE].row;
+                const char* says = row && row->info ? row->info->computes : nullptr;
+                if (!says || !std::strstr(says, mark)) {
+                    RAD_ERR("%s=1 refused: op %zu (%s) resolves %s to %s, whose row does not name %s: load a "
+                            "libr4d.so built with the form, with %s=1 in its environment", env, h, op.op.c_str(),
+                            b.span.empty() ? "a band" : b.span.c_str(), row_name(b) ? row_name(b) : "nothing", mark,
+                            env);
+                    return RAD_E_INVAL;
+                }
+            }
+            ++(want_dense ? n_dense : n_attn);
+        }
         const char* ty = op.base.get_s("type");
         if (op.op == "moe_gemm_ggml" && ty && !std::strcmp(ty, "mxfp4")) {
             ++n_moe;
@@ -1814,6 +1838,14 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
                           (long long)kEpRouteLcpMax).c_str());
         return RAD_E_INVAL;
     }
+    if ((ds41p1::dense_tiled_state() == 1 && n_dense == 0) || (ds41p1::attn_wmma_state() == 1 && n_attn == 0)) {
+        const bool d = ds41p1::dense_tiled_state() == 1 && n_dense == 0;
+        RAD_ERR("%s=1 refused: the program has no %s op", d ? ds41p1::kDenseTiledEnv : ds41p1::kAttnWmmaEnv,
+                d ? "gemm_nt_bf16f8" : "attn_sparse_sink");
+        return RAD_E_INVAL;
+    }
+    lcp_dense_ops_ = n_dense;
+    lcp_attn_ops_ = n_attn;
     /* The compact floor may cross the sparse launcher's internal48-row threshold. LCP's env
      * pin is authoritative only for known untuned index rows from its actual admitted DSO. */
     const char* compact = std::getenv(deepseek41::kIndexCompactEnv);
@@ -1872,6 +1904,12 @@ int FileStager::tall_init(const Program& prog) {
         return RAD_E_INVAL;
     }
     if (lcp > 0) return lcp_init(prog, lcp);
+    lcp_dense_ops_ = lcp_attn_ops_ = 0;
+    for (const char* env : { ds41p1::kDenseTiledEnv, ds41p1::kAttnWmmaEnv })
+        if (const char* v = std::getenv(env); ds41p1::env_state(v) != 0) {
+            RAD_ERR("%s=%s refused: it acts on large-chunk prefill's passes, and %s is not set", env, v, kLcpEnv);
+            return RAD_E_INVAL;
+        }
     const int st = ds41_exact_tall_state();
     if (st < 0) {
         const char* v = std::getenv(kExactTallEnv);
@@ -2078,6 +2116,14 @@ int FileStager::hx_init(const Program& prog) {
             lcp_report();
             lcp_spec_report();
         }
+        if (lcp_dense_ops_)
+            RAD_INFO("%s %d (%s=1): %d gemm_nt_bf16f8 ops above 64 rows on %s -- every output the m64 kernel's bits",
+                     ds41p1::kLogDenseTiled, plan_->rank, ds41p1::kDenseTiledEnv, lcp_dense_ops_,
+                     ds41p1::kDenseTiledMark);
+        if (lcp_attn_ops_)
+            RAD_INFO("%s %d (%s=1): %d attn_sparse_sink ops at every height on %s -- q.k and sum p k summed in "
+                     "another f32 order: NOT the exact kernels' bits (an opt-in fast mode)",
+                     ds41p1::kLogAttnWmma, plan_->rank, ds41p1::kAttnWmmaEnv, lcp_attn_ops_, ds41p1::kAttnWmmaMark);
     }
     return rc;
 }
