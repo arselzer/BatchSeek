@@ -45,6 +45,7 @@ LW=$(sed -n '/^launch_words() {/,/^}/p' "$W")
   echo 'p1tiled: PASS: test, also with the tail filled once' > "$OUT/devcheck-p1tiled.log"
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
   eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
+  eval "$(sed -n '/^ARM_PRESET_B2=/p;/^ARM_PRESET_B4=/p;/^arm_full() {/,/^}/p' "$W")"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
   ARMS=$ARM
   s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)

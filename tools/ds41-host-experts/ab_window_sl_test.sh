@@ -52,6 +52,7 @@ run_loop() {
     ARMS="$B $B-Sl4096 $B-Sl63 $B-Sl4096-Sl2048 ${B%-L720896}-L2048-Sl4096 $B-Slx"
     eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
     eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
+    eval "$(sed -n '/^ARM_PRESET_B2=/p;/^ARM_PRESET_B4=/p;/^arm_full() {/,/^}/p' "$W")"
     HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
     s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)
     e=$(awk -v s="$s" 'NR > s && /^done$/ { print NR; exit }' "$W")

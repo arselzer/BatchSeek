@@ -266,6 +266,20 @@ DOCKER=(/usr/bin/sudo -n /usr/bin/docker)
 NAME=radiance-flashnext
 URL=http://127.0.0.1:8078
 mkdir -p "$OUT"
+# Arm-name presets (the common batch prefix, so an arm name and its files stay under the 255-byte name limit): an arm
+# named B2-<parts> is the batch configuration's prefix with 2,048-row chunks, B4-<parts> the same with 4,096-row chunks
+# (M4096, Lc4096; such an arm also names Pci4096 or more). Parts are parsed from the expanded name; files use the arm's
+# own (short) name.
+ARM_PRESET_B2=all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs
+ARM_PRESET_B4=all-t40-f-M4096-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc4096-P1-Qe64-Mb1-Rb-Vp-Cs
+arm_full() {   # arm name -> the name its parts are read from
+  case $1 in
+    B2-*) printf '%s' "$ARM_PRESET_B2-${1#B2-}" ;;
+    B4-*) printf '%s' "$ARM_PRESET_B4-${1#B4-}" ;;
+    *)    printf '%s' "$1" ;;
+  esac
+}
+
 log() { echo "[$(date -u +%FT%TZ)] $*" | tee -a "$OUT/window.log"; }
 
 idle_for() {   # seconds of continuous idleness required, give up after $2 seconds
@@ -2673,10 +2687,10 @@ aux_kld_check() {   # arm name, the server's pid
 # The loop's gate then finds each library checked (and checks one this missed).
 if [[ -n "${VPACK_CHECK:-}" && -x "${VPACK_CHECK:-}" ]]; then
   for a in $ARMS; do
-    [[ "-$a-" == *-Vp-* ]] || continue
+    [[ "-$(arm_full "$a")-" == *-Vp-* ]] || continue
     h=$RHOME
-    [[ "-$a-" == *-H-* ]] && h=${RADIANCE_HOME_DIR2:-$RHOME}
-    [[ "-$a-" == *-H3-* ]] && h=${RADIANCE_HOME_DIR3:-$RHOME}
+    [[ "-$(arm_full "$a")-" == *-H-* ]] && h=${RADIANCE_HOME_DIR2:-$RHOME}
+    [[ "-$(arm_full "$a")-" == *-H3-* ]] && h=${RADIANCE_HOME_DIR3:-$RHOME}
     IFS=: read -r -a homes <<< "$h"
     for hh in "${homes[@]}"; do [[ -f "$hh/kernels/libr4d.so" ]] && { vpack_check "$hh/kernels/libr4d.so"; break; }; done
   done
@@ -2885,7 +2899,7 @@ ar_rows_gate() {   # arm, library; never starts a checker after the reference ar
 if [[ -x ${SELFTEST_AR_ROWS:-} ]]; then
   for a in $ARMS; do
     h=$RHOME ar_parts=0 ar_bad=0
-    IFS=- read -r -a preflight_parts <<< "$a"
+    IFS=- read -r -a preflight_parts <<< "$(arm_full "$a")"
     for p in "${preflight_parts[@]}"; do
       case $p in
         Ar*) ar_parts=$((ar_parts + 1)); ar_rows_parse "$p" >/dev/null || ar_bad=1 ;;
@@ -2956,7 +2970,7 @@ ag_rows_gate() {   # arm, library; never starts a checker after the reference ar
 if [[ -x ${SELFTEST_AG_ROWS:-} ]]; then
   for a in $ARMS; do
     h=$RHOME ag_parts=0 ag_bad=0
-    IFS=- read -r -a preflight_parts <<< "$a"
+    IFS=- read -r -a preflight_parts <<< "$(arm_full "$a")"
     for p in "${preflight_parts[@]}"; do
       case $p in
         Ag*) ag_parts=$((ag_parts + 1)); ag_rows_parse "$p" >/dev/null || ag_bad=1 ;;
@@ -2976,7 +2990,7 @@ fi
 ar_ag_shared_arm() {   # arm spelling; match the same BT/Lc cap clamp as the main arm loop
   local a=$1 p ar= ag= bt=16 lc= step
   local -a fields
-  IFS=- read -r -a fields <<< "$a"
+  IFS=- read -r -a fields <<< "$(arm_full "$a")"
   for p in "${fields[@]:1}"; do
     case $p in
       Ar*) [[ -z $ar ]] && ar=$(ar_rows_parse "$p") || return 1 ;;
@@ -3051,7 +3065,7 @@ if [[ -x ${SELFTEST_AR_AG_SHARED:-} ]]; then
   for a in $ARMS; do
     ar_ag_shared_arm "$a" || continue
     h=$RHOME
-    IFS=- read -r -a preflight_parts <<< "$a"
+    IFS=- read -r -a preflight_parts <<< "$(arm_full "$a")"
     for p in "${preflight_parts[@]}"; do
       case $p in H) h=${RADIANCE_HOME_DIR2:-$RHOME} ;; H3) h=${RADIANCE_HOME_DIR3:-$RHOME} ;; esac
     done
@@ -3378,7 +3392,7 @@ for a in $ARMS; do
 # every router input the predictor is posted into pred-<arm>.bin (..._PREFETCH_RECORD; ~10 KB an
 # input, ~190 MB an arm of the held-out prompts; an instrument: router_score_eval scores the file
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
-  IFS=- read -r -a parts <<< "$a"
+  IFS=- read -r -a parts <<< "$(arm_full "$a")"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" sg="" pcn=""
   p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qsp="" qt="" qz="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr=""
@@ -3811,8 +3825,8 @@ for a in $ARMS; do
   # whatever the window's environment (0: the urgent pieces, as before); arm() checks the log both
   # ways. Without a PpK part there is nothing to finish, and the arm would not test it.
   if [[ -n "$pu" ]]; then
-    if [[ "-$a-" != *-Pp[0-9]* ]]; then log "arm $a: Pu${pu#1} needs a PpK part (read-ahead in pieces); the arm is skipped"; skip=1; fi
-    [[ "$pu" == 2 && "-$a-" != *-Rd[0-9]* ]] && { log "arm $a: Pu2 needs the decode mirror (R and RdNN); the arm is skipped"; skip=1; }
+    if [[ "-$(arm_full "$a")-" != *-Pp[0-9]* ]]; then log "arm $a: Pu${pu#1} needs a PpK part (read-ahead in pieces); the arm is skipped"; skip=1; fi
+    [[ "$pu" == 2 && "-$(arm_full "$a")-" != *-Rd[0-9]* ]] && { log "arm $a: Pu2 needs the decode mirror (R and RdNN); the arm is skipped"; skip=1; }
   else
     env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=0)
   fi
@@ -3976,7 +3990,7 @@ for a in $ARMS; do
     log "arm $a: Dc / Dl / Dx with Ds0 (nothing drafts); the arm is skipped"; skip=1
   fi
   if [[ -n "$dc" && -n "$dg" ]]; then log "arm $a: Dc and Dg both decide the query pass; the arm is skipped"; skip=1; fi
-  if [[ -n "$dm" && "-$a-" != *-Er-* ]]; then log "arm $a: Dm needs Er (the codebooks go where the embedding goes); the arm is skipped"; skip=1; fi
+  if [[ -n "$dm" && "-$(arm_full "$a")-" != *-Er-* ]]; then log "arm $a: Dm needs Er (the codebooks go where the embedding goes); the arm is skipped"; skip=1; fi
   if [[ -n "$dpc" && ( -z "$ds" || "$ds" == Ds0 ) ]]; then
     log "arm $a: Dpc needs a drafting Ds part (not Ds0); the arm is skipped"; skip=1
   fi
@@ -4549,7 +4563,7 @@ declare -A BY_PROMPTS=() KH_BY_PROMPTS=()
 for a in $ARMS; do
   u=$(tr '-' '\n' <<< "$a" | grep -m1 -E '^U.+')
   BY_PROMPTS[${u:-held-out}]+="$a "
-  [[ "-$a-" == *-Kh-* ]] && KH_BY_PROMPTS[${u:-held-out}]+="$a "
+  [[ "-$(arm_full "$a")-" == *-Kh-* ]] && KH_BY_PROMPTS[${u:-held-out}]+="$a "
 done
 if (( ${#BY_PROMPTS[@]} > 1 )); then
   for u in "${!BY_PROMPTS[@]}"; do
@@ -4573,7 +4587,7 @@ done
 # requests must have the draft_n and draft_n_accepted (and the texts) of the same arm without its
 # Dk part, when the window ran it (K1 review finding 3).
 for a in $ARMS; do
-  [[ "-$a-" == *-Dk-* || "-$a-" == *-Dkt-* ]] || continue
+  [[ "-$(arm_full "$a")-" == *-Dk-* || "-$(arm_full "$a")-" == *-Dkt-* ]] || continue
   b=$(sed -E 's/-Dkt?(-|$)/\1/' <<< "$a")
   if [[ " $ARMS " != *" $b "* ]]; then log "draft stats: no arm $b in this window to hold $a to"; continue; fi
   log "draft stats: $a against $b"
@@ -4583,12 +4597,12 @@ done
 # arm with the same Ds and Db parts in each prompt set (put the pinned-bank arm first, so a Dv arm's masked
 # draft is read against the bank's unmasked one at its verify cap), tokens a step and decode tokens/s.
 ds_arms=""
-for a in $ARMS; do [[ "-$a-" =~ -Ds[0-9a]?- && -f "$OUT/$a.json" ]] && ds_arms+="$a "; done
+for a in $ARMS; do [[ "-$(arm_full "$a")-" =~ -Ds[0-9a]?- && -f "$OUT/$a.json" ]] && ds_arms+="$a "; done
 [[ -n "$ds_arms" ]] && python3 -I "$HERE/ab_requests.py" --acceptance "$OUT" $ds_arms | tee -a "$OUT/window.log"
 # Xd arms: each capture's share of draft selections the hot set its prompts' Dv arms use keeps at N = 8,
 # 16, 24 (held-out coverage when that hot set was written from the other prompt set's capture).
 for a in $ARMS; do
-  [[ "-$a-" == *-Xd-* && -f "$OUT/xstats-$a.json" ]] || continue
+  [[ "-$(arm_full "$a")-" == *-Xd-* && -f "$OUT/xstats-$a.json" ]] || continue
   h=$(hotset_for "$a")
   [[ -f "$h" ]] && python3 -I "$HERE/draft_hotset.py" cover "$h" "$OUT/xstats-$a.json" 8 16 24 | tee -a "$OUT/window.log"
   # A Dv arm with Xd: its capture, taken under the mask, must select only the first N of each list.
@@ -4598,7 +4612,7 @@ done
 # Df arms: gemm_nt_bf16f8 gives gemm_nt's bytes, so the drafter proposes the same tokens; each Df
 # arm's draft_n and draft_n_accepted must equal the same arm's without Df, as for Dk.
 for a in $ARMS; do
-  [[ "-$a-" == *-Df-* ]] || continue
+  [[ "-$(arm_full "$a")-" == *-Df-* ]] || continue
   b=$(sed -E 's/-Df(-|$)/\1/' <<< "$a")
   if [[ " $ARMS " != *" $b "* ]]; then log "draft stats: no arm $b in this window to hold $a to"; continue; fi
   log "draft stats: $a against $b"
@@ -4607,7 +4621,7 @@ done
 [[ " $ARMS" == *-Pc* ]] && python3 -I "$HERE/ab_requests.py" --ttft "$OUT" $ARMS | tee -a "$OUT/window.log"
 # The read-only capture must preserve the draft/acceptance counts of its otherwise identical arm.
 for a in $ARMS; do
-  [[ "-$a-" == *-Dpc-* ]] || continue
+  [[ "-$(arm_full "$a")-" == *-Dpc-* ]] || continue
   b=$(sed -E 's/-Dpc(-|$)/\1/' <<< "$a")
   if [[ " $ARMS " != *" $b "* ]]; then log "draft stats: no arm $b in this window to hold $a to"; continue; fi
   log "draft stats: read-only capture $a against $b"

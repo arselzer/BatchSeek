@@ -80,6 +80,7 @@ ARMS="$BASE $BA $BA128 $KLDOK $NOPF $NOLC $ONE $PC $PCN $BIG $BIGNOP1 $BIGLC $BI
   echo '{}' > "$OUT/kld-corpus.jsonl"   # a Kld arm's corpus already there (nothing to build)
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
   eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
+  eval "$(sed -n '/^ARM_PRESET_B2=/p;/^ARM_PRESET_B4=/p;/^arm_full() {/,/^}/p' "$W")"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
   s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)
   e=$(awk -v s="$s" 'NR > s && /^done$/ { print NR; exit }' "$W")
@@ -291,6 +292,7 @@ mkdir -p "$T/profiles"; echo '{}' > "$T/profiles/prof.json"
   echo 'p1tiled: PASS: ... equal to one launch, also with the tail filled once (54 cases)' > "$OUT/devcheck-p1tiled.log"
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
   eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
+  eval "$(sed -n '/^ARM_PRESET_B2=/p;/^ARM_PRESET_B4=/p;/^arm_full() {/,/^}/p' "$W")"
   eval "$(sed -n '/^launch_words() {/,/^}/p' "$W")"
   eval "$(sed -n '/^sb_check() {/,/^}/p' "$W")"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
