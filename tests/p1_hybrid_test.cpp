@@ -675,6 +675,10 @@ struct P1HybridProbe {
         CHECK_EQ(other.cpu_units, (uint64_t)0);
         /* In the prefill passes some CPU unit held more rows than a job takes: its rows went as several jobs. */
         if (prefill) CHECK(max_cpu_rows > HostExpertPool::max_rows());
+        /* The pool's own finish was read at each split layer's gather, within the submit-to-gather span. */
+        CHECK(mine.pool_layers > 0);
+        CHECK(mine.pool_ns <= mine.cpu_ns);
+        CHECK(mine.cost_bytes > 0);
         fs.hx_out_ev_ = nullptr;
         rad_event_destroy(ev);
         rad_stream_destroy(s);

@@ -5764,6 +5764,7 @@ bool FileStager::p1_hyb_borrow(int32_t u, int rows, bool admit) {
                 const int64_t c = HostExpertPool::cost_rows(std::max(rows, 1));
                 hx_pool_->reserve(c);
                 hx_reserved_ += c;
+                p1_hyb_cur().cost_bytes += c;
                 return true;
             }
             mover_->release_host_unit(&hu);
@@ -5781,6 +5782,7 @@ int FileStager::p1_hyb_submit(int32_t li) {
     hx_stage_ = 1;
     p1_hyb_li_ = li;
     p1_hyb_split_ = true;
+    hx_ticket_.last_ns.store(0, std::memory_order_relaxed);   /* p1_hyb_done reads the pool's finish */
     p1_hyb_t_sub_ = std::chrono::steady_clock::now();
     RAD_TRY(hx_submit());
     HybStats& hs = p1_hyb_cur();
@@ -5798,6 +5800,14 @@ void FileStager::p1_hyb_done(bool early, uint64_t waited_ns) {
     hs.cpu_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                      std::chrono::steady_clock::now() - p1_hyb_t_sub_).count();
     hs.wait_ns += waited_ns;
+    /* The pool's own finish (the ticket is done: hx_finish waited for it). */
+    const int64_t sub = (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            p1_hyb_t_sub_.time_since_epoch()).count();
+    const int64_t fin = hx_ticket_.last_ns.load(std::memory_order_relaxed);
+    if (fin > 0) {
+        hs.pool_ns += (uint64_t)std::max<int64_t>(fin - sub, 0);
+        ++hs.pool_layers;
+    }
     const bool late = !early && p1_hyb_rec_ && rad_event_query(p1_hyb_ev_) == 1;
     if (early) ++hs.early;
     if (late) {
@@ -5999,13 +6009,16 @@ std::string FileStager::p1_stats_line() const {
         line += fmt("; hybrid: passes split %llu of %llu armed, layers %llu, units CPU %llu / card %llu (fell back %llu, "
                     "layers without rows %llu, rows at the other arena level %llu), CPU rows %llu, CPU %.3f s (%.4f s a pass) against issue %.4f s a pass, "
                     "predicted CPU %.3f s / card %.3f s, gather wait %.3f s, late layers %llu (wait %.3f s), early layers "
-                    "%llu, share %.1f%% (lowest %.1f%%)",
+                    "%llu, share %.1f%% (lowest %.1f%%), pool done %.3f s after the submits (%.4f s a pass, %llu layers), "
+                    "cost %.1f GB",
                     (unsigned long long)h.passes, (unsigned long long)h.armed, (unsigned long long)h.layers,
                     (unsigned long long)h.cpu_units, (unsigned long long)h.card_units, (unsigned long long)h.fell_back,
                     (unsigned long long)h.no_rows, (unsigned long long)h.other_level, (unsigned long long)h.cpu_rows, (double)h.cpu_ns * 1e-9,
                     (double)h.cpu_ns * per, (double)p1_dec_ns_ * per, h.pred_cpu_ns * 1e-9, h.pred_card_ns * 1e-9,
                     (double)h.wait_ns * 1e-9, (unsigned long long)h.late, (double)h.late_wait_ns * 1e-9,
-                    (unsigned long long)h.early, 100.0 * p1_hyb_share_.share(), 100.0 * p1_hyb_share_.min_seen());
+                    (unsigned long long)h.early, 100.0 * p1_hyb_share_.share(), 100.0 * p1_hyb_share_.min_seen(),
+                    (double)h.pool_ns * 1e-9, (double)h.pool_ns * per, (unsigned long long)h.pool_layers,
+                    (double)h.cost_bytes * 1e-9);
     }
     /* ..._P1_HYBRID_PREFILL: the same for armed prefill passes (ab_window.sh's Qyp arm is measured only if some rank
      * split one); the issue time is the armed prefill passes' own. */
@@ -6015,14 +6028,16 @@ std::string FileStager::p1_stats_line() const {
         line += fmt("; hybrid prefill: passes split %llu of %llu armed, layers %llu, units CPU %llu / card %llu (fell back "
                     "%llu, layers without rows %llu, rows at the other arena level %llu), CPU rows %llu, CPU %.3f s (%.4f s "
                     "a pass) against issue %.4f s a pass, predicted CPU %.3f s / card %.3f s, gather wait %.3f s, late "
-                    "layers %llu (wait %.3f s), early layers %llu, share %.1f%% (lowest %.1f%%)",
+                    "layers %llu (wait %.3f s), early layers %llu, share %.1f%% (lowest %.1f%%), pool done %.3f s after "
+                    "the submits (%.4f s a pass, %llu layers), cost %.1f GB",
                     (unsigned long long)h.passes, (unsigned long long)h.armed, (unsigned long long)h.layers,
                     (unsigned long long)h.cpu_units, (unsigned long long)h.card_units, (unsigned long long)h.fell_back,
                     (unsigned long long)h.no_rows, (unsigned long long)h.other_level, (unsigned long long)h.cpu_rows,
                     (double)h.cpu_ns * 1e-9, (double)h.cpu_ns * per, (double)h.issue_ns * per, h.pred_cpu_ns * 1e-9,
                     h.pred_card_ns * 1e-9, (double)h.wait_ns * 1e-9, (unsigned long long)h.late,
                     (double)h.late_wait_ns * 1e-9, (unsigned long long)h.early, 100.0 * p1_hyb_pf_share_.share(),
-                    100.0 * p1_hyb_pf_share_.min_seen());
+                    100.0 * p1_hyb_pf_share_.min_seen(), (double)h.pool_ns * 1e-9, (double)h.pool_ns * per,
+                    (unsigned long long)h.pool_layers, (double)h.cost_bytes * 1e-9);
     }
     return line;
 }

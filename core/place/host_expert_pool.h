@@ -139,6 +139,10 @@ public:
     /* The jobs one caller waits for: submit adds them, the pool counts them down. */
     struct Ticket {
         std::atomic<int> left{ 0 };
+        /* steady_clock ns at which the latest of its jobs finished (raised before each job's count goes
+         * down, so a waiter that saw `left` reach 0 sees the last one); stats only, 0 until one does.
+         * The caller resets it before a submit it wants timed. */
+        std::atomic<int64_t> last_ns{ 0 };
     };
 
     /* The process's pool, started on the first call from the environment. Null when off, or when

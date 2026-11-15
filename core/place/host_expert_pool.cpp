@@ -613,6 +613,11 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
         active_[i / 64].fetch_and(~((uint64_t)1 << (i % 64)), std::memory_order_relaxed);
     }
     s.state.store(0, std::memory_order_release);
+    {   /* Ticket::last_ns: the latest finish, before the count that may release the waiter */
+        const int64_t fin = now_ns();
+        int64_t prev = t->last_ns.load(std::memory_order_relaxed);
+        while (prev < fin && !t->last_ns.compare_exchange_weak(prev, fin, std::memory_order_relaxed)) {}
+    }
     t->left.fetch_sub(1, std::memory_order_acq_rel);
     slot_cv_.notify_one();
     /* quiet_after_tickets: the ticket's waiter goes on first. The job is work() until its ticket is

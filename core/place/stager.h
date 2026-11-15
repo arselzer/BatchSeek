@@ -908,6 +908,10 @@ private:
         uint64_t cpu_rows = 0, cpu_ns = 0, wait_ns = 0, late = 0, late_wait_ns = 0, early = 0;
         double   pred_cpu_ns = 0, pred_card_ns = 0;
         uint64_t issue_ns = 0;      /* prefill only: the armed passes' issue time (decode's is p1_dec_ns_) */
+        /* The pool's own finish: submit to the layer's last job done (HostExpertPool::Ticket::last_ns), which
+         * cpu_ns (submit to the gather's wait) bounds from above; and the cost the taken units reserved. */
+        uint64_t pool_ns = 0, pool_layers = 0;
+        int64_t  cost_bytes = 0;
     } p1_hyb_st_, p1_hyb_pf_st_;   /* decode passes', and (..._P1_HYBRID_PREFILL) prefill passes' */
     HybStats& p1_hyb_cur() { return p1_decode_pass_ ? p1_hyb_st_ : p1_hyb_pf_st_; }
     /* Whether an armed pass may split, from its kind and the two switches (the event is the switches' common
