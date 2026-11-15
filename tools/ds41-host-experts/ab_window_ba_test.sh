@@ -79,6 +79,7 @@ ARMS="$BASE $BA $BA128 $KLDOK $NOPF $NOLC $ONE $PC $PCN $BIG $BIGNOP1 $BIGLC $BI
   OUT=$T/out; mkdir -p "$OUT"; CANCEL_FILE=/nonexistent/cancel; CANCEL=$CANCEL_FILE
   echo '{}' > "$OUT/kld-corpus.jsonl"   # a Kld arm's corpus already there (nothing to build)
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
+  eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
   s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)
   e=$(awk -v s="$s" 'NR > s && /^done$/ { print NR; exit }' "$W")
@@ -289,6 +290,7 @@ mkdir -p "$T/profiles"; echo '{}' > "$T/profiles/prof.json"
   echo 'p1: PASS: ... splits and full/span SwiGLU waves of 1-3 equal to one launch, also with the tail filled once (52 cases)' > "$OUT/devcheck-p1.log"
   echo 'p1tiled: PASS: ... equal to one launch, also with the tail filled once (54 cases)' > "$OUT/devcheck-p1tiled.log"
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
+  eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
   eval "$(sed -n '/^launch_words() {/,/^}/p' "$W")"
   eval "$(sed -n '/^sb_check() {/,/^}/p' "$W")"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)

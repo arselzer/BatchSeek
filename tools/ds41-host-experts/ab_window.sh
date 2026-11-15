@@ -1854,7 +1854,10 @@ if [[ "$("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null
   log "QFN ($NAME) is not running before the window; not starting one"; exit 4
 fi
 log "waiting for 30 s of QFN idleness"
-if ! idle_for 30 600; then log "QFN not idle within 10 min; no window"; exit 3; fi
+# QFN_FORCE_STOP=1 (the owner's go to stop production even while it serves): skip the 30-s idleness wait; the stop
+# below still lets running requests drain for up to 60 s and the restore brings production back.
+if [[ "${QFN_FORCE_STOP:-0}" == 1 ]]; then log "QFN_FORCE_STOP=1: not waiting for QFN idleness"
+elif ! idle_for 30 600; then log "QFN not idle within 10 min; no window"; exit 3; fi
 "${DOCKER[@]}" inspect "$NAME" --format 'before: {{.Id}} {{.State.Status}} {{.State.StartedAt}} {{.Config.Image}}' >>"$OUT/window.log" 2>&1
 trap restore EXIT
 trap 'exit 130' INT TERM HUP
@@ -3023,6 +3026,17 @@ fi
 
 HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
 CANCEL=${CANCEL_FILE:-/home/as/ds41-claude-build/work/cancel_window}
+
+# A chain trace's file base: chain-<arm>, or chain-<sha1 of the arm, 16 hex> when chain-<arm>.stamps.csv would pass the
+# file system's 255-byte name limit (the engine drops a trace it cannot open); the long form is noted in chain-names.txt.
+trace_base() {   # arm
+  local b="chain-$1"
+  if (( ${#b} + 11 > 255 )); then
+    b="chain-$(printf '%s' "$1" | sha1sum | cut -c1-16)"
+    printf '%s %s\n' "$b" "$1" >> "$OUT/chain-names.txt"
+  fi
+  printf '%s' "$b"
+}
 for a in $ARMS; do
   if [[ -e "$CANCEL" ]]; then log "cancel file $CANCEL present; skipping the remaining arms"; break; fi
   # An arm is POLICY[-tN][-gG][-sS][-nP][-mM][-MR][-f][-x]: policy base, verify, greedy or all; N CPU
@@ -3497,12 +3511,12 @@ for a in $ARMS; do
                  log "arm $a: $p: CtpN takes a positive N; the arm is skipped"; skip=1
                else
                  env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL=$((10#$ctp))
-                       RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_OUT=$(cd "$OUT" && pwd)/chain-$a)
+                       RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_OUT=$(cd "$OUT" && pwd)/$(trace_base "$a"))
                fi ;;
       Ct|Ct[0-9]*)
                ct=${p#Ct}
                env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE=${ct:-16}
-                     RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_OUT=$(cd "$OUT" && pwd)/chain-$a) ;;
+                     RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_OUT=$(cd "$OUT" && pwd)/$(trace_base "$a")) ;;
       Ei)      env+=(RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1) ;;      # routed card ops ahead of the counts sync
       Ss)      env+=(RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1) ;;   # no pass behind a reply's last token
       Xt)      xt=1 ;;                                                 # exact tall passes (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1)

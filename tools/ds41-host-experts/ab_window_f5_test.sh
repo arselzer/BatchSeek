@@ -42,6 +42,7 @@ DUP=$POST-F5warm
   BAL_OK=1 BAL_SUM=$SUM BAL_LIB=$LIB BAL_MAX_M=2048 P1_OK=1 P1_SUM=$SUM P1_LIB=$LIB
   ARMS="$PLAIN $POST $WARM $BADU $BADN $BADK $BADC $SHORT $DUP"
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
+  eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
   s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)
   e=$(awk -v s="$s" 'NR > s && /^done$/ { print NR; exit }' "$W")
   eval "$(sed -n "${s},${e}p" "$W")"
