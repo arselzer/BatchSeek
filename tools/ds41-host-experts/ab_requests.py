@@ -2,7 +2,9 @@
 
   ab_requests.py RECEIPT URL N OUT.json   send the first N held-out requests of RECEIPT (the loop's
                                           receipt.json) to URL, one at a time (AB_CONCURRENCY=K:
-                                          in waves of K at once); save each response
+                                          in waves of K at once; AB_REFILL=G with it: a pool of
+                                          K in flight, refilled whenever G slots are free); save
+                                          each response
   ab_requests.py --before RECEIPT N K MAIN_RECEIPT URL MAIN_N OUT.json
                                           run the first receipt, then the main receipt on the same
                                           server; save the first phase as OUT.before.json, with its
@@ -119,6 +121,50 @@ def request_timeout():
     if not (math.isfinite(t) and t > 0):
         raise ValueError("AB_REQUEST_TIMEOUT_S=%r is not a positive number of seconds" % v)
     return t
+
+
+def refill_of(k):
+    """AB_REFILL=G: the requests run as a pool of k in flight, refilled whenever G of its slots are
+    free (G=1: each request as soon as one ends, as batch_client.py sends them); unset or empty: the
+    waves of k (the next wave after the last of the previous one ends). Pool mode changes only when
+    requests are sent, never what they are; G must be 1..k. Anything else raises ValueError."""
+    v = os.environ.get("AB_REFILL", "").strip()
+    if not v:
+        return 0
+    if not v.isdigit() or not 1 <= int(v) <= k:
+        raise ValueError("AB_REFILL=%r: a pool refills 1..%d slots at a time (AB_CONCURRENCY=%d)" % (v, k, k))
+    return int(v)
+
+
+def pool(reqs, url, k, g, timeout, rows):
+    """AB_REFILL's pool: reqs in order, at most k in flight, the next ones sent when g slots are free
+    (or nothing is in flight). Each row gets sent_s, its send time from the pool's start."""
+    cv = threading.Condition()
+    live = [0]
+    t0 = time.time()
+
+    def go(i, sent):
+        r = one(reqs[i], url, {}, timeout)
+        r["sent_s"] = sent
+        with cv:
+            rows[i] = r
+            live[0] -= 1
+            cv.notify()
+    th, i = [], 0
+    with cv:
+        while i < len(reqs):
+            while live[0] > 0 and k - live[0] < g:
+                cv.wait()
+            take = min(k - live[0], len(reqs) - i)
+            for j in range(i, i + take):
+                x = threading.Thread(target=go, args=(j, time.time() - t0))
+                live[0] += 1
+                x.start()
+                th.append(x)
+            i += take
+    for x in th:
+        x.join()
+    return time.time() - t0
 
 
 # DeepSeek-V4.1's chat tokens, as the held-out prompts use them.
@@ -270,9 +316,23 @@ def run(receipt, url, n, out, concurrency=None, phase=None):
         sys.exit("ab_requests.py: %s" % e)
     if os.environ.get("AB_REQUEST_TIMEOUT_S", "").strip():
         print("requests time out after %g s (AB_REQUEST_TIMEOUT_S)" % timeout, flush=True)
+    try:
+        g = refill_of(k) if k > 1 else 0
+    except ValueError as e:
+        sys.exit("ab_requests.py: %s" % e)
     rows, waves = [None] * len(reqs), []
+    if g:
+        dep = [b["name"] for b in reqs
+               if any("assistant_from" in t for t in b["request"].get("chat_turns") or [])]
+        if dep:
+            sys.exit("ab_requests.py: AB_REFILL=%d: %s send back earlier replies (assistant_from), which "
+                     "a pool cannot order; run them in waves" % (g, ", ".join(dep[:3])))
+        print("requests: a pool of %d in flight, refilled %d at a time (AB_REFILL)" % (k, g), flush=True)
+        wall = pool(reqs, url, k, g, timeout, rows)
+        waves.append({"wall_s": wall, "tokens": sum((r["timings"].get("predicted_n") or 0) for r in rows),
+                      "refill": g})
     replies = {}   # earlier requests' rows by name, for chat_turns' assistant_from
-    for w in range(0, len(reqs), k):
+    for w in range(0, len(reqs) if not g else 0, k):
         idx = list(range(w, min(len(reqs), w + k)))
         t0 = time.time()
         if k == 1:
@@ -290,7 +350,9 @@ def run(receipt, url, n, out, concurrency=None, phase=None):
                       "tokens": sum((rows[i]["timings"].get("predicted_n") or 0) for i in idx)})
     if k > 1:
         tok = sum(x["tokens"] for x in waves); wall = sum(x["wall_s"] for x in waves)
-        print("aggregate: %d tokens in %.1f s of waves of %d: %.2f tok/s" % (tok, wall, k, tok / wall if wall else 0.0), flush=True)
+        print("aggregate: %d tokens in %.1f s of %s %d: %.2f tok/s" % (
+            tok, wall, "a pool (refilled %d at a time) of" % g if g else "waves of", k, tok / wall if wall else 0.0),
+            flush=True)
     # The receipt's own count of each prompt (provenance, the model's tokenizer) beside the server's.
     want = {q.get("name"): q.get("prompt_tokens")
             for q in ((rec.get("provenance") or {}).get("requests") or []) if isinstance(q, dict)}
@@ -308,6 +370,8 @@ def run(receipt, url, n, out, concurrency=None, phase=None):
     except Exception as e:
         stats = {"error": repr(e)}
     result = {"requests": rows, "waves": waves, "concurrency": k, "request_timeout_s": timeout, "stats": stats}
+    if g:
+        result["refill"] = g
     if phase is not None:
         result["phase"] = dict(phase, client_wall_s=time.time() - phase_start)
     with open(out, "w") as f:

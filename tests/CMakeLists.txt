@@ -533,6 +533,14 @@ set_tests_properties(ab_window_n128_test PROPERTIES LABELS "unit;fast" TIMEOUT $
 add_test(NAME ab_window_sl_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_sl_test.sh)
 set_tests_properties(ab_window_sl_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+# ab_window.sh's CrG part (the arm's requests as a pool refilled G at a time, AB_REFILL) and ab_requests.py's
+# pool: the request-json gate, the launch stating AB_REFILL in every arm, the arm loop; the pool's sends.
+add_test(NAME ab_window_cr_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_cr_test.sh)
+set_tests_properties(ab_window_cr_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+add_test(NAME ab_requests_refill_test COMMAND python3 -I ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_requests_refill_test.py)
+set_tests_properties(ab_requests_refill_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 # ab_window.sh's P1 parts (P1, QmN, QlK, QhMS): the server-log gate on synthetic logs and the arm loop with
 # every action stubbed. No card, no server, no model.
 add_test(NAME ab_window_p1_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_p1_test.sh)
