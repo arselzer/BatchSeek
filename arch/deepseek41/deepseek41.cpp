@@ -56,6 +56,9 @@
 /* And rad_declare_two_batch (RADIANCE_EXPERIMENTAL_SCHED_TBO, core/sched/tbo.h): null on an engine
  * older than the split, which then never splits a step. */
 #pragma weak rad_declare_two_batch
+/* And rad_row_read_ahead (RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY): null on an engine older than
+ * the call, which then reads no Engram rows early. */
+#pragma weak rad_row_read_ahead
 
 namespace deepseek41 {
 using namespace rad::arch;
@@ -89,6 +92,12 @@ static constexpr const char* kDenseF8 = "gemm_nt_bf16f8";
 static bool router_bf16_on() {
     const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16");
     return s && !std::strcmp(s, "1");
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY=1: Model::engram_early. */
+static bool engram_early_on() {
+    const char* v = std::getenv("RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY");
+    return v && std::strcmp(v, "1") == 0;
 }
 
 /* Whether libr4d gives a row of every op on the compressor tail's work rows (qsa_work, softmax_pool,
@@ -664,6 +673,17 @@ struct Model {
      * rank issued split (rad_plugin_close's report). */
     bool tbo = false;
     uint64_t tbo_steps = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY=1, read at declare (engram_early_on): right after an
+     * Engram layer's host gather, the next Engram layer's table rows are asked for on the core's
+     * helper thread (rad_row_read_ahead), each rank its 1/world of the step's rows (the ranks share
+     * the mapping's page cache), so the drive reads them while the card runs the layers between.
+     * The gather itself, its ids, tables, rows and order are unchanged: the call only advises
+     * pages. And what this rank asked (rad_plugin_close's report): started, nothing to ask for
+     * (no mapped table, recording, a slice with no rows), refused (a malformed call). */
+    bool engram_early = false;
+    struct EarlyStats {
+        uint64_t started = 0, none = 0, refused = 0, skipped = 0;
+    } eas;
     /* The consumer skip (cut_declare): declared, at boundary `cut_b`; and what this rank's cut
      * passes ran (rad_plugin_close's report): passes cut, layer-passes in full, key ops alone,
      * skipped. Only this rank's thread writes them. */
@@ -2799,6 +2819,23 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         fprintf(stderr, "radiance: deepseek41: two-batch overlap (RADIANCE_EXPERIMENTAL_SCHED_TBO=1): a "
                         "decode step of two or more sequences is issued as two micro-batches, each "
                         "layer's MoE gather of one behind the other's card work\n");
+    m.engram_early = false;
+    if (engram_early_on()) {
+        if (m.c.ple.empty() || !rad_row_read_ahead) {
+            if (ctx->rank == 0 && !m.probe)
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY=1, but %s: "
+                                "no Engram rows are read early\n",
+                        m.c.ple.empty() ? "this checkpoint has no Engram layers"
+                                      : "this engine does not carry rad_row_read_ahead");
+        } else {
+            m.engram_early = true;
+            if (ctx->rank == 0 && !m.probe)
+                fprintf(stderr, "radiance: deepseek41: Engram rows early (RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY=1): "
+                                "after each Engram layer's host gather the next one's table rows are "
+                                "asked for on a helper thread, each rank 1/%d of the step's rows; the "
+                                "gathers themselves are unchanged\n", (int)ctx->world_size);
+        }
+    }
     m.router_bf16 = router_bf16_on();
     if (m.router_bf16 && !rad_op_declared(b, "gemm_nt_f32bf16")) {
         fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1 needs "
@@ -3366,6 +3403,52 @@ static void step(RadCtx* x, const RadBatch* batch) {
      * 0 .. sv); the attention's own scratch (the compressor's rows, the index scores) starts at row
      * 0, as in a step of its rows alone, since each micro-batch's attention runs whole between the
      * other's segments. */
+    /* RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY (Model::engram_early): behind Engram layer `l`'s
+     * host gather, the next Engram layer's table rows on the core's helper thread, once a step
+     * (a split step gathers each layer twice). Every row of the step: the gather of an Engram layer
+     * runs on all of them in every view (a cut or per-row cut never reaches past the boundary, at
+     * or above every Engram layer; a layer the pass does not reach is not asked for). This rank
+     * asks for its 1/world of them. Advice only: the gathers read the same rows either way. */
+    uint64_t ea_done = 0;
+    const auto engram_ahead = [&](int l) {
+        if (!m.engram_early) return;
+        const Layer* N = nullptr;
+        for (const auto& K : m.layers)
+            if (K.l > l && K.e_ids) { N = &K; break; }
+        if (!N || N->l >= 64 || (ea_done >> N->l & 1u)) return;
+        ea_done |= (uint64_t)1 << N->l;
+        const int nl = N->l;
+        if ((cut_full && nl > cut_full) || (row0 && nl > m.cut_b && row0[nl - 1] >= T)) {
+            ++m.eas.skipped;
+            return;
+        }
+        const int W = std::max(1, rad_world_size(x)), rk = rad_rank(x);
+        const int64_t r0 = T * rk / W, r1 = T * (rk + 1) / W;
+        if (r1 <= r0) { ++m.eas.none; return; }
+        const int pi = c.ple_index(nl);
+        if (m.local_engram && (pi < 0 || pi >= int(sizeof(m.ista_tables) / sizeof(m.ista_tables[0])))) {
+            ++m.eas.refused;
+            return;
+        }
+        const auto* et = m.local_engram ? &m.ista_tables[pi] : nullptr;
+        const int64_t egroup = et ? et->group : m.ple_group;
+        const int64_t H = c.ple_heads;
+        const RadOperand ids = brow_slice(N->ids, r0, r1 - r0, H);
+        int rc;
+        if (egroup > 0) {
+            const rad_weight etab = et ? et->tab : m.ple_tab;
+            const RadOperand o[5] = { ids, RAD_W(et ? et->codes : m.ple_codes),
+                                      RAD_W(et ? et->scale : m.ple_scale),
+                                      etab ? RAD_W(etab) : RAD_NONE, RAD_NONE };
+            rc = rad_row_read_ahead(x, N->e_emb, o, 5, (r1 - r0) * H);
+        } else {
+            const RadOperand o[3] = { ids, RAD_W(et ? et->plain : m.ple_table), RAD_NONE };
+            rc = rad_row_read_ahead(x, N->e_emb, o, 3, (r1 - r0) * H);
+        }
+        if (rc > 0) ++m.eas.started;
+        else if (rc == 0) ++m.eas.none;
+        else ++m.eas.refused;
+    };
     struct View {
         bool full = true;
         int64_t rb = 0, te = 0, sb = 0, sv = 0;
@@ -3434,6 +3517,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
                             etab ? RAD_W(etab) : RAD_NONE, VR(m.emb, H * c.ple_dim));
             else
                 RAD_ISSUE_N(x, L.e_emb, nv * H, VR(L.ids, H), RAD_W(eplain), VR(m.emb, H * c.ple_dim));
+            engram_ahead(l);
             RAD_ISSUE_N(x, L.e_copy, nv, VR(m.emb, H * c.ple_dim), VR(m.embd, H * c.ple_dim));
             /* This layer's own reads go right behind its Engram GEMM, which would have evicted
              * them (..._PREFETCH_ENGRAM=1): beside the all_gather of the split rows, the gate and
@@ -3909,6 +3993,18 @@ static void pf_report() {
 
 /* The consumer skip's shutdown line, a line a rank (Model::CutStats): what its cut passes issued,
  * which the engine's own "consumer skip:" line counts from the batches; the two agree. */
+/* RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY's shutdown line, a line a rank (Model::EarlyStats). */
+static void engram_early_report() {
+    for (int r = 0; r < MAX_RANKS; ++r) {
+        const Model* m = models[r].get();
+        if (!m || !m->engram_early) continue;
+        std::fprintf(stderr, "radiance: deepseek41: rank %d: Engram rows early: %llu read-aheads started, "
+                             "%llu with nothing to ask for, %llu past the pass's last layer, %llu refused\n",
+                     r, (unsigned long long)m->eas.started, (unsigned long long)m->eas.none,
+                     (unsigned long long)m->eas.skipped, (unsigned long long)m->eas.refused);
+    }
+}
+
 /* The two-batch overlap's shutdown line, a line a rank: the steps step() issued split. */
 static void tbo_report() {
     for (int r = 0; r < MAX_RANKS; ++r) {
@@ -3950,5 +4046,6 @@ extern "C" void rad_plugin_close(void) {
     deepseek41::pf_report();
     deepseek41::cut_report();
     deepseek41::tbo_report();
+    deepseek41::engram_early_report();
 }
 #endif

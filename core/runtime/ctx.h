@@ -402,6 +402,12 @@ public:
     /* Of the calls, those whose read-ahead ran beside the kernel (runtime/rowprefetch.h). */
     int64_t     row_prefetch_beside_calls() const { return rowpf_beside_calls_; }
     bool        row_prefetch_busy() const { return rowpf_worker_ && rowpf_worker_->busy(); }
+    /* rad_row_read_ahead: a later host gather's rows asked for early, on their own helper thread
+     * (rowpf_early_), and the pages that helper advised; tests read them. */
+    int         row_read_ahead(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
+    int64_t     row_early_calls() const { return rowpf_early_calls_; }
+    int64_t     row_early_pages() const { return rowpf_early_pages_; }
+    bool        row_early_busy() const { return rowpf_early_ && rowpf_early_->busy(); }
     /* This rank's all-reduce traffic. The inter-card link carries both the tensor-parallel
      * all-reduce and the expert mover's transfers; the mover counts its own (MoverStats), so the
      * two can be told apart.
@@ -807,6 +813,13 @@ private:
     int64_t   rowpf_calls_ = 0, rowpf_pages_ = 0, rowpf_beside_calls_ = 0;
     std::unique_ptr<RowPrefetchWorker> rowpf_worker_;
     bool      rowpf_beside_ = false;   /* a read-ahead runs beside the kernel being launched */
+    /* rad_row_read_ahead's helper: one job at a time, stopped (row_early_done) before any host
+     * row gather runs its own read-ahead, at the end of the step and on abort, since its ids are
+     * a buffer the next step rewrites. */
+    std::unique_ptr<RowPrefetchWorker> rowpf_early_;
+    bool      rowpf_early_live_ = false;
+    int64_t   rowpf_early_calls_ = 0, rowpf_early_pages_ = 0;
+    void      row_early_done();
     void      row_prefetch_plan(const RadArgs& a, const RadOperand* opd, int n_opd,
                                 const RadTensor* t, RowPrefetch* out) const;
     void      row_prefetch_run(const RowPrefetch& rp, const RadTensor* t, int64_t n);

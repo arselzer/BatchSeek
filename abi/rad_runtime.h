@@ -957,6 +957,16 @@ int rad_expert_prefetch_mark(RadCtx* c);
 /* Ahead of `layer`'s routed GEMMs, on every routed layer of every pass. */
 int rad_expert_prefetch_step(RadCtx* c, int layer);
 
+/* A later host row gather's table rows (embed_lookup, embed_lookup_q, embed_lookup_planes,
+ * embed_lookup_ggml on the mapped tier), asked for now on a helper thread, as that gather's own
+ * issue would ask for them (runtime/rowprefetch.h), so the reads overlap the work issued until
+ * then. `op`, `opd` and `n` are the gather's issue (any subset of its ids' rows; the output may be
+ * RAD_NONE); nothing is launched or written, so the gather's bytes cannot change. The ids must stay
+ * unwritten until the step ends; the helper stops before any host row gather runs and at the end
+ * of the step. Returns 1 started, 0 nothing to ask for (off, recording a pass, the op not on the
+ * host, no mapped table), < 0 a malformed call. */
+int rad_row_read_ahead(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd, int64_t n);
+
 /* A weight's pointer, for the rare plugin-private kernel invoked outside the op vocabulary. Waits
  * on the mover. The weight may move afterwards, so the pointer is valid only within one issue. */
 void* rad_weight_ptr(RadCtx* c, rad_weight w);

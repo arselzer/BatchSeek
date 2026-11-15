@@ -143,6 +143,7 @@ plus 3.2 KB a token), so the cards hold 256 sequences. Every row below has repli
 | the same with `--checkpoint-slots 128` | 331 s | 132.7 | 160 s |
 | four cards, `--checkpoint-slots 128`, hybrid decode `Qy60`, `--max-seq-len 4096` (ab-20261115T070032Z control) | 287 s | 195.8 | 171 s |
 | **+ tiled prefill twin `Qsp-Qt-Qz`** (same window) | **250 s** | **202.6** | **138 s** |
+| + Engram early read-ahead `Ee` (ab-20261115T173507Z, A-B-B-A; server step time 266.5 -> 250.3 s, replies 256/256 identical) | -6.1% | 201 | -10% |
 
 Recommended for batch jobs, on top of the configuration below: `RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=1` with an
 explicit cache cap, the prefix cache with shared heads at a 32-token floor (`RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=32`) and

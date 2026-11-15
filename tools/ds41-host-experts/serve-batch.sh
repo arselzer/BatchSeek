@@ -19,13 +19,15 @@
 #   - --tiled (Qt, ..._P1_TILED), --tail-once (Qz, ..._P1_TAIL_ONCE) and --swiglu-span (Qsp, ..._P1_SWIGLU_SPAN): the
 #     prefill Phase 1 twin's variants, on by default: exact, prefill -19% and 256 NL-SQL 287 -> 250 s with hybrid
 #     decode (window ab-20261115T070032Z); give 0 to turn one off.
+#   - --engram-early (Ee, RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY=1): the next Engram layer's table rows read ahead; on by
+#     default (exact, 256 NL-SQL 266 -> 250 s in an A-B-B-A, window ab-20261115T173507Z); --engram-early 0 turns it off.
 #   - --served-model-name ds41 (a name only; --served-name sets another) and --radiance-home only when given
 #     (RADIANCE_HOME otherwise).
 #
 # Usage: serve-batch.sh --model MODEL.rad --silu-table FILE [--streams 256] [--port 8000] [--reserve-mib N]
 #                       [--ctx-per-stream 1152] [--profile FILE] [--mirror DIR] [--shared-head 32] [--served-name ds41]
 #                       [--radiance-home DIR] [--hybrid 60] [--max-seq-len N] [--tiled 0|1] [--tail-once 0|1]
-#                       [--swiglu-span 0|1] [--dry-run]
+#                       [--swiglu-span 0|1] [--engram-early 0|1] [--dry-run]
 #                       [-- more radiance flags, e.g. --expert-stats FILE to record a profile; outside the measured set]
 #   RADIANCE_BIN (default: radiance on PATH, else build/bin/radiance), RADIANCE_HOME as for any radiance run.
 # --dry-run prints the environment and the command and starts nothing. Otherwise the script becomes the server (exec:
@@ -33,7 +35,7 @@
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
-EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1
+EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1
 while (( $# )); do
   case $1 in
     --model) MODEL=${2:?}; shift ;;
@@ -51,6 +53,7 @@ while (( $# )); do
     --max-seq-len) SEQLEN=${2:?}; shift ;;
     --tiled) TILED=${2:?}; shift ;;
     --tail-once) TAILONCE=${2:?}; shift ;;
+    --engram-early) ENGEARLY=${2:?}; shift ;;
     --swiglu-span) SPAN=${2:?}; shift ;;
     --dry-run) DRY=1 ;;
     --) shift; EXTRA=("$@"); break ;;
@@ -66,7 +69,7 @@ num --streams "$STREAMS" 1; num --port "$PORT" 1; num --ctx-per-stream "$CTX" 1;
 [[ -z "$RESERVE" ]] || num --reserve-mib "$RESERVE" 1024
 num --hybrid "$HYBRID" 0; (( 10#$HYBRID <= 400 )) || die "--hybrid takes 0 (off) or a share of 1-400 percent, not '$HYBRID'"
 [[ -z "$SEQLEN" ]] || num --max-seq-len "$SEQLEN" 64
-for v in "--tiled $TILED" "--tail-once $TAILONCE" "--swiglu-span $SPAN"; do
+for v in "--tiled $TILED" "--tail-once $TAILONCE" "--swiglu-span $SPAN" "--engram-early $ENGEARLY"; do
   [[ ${v#* } == [01] ]] || die "${v% *} takes 0 or 1, not '${v#* }'"
 done
 STREAMS=$((10#$STREAMS)) CTX=$((10#$CTX))
@@ -219,6 +222,8 @@ ENV=(
 )
 # mAN: the RAM budget's reserve (the engine's default 10240 MiB without it).
 [[ -n "$RESERVE" ]] && ENV+=(RADIANCE_EXPERIMENTAL_DS41_RAM_RESERVE_MIB=$((10#$RESERVE)))
+# Ee: the next Engram layer's rows read ahead (exact; window ab-20261115T173507Z: -6.1%); the harness states it only when on.
+(( ENGEARLY == 1 )) && ENV+=(RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY=1)
 
 # The KV pool: --max-model-len is the pool the streams share, streams x tokens a stream (prompt plus reply). The
 # measured arms: 256 x 1152 = 294912 and 128 x 1152 = 147456 for prompts of about 1K tokens and 128-token replies.

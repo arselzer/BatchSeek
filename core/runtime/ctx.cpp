@@ -25,6 +25,7 @@ int Ctx::quiesce_for_backing() {
     if (!program_ || !stream_ || rec_) return RAD_E_STATE;
     RAD_TRY(rad_dev_set(device_));
     row_prefetch_done();
+    row_early_done();
     const int lane_status = lane1_ ? rad_stream_sync(lane1_) : RAD_OK;
     const int main_status = rad_stream_sync(stream_);
     return lane_status < 0 ? lane_status : main_status;
@@ -75,7 +76,9 @@ void Ctx::shutdown() {
     oracle_close();
     xp_close();
     row_prefetch_done();
+    row_early_done();
     rowpf_worker_.reset();   /* joins the read-ahead helper, if one started */
+    rowpf_early_.reset();
     /* Teardown sync, before freeing memory the streams may still use: the routing staging is the
      * destination of unwaited copies (spec §5.5) and the arena holds every kernel's operands. */
     if (stream_) rad_stream_sync(stream_);
@@ -1544,6 +1547,8 @@ int Ctx::run_step(const RadBatch* b) {
         const int rc = run_pass(b);
         if (rc < 0 && step_status_ >= 0) step_status_ = rc;
     }
+    /* An early read-ahead the pass left running reads ids the next step rewrites. */
+    row_early_done();
 
     /* Always join lane 1 back into lane 0 before the step ends: the engine syncs only the
      * compute stream, so work left on lane 1 could be read by the sampler or freed while in

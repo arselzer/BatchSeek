@@ -26,11 +26,13 @@
 # Phase 1's lent arena) on it: the real declare's graph at fewer rows, and the arena levels' sizes.
 # ds41_work_rows_arch_test is deepseek41's compressor tail at the rows a step needs (work_rows) on it:
 # the bound, the same bytes at either bound on host forms of the ops, and the recorded passes' key.
+# ds41_engram_early_arch_test is deepseek41's early Engram read-ahead (RADIANCE_EXPERIMENTAL_DS41_
+# ENGRAM_EARLY, rad_row_read_ahead) on it: no issue changes on any kind of pass, one read-ahead.
 set(RAD_TESTS_NO_CORE kv_growth_test arch_test glm5next_test nemotron35_test mapped_slab_pregrow_test draft_policy_test ds41_prefetch_arch_test
                       ds41_prefetch_plan_test ds41_consumer_skip_arch_test consumer_skip_test
                       ds41_dspark_fp8_arch_test ds41_tbo_arch_test ds41_dspark_defer_arch_test
                       ds41_shape_probe_arch_test ds41_work_rows_arch_test ds41_ar_rows_arch_test ds41_ag_rows_arch_test
-                      aux_share_test aux_online_test)
+                      ds41_engram_early_arch_test aux_share_test aux_online_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and

@@ -3189,4 +3189,191 @@ TEST(the_loader_reads_which_kernels_fetch_their_own_rows) {
     CHECK(plain > 0);
 }
 
+/* ================================================================== rad_row_read_ahead */
+
+namespace {
+
+/* A gather that copies: out row i = table row ids[i], a zero row for an id past the table. What an
+ * embed_lookup does, through the mapping, so the read-ahead's effect on its bytes is visible. */
+const uint8_t* g_copy_tab = nullptr;
+int64_t        g_copy_rb = 0, g_copy_rows = 0, g_copy_n = 0;
+int k_row_copy(const RadArgs* a, RadStream) {
+    const int32_t* ids = (const int32_t*)a->t[0].data;
+    uint8_t* out = (uint8_t*)a->t[2].data;
+    for (int64_t i = 0; i < g_copy_n; ++i) {
+        uint8_t* o = out + i * g_copy_rb;
+        if (ids[i] < 0 || ids[i] >= g_copy_rows) std::memset(o, 0, (size_t)g_copy_rb);
+        else std::memcpy(o, g_copy_tab + (int64_t)ids[i] * g_copy_rb, (size_t)g_copy_rb);
+    }
+    return RAD_OK;
+}
+
+/* One step: optionally rad_row_read_ahead over ids rows [ra0, ra1) first (and, with `wait_in`,
+ * until those rows' pages are resident or 5 s pass), then the gather of all n ids. */
+struct EarlyRun {
+    int status = RAD_OK, ra = -99;
+    bool in_before = false;        /* the asked rows' pages came in before the gather ran */
+    int64_t other_before = -1;     /* resident pages of a row nobody named, before the gather */
+    bool busy_after = true;
+    int64_t calls = 0;
+    std::vector<uint8_t> out;
+};
+EarlyRun early_run(const ColdTable& ct, int64_t rows, int64_t rb, const std::vector<int32_t>& ids,
+                   bool early, int64_t ra0, int64_t ra1, bool wait_in, int64_t other_row,
+                   bool row_prefetch = true, bool fetches_rows = false) {
+    EarlyRun out;
+    const int64_t n = (int64_t)ids.size();
+    g_copy_tab = ct.base;
+    g_copy_rb = rb;
+    g_copy_rows = rows;
+    g_copy_n = n;
+    Fixture f;
+    const int64_t ib_bytes = (n * 4 + 4095) / 4096 * 4096;
+    rad_buf ib = f.add_buffer("ids", RAD_I32, n, 1, 0);
+    f.P.buffers[ib].decl.domain = RAD_DOMAIN_HOST;
+    rad_buf xb = f.add_buffer("rows", RAD_U8, n, rb, ib_bytes);
+    f.P.buffers[xb].decl.domain = RAD_DOMAIN_HOST;
+    rad_weight w = f.add_weight("ngram.weight", RAD_U8, rows, rb, ct.base);
+    rad::WeightInfo& wi = f.P.weights[w];
+    wi.tier = rad::Tier::Mapped;
+    wi.site = rad::Site::Host;
+    wi.logical_bytes = wi.stored_bytes = rows * rb;
+    wi.stored_dtype = RAD_U8;
+    wi.stored_rank = 2;
+    wi.stored_shape[0] = rows;
+    wi.stored_shape[1] = rb;
+    rad_op op = f.add_op("embed_lookup", "M", { 8192 }, { nullptr }, { nullptr }, nullptr, { w });
+    f.P.ops[op].base.set_i("n_vocab", rows);
+    attach_host_row(f, op, k_row_copy, "row_copy");
+    f.rows.back().fetches_rows = fetches_rows;
+    for (rad::Band& band : f.P.ops[op].bands) band.dom[RAD_DOMAIN_HOST].geom.set_i("n_vocab", rows);
+    f.row_prefetch = row_prefetch;
+    out.status = f.start();
+    if (out.status < 0) return out;
+    if (f.ctx.set_op_domain(op, RAD_DOMAIN_HOST) != RAD_OK) { out.status = RAD_E_STATE; return out; }
+    std::memcpy(f.ctx.buf_ptr(ib), ids.data(), (size_t)n * sizeof(int32_t));
+    out.status = f.step((int)n, 0, [&](Ctx& c) {
+        if (early) {
+            RadOperand ro = RAD_B(ib);
+            ro.offset = ra0;
+            ro.rows = ra1 - ra0;
+            const RadOperand o[3] = { ro, RAD_W(w), RAD_NONE };
+            out.ra = c.row_read_ahead(op, o, 3, ra1 - ra0);
+            if (wait_in) {
+                const auto t0 = std::chrono::steady_clock::now();
+                for (;;) {
+                    bool all = true;
+                    for (int64_t i = ra0; i < ra1 && all; ++i)
+                        if (ids[(size_t)i] >= 0 && ids[(size_t)i] < rows)
+                            all = ct.resident_pages((int64_t)ids[(size_t)i] * rb, rb) ==
+                                  (((int64_t)ids[(size_t)i] * rb + rb - 1) / 4096 -
+                                   (int64_t)ids[(size_t)i] * rb / 4096 + 1);
+                    if (all) { out.in_before = true; break; }
+                    if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > 5.0)
+                        break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            out.other_before = ct.resident_pages(other_row * rb, rb);
+        }
+        const RadOperand g[3] = { RAD_B(ib), RAD_W(w), RAD_B(xb) };
+        CHECK_OK(c.issue(op, g, 3, RAD_N_BATCH));
+    });
+    out.busy_after = f.ctx.row_early_busy();
+    out.calls = f.ctx.row_early_calls();
+    out.out.assign((const uint8_t*)f.ctx.buf_ptr(xb), (const uint8_t*)f.ctx.buf_ptr(xb) + n * rb);
+    rad_stream_sync(f.ctx.stream());
+    f.ctx.shutdown();
+    return out;
+}
+
+/* What the gather must write, from the file's bytes. */
+std::vector<uint8_t> expected_rows(const ColdTable& ct, int64_t rows, int64_t rb, const std::vector<int32_t>& ids) {
+    std::vector<uint8_t> v((size_t)((int64_t)ids.size() * rb), 0);
+    for (size_t i = 0; i < ids.size(); ++i)
+        if (ids[i] >= 0 && ids[i] < rows) std::memcpy(v.data() + i * rb, ct.base + (int64_t)ids[i] * rb, (size_t)rb);
+    return v;
+}
+
+}  /* namespace */
+
+/* RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY's core half: rad_row_read_ahead asks for a later host
+ * gather's rows on a helper thread and returns; the rows arrive without the gather (a row nobody
+ * named stays out), and the gather then writes exactly the bytes it writes without the call -- a
+ * prefill chunk's ids (thousands, above kRowAheadInline), a decode step's few with one past the
+ * table, a slice of the ids (one rank's share) -- and exactly the table's rows. The helper is
+ * stopped once the step ends. Off with --row-prefetch off, for a kernel that fetches its own rows,
+ * and for an op that is not a row gather (refused). */
+TEST(rad_row_read_ahead_brings_a_later_gathers_rows_and_changes_no_gathered_byte) {
+    if (!rad::device_is_host()) SKIP("the gather runs on the host backend's host domain");
+    struct Case { const char* name; int64_t rows, rb; std::vector<int32_t> ids; int64_t ra0, ra1, other; };
+    std::vector<Case> cases;
+    {
+        Case c{ "prefill", 8192, 4096, {}, 0, 0, 8100 };
+        for (int i = 0; i < 3000; ++i) c.ids.push_back((int32_t)((i * 2654435761u) % 8000u));
+        c.ra1 = (int64_t)c.ids.size();
+        cases.push_back(c);
+        Case q = c;   /* one rank's quarter, rows [750, 1500) */
+        q.name = "slice";
+        q.ra0 = 750; q.ra1 = 1500;
+        cases.push_back(q);
+    }
+    cases.push_back(Case{ "decode", 1024, 1000, { 3, 200, 201, 4000 }, 0, 4, 900 });
+    cases.push_back(Case{ "mixed", 1024, 1000, { 7, 7, 512, -1, 1023, 64, 300 }, 2, 7, 900 });
+    int idx = 0;
+    for (const Case& k : cases) {
+        const std::string a = radtest::tmp_path((std::string("rowea-a-") + std::to_string(idx) + ".bin").c_str());
+        const std::string b = radtest::tmp_path((std::string("rowea-b-") + std::to_string(idx) + ".bin").c_str());
+        ++idx;
+        ColdTable ta(a, k.rows * k.rb);
+        if (!ta.base) SKIP("could not write and map a table under %s", radtest::tmpdir().c_str());
+        const EarlyRun plain = early_run(ta, k.rows, k.rb, k.ids, false, 0, 0, false, k.other);
+        CHECK_OK(plain.status);
+        CHECK(plain.out == expected_rows(ta, k.rows, k.rb, k.ids));
+        ColdTable tb(b, k.rows * k.rb);
+        REQUIRE(tb.base);
+        const bool cold = tb.cold;
+        const EarlyRun e = early_run(tb, k.rows, k.rb, k.ids, true, k.ra0, k.ra1, cold, k.other);
+        CHECK_OK(e.status);
+        CHECK_EQ(e.ra, 1);
+        CHECK_EQ(e.calls, (int64_t)1);
+        CHECK(!e.busy_after);
+        /* The same bytes as without the call, and the table's own. */
+        CHECK(e.out == plain.out);
+        if (e.out != plain.out) fprintf(stderr, "    case %s: gathered bytes differ\n", k.name);
+        if (cold) {
+            CHECK(e.in_before);                    /* the rows came in before the gather ran */
+            CHECK_EQ(e.other_before, (int64_t)0);  /* a row nobody named stayed out */
+        }
+    }
+    {
+        /* Off, a kernel that fetches its own rows: nothing asked (0), the same bytes. */
+        const std::vector<int32_t> ids = { 3, 200, 201 };
+        ColdTable t(radtest::tmp_path("rowea-off.bin"), 1024 * 1000);
+        REQUIRE(t.base);
+        const EarlyRun off = early_run(t, 1024, 1000, ids, true, 0, 3, false, 900, false);
+        CHECK_OK(off.status);
+        CHECK_EQ(off.ra, 0);
+        CHECK_EQ(off.calls, (int64_t)0);
+        CHECK(off.out == expected_rows(t, 1024, 1000, ids));
+        const EarlyRun own = early_run(t, 1024, 1000, ids, true, 0, 3, false, 900, true, true);
+        CHECK_OK(own.status);
+        CHECK_EQ(own.ra, 0);
+        CHECK(own.out == expected_rows(t, 1024, 1000, ids));
+    }
+    {
+        /* Not a row gather: refused, and nothing started. */
+        Fixture f;
+        rad_buf x = f.add_buffer("x", RAD_I32, 4, 1, 0);
+        rad_op op = host_op(f, k_copy, "notagather");
+        CHECK_OK(f.start());
+        CHECK_OK(f.step(4, 0, [&](Ctx& c) {
+            const RadOperand o[1] = { RAD_B(x) };
+            CHECK_EQ(c.row_read_ahead(op, o, 1, 4), (int)RAD_E_INVAL);
+        }));
+        CHECK_EQ(f.ctx.row_early_calls(), (int64_t)0);
+        f.ctx.shutdown();
+    }
+}
+
 RAD_TEST_MAIN_HOST_KARGS()
