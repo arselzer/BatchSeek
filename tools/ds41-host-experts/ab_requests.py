@@ -395,11 +395,20 @@ def by_receipt(data):
     return [(tuple(g[0]), sorted(g[2], key=order.get)) for g in groups]
 
 
+INEXACT_PARTS = ("Qw", "Aw")   # the WMMA P1 twin, the WMMA sparse attention
+
+
+def inexact_parts(a):
+    """The parts that make an arm's replies not the exact engine's by design (Qw: the WMMA P1 twin; Aw: the WMMA
+    sparse attention; each an f32 summation order of its own)."""
+    w = "-" + a.replace(".before", "") + "-"
+    return [p for p in INEXACT_PARTS if "-%s-" % p in w]
+
+
 def inexact(a):
-    """An arm whose replies are not the exact engine's by design (a Qw part: the WMMA P1 twin, an f32 summation order
-    of its own). Its texts are reported against the reference, never used as one, and never read as an exactness
-    result."""
-    return "-Qw-" in "-" + a.replace(".before", "") + "-"
+    """An arm with an inexact part. Its texts are reported against the reference, never used as one, and never read as
+    an exactness result."""
+    return bool(inexact_parts(a))
 
 
 def ref_arm(data, cols, n):
@@ -441,7 +450,7 @@ def compare(d, arms):
         print("%-12s" % "decode" + "".join(
             "%12.2f tok/s" % (tot[a][1] / tot[a][0] * 1e3 if tot[a][0] else 0.0) for a in cols))
         for a, (k, m) in inx.items():
-            print("%s: differ from reference: %d of %d (inexact arm, Qw)" % (a, k, m))
+            print("%s: differ from reference: %d of %d (inexact arm, %s)" % (a, k, m, ", ".join(inexact_parts(a))))
 
 
 def prompt_tokens(t):

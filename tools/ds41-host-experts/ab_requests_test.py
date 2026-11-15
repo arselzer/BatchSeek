@@ -613,5 +613,21 @@ class InexactArmTest(unittest.TestCase):
         self.assertFalse(ab_requests.inexact("all-P1-Qw2"))   # QwN is the wave size, exact
         self.assertFalse(ab_requests.inexact("all-P1-Qt"))
 
+    def test_aw_and_dt_names(self):
+        # Aw (the WMMA sparse attention) is inexact; Dt (the tiled bf16f8 GEMM) is exact.
+        self.assertTrue(ab_requests.inexact("all-Lc2048-P1-Aw"))
+        self.assertFalse(ab_requests.inexact("all-Lc2048-P1-Dt"))
+        self.assertFalse(ab_requests.inexact("all-A2-Lc2048"))   # A2 is the async misses
+        self.assertEqual(ab_requests.inexact_parts("all-Lc2048-P1-Qw-Dt-Aw"), ["Qw", "Aw"])
+
+    def test_an_aw_arm_is_labelled_and_never_the_reference(self):
+        self.arm("all-Lc2048-P1-Dt-Aw", [("p1", "a"), ("p2", "x")])
+        self.arm("all-Lc2048-P1-Dt", [("p1", "a"), ("p2", "b")])
+        self.arm("all-Lc2048-P1-Qw-Aw", [("p1", "a"), ("p2", "y")])
+        text = self.compare("all-Lc2048-P1-Dt-Aw", "all-Lc2048-P1-Dt", "all-Lc2048-P1-Qw-Aw")
+        self.assertIn("all-Lc2048-P1-Dt-Aw: differ from reference: 1 of 2 (inexact arm, Aw)", text)
+        self.assertIn("all-Lc2048-P1-Qw-Aw: differ from reference: 1 of 2 (inexact arm, Qw, Aw)", text)
+        self.assertNotIn("all-Lc2048-P1-Dt: differ", text)
+
 if __name__ == "__main__":
     unittest.main()

@@ -41,6 +41,10 @@
 #      with the part, none without it); in the arm loop the fast arm with Qt (and with Qsp-Qt) is launched with
 #      the switch at 1 and every other switch as the fast arm, every arm without the part states it 0, Qt without
 #      P1 is skipped, and without a passing p1tiled receipt every Qt arm is refused while the fast arm still runs.
+#   8d. Dt / Aw (the tiled bf16f8 GEMM, exact; the WMMA sparse attention, inexact): the switches at 1 on the preset arm,
+#      every other arm states them 0; Dt without Lc or F8, Aw without Lc, Aw with Kld before a reference skipped;
+#      with a reference an Aw Kld arm scores against it (--kld-ref) and a Dt Kld arm records; without their receipts
+#      refused while the fast arm runs; dt_gate / aw_gate on synthetic logs.
 # Exit 0 when every check passes.
 set -u
 W=${1:-$(dirname "$0")/ab_window.sh}
@@ -398,13 +402,23 @@ QWNOP=$REF-Qw
 QWKLD=$FAST-Qw-Kld
 QW2=$FAST-Qw2
 ARMS="$ARMS $QW $QWV $QWNOP $QWKLD $QW2"
+# Dt / Aw: the tiled bf16f8 GEMM (exact) and the WMMA sparse attention (inexact) on the preset; Dt without Lc and
+# without F8, Aw without Lc, and both with Kld.
+DTAW=$FAST-Qsp-Qt-Qz-Dt-Aw
+DTNOLC=$pre-M16-$mid-B6-${post%-Lc1024}-Dt
+DTNOF8=${FAST/-F8-/-}-Dt
+AWNOLC=$pre-M16-$mid-B6-${post%-Lc1024}-Aw
+AWKLD=$FAST-Aw-Kld
+DTKLD=$FAST-Dt-Kld
+AWONLY=$FAST-Aw
+ARMS="$ARMS $DTAW $DTNOLC $DTNOF8 $AWNOLC $AWKLD $DTKLD $AWONLY"
 run_loop() {   # actual balance-oracle bound; every model action remains stubbed
  (
   set +u
   log() { echo "LOG: $*"; }
   power_set() { :; }; power_restore() { :; }
   vpack_gate() { return 0; }
-  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; echo "  ARM_QD: ${ARM_QD:-}"; echo "  ARM_QY: ${ARM_QY:-}"; echo "  ARM_QYF: ${ARM_QYF:-}"; echo "  ARM_QT: ${ARM_QT:-}"; echo "  ARM_QW: ${ARM_QW:-}"; }
+  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; echo "  ARM_QD: ${ARM_QD:-}"; echo "  ARM_QY: ${ARM_QY:-}"; echo "  ARM_QYF: ${ARM_QYF:-}"; echo "  ARM_QT: ${ARM_QT:-}"; echo "  ARM_QW: ${ARM_QW:-}"; echo "  ARM_DT: ${ARM_DT:-}"; echo "  ARM_AW: ${ARM_AW:-}"; }
   HX_THREADS=16 SILU=/dev/null RHOME=$H RADIANCE_HOME_DIR2=$H MIRROR=$T
   PROMPTS=$T/prompts.json
   unset RADIANCE_TUNE
@@ -416,6 +430,8 @@ run_loop() {   # actual balance-oracle bound; every model action remains stubbed
   else P1T_OK=1 P1T_WHY=test P1T_SUM=$SUM P1T_LIB=$LIB; fi
   if [[ ${2:-} == no-p1w ]]; then P1W_OK="" P1W_WHY="no p1wmma check (test)" P1W_SUM="" P1W_LIB=""
   else P1W_OK=1 P1W_WHY=test P1W_SUM=$SUM P1W_LIB=$LIB; fi
+  if [[ ${2:-} == no-fast ]]; then DT_OK="" DT_WHY="no dtiled check (test)" DT_SUM="" DT_LIB="" AW_OK="" AW_WHY="no attnwm check (test)" AW_SUM="" AW_LIB=""
+  else DT_OK=1 DT_WHY=test DT_SUM=$SUM DT_LIB=$LIB AW_OK=1 AW_WHY=test AW_SUM=$SUM AW_LIB=$LIB; fi
   KLD_REF=${3:-}
   OUT=$T/out; mkdir -p "$OUT"; CANCEL_FILE=/nonexistent/cancel; CANCEL=$CANCEL_FILE
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
@@ -718,6 +734,58 @@ sed -i '/rank 2/d' "$T/qw.log"
 why=$(qw_gate "$T/qw.log" 1) && bad "qw_gate passed three markers" || { [[ $why == *"rank 2 lacks"* ]] && ok "qw_gate: a missing rank's marker is named" || bad "qw_gate: $why"; }
 : > "$T/qw.log"
 qw_gate "$T/qw.log" "" > /dev/null && ok "qw_gate: a plain arm without markers passes" || bad "qw_gate refused a plain arm"
+
+# ---- 8d. Dt / Aw
+sec=$(section "$DTAW")
+if [[ -z "$sec" ]]; then bad "the Dt-Aw arm $DTAW was not launched: $(grep -m3 "arm $DTAW" "$T/loop.txt")"
+else
+  has "Dt" "$sec" RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED 1
+  has "Aw" "$sec" RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA 1
+  for v in RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_P1_WMMA RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8; do
+    has "Dt-Aw as the fast arm" "$sec" "$v" "$(val "$(section "$FAST")" "$v")"
+  done
+  grep -qx "  ARM_DT: 1" <<< "$sec" && grep -qx "  ARM_AW: 1" <<< "$sec" && ok "Dt-Aw: gated on both startup markers (ARM_DT=1, ARM_AW=1)" ||
+    bad "Dt-Aw: $(grep -E '  ARM_(DT|AW):' <<< "$sec" | tr '\n' ' ')"
+fi
+for a in "$REF" "$FAST" "$QW" "$QT"; do
+  has "no Dt part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED 0
+  has "no Aw part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA 0
+done
+qdskip "$DTNOLC" "Dt needs Lc.*skipped"
+qdskip "$DTNOF8" "Dt needs F8.*skipped"
+qdskip "$AWNOLC" "Aw needs Lc.*skipped"
+qdskip "$AWKLD" "Aw with Kld scores against the window's Kld reference, and none has been recorded yet.*skipped"
+sec=$(section "$DTKLD")
+if [[ -n "$sec" ]] && grep -q -- "--kld-record $T/out/kld-$DTKLD" <<< "$sec"; then ok "Dt with Kld: recorded (exact), compared as any exact arm"
+else bad "Dt with Kld: $(grep '  ARGS:' <<< "$sec")"; fi
+sec=$(awk -v a="ARM $AWKLD" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' <<< "$ref_out")
+if [[ -z "$sec" ]]; then bad "the Aw Kld arm was not launched with a reference: $(grep -m2 "arm $AWKLD" <<< "$ref_out")"
+elif grep -q -- "--kld-ref $T/out/kld-plain --kld-out $T/out/kld-$AWKLD.json" <<< "$sec" && ! grep -q -- "--kld-record" <<< "$sec"; then
+  ok "Aw with Kld: scored against the reference (--kld-ref, --kld-out), not recorded"
+else bad "Aw with Kld: $(grep '  ARGS:' <<< "$sec")"; fi
+nofast_out=$(run_loop 4096 no-fast)
+if grep -qxF "ARM $DTAW" <<< "$nofast_out" || grep -qxF "ARM $AWONLY" <<< "$nofast_out"; then bad "a Dt / Aw arm launched without its receipts"
+elif grep -qF "arm $DTAW: Dt refused: no dtiled check (test)" <<< "$nofast_out" &&
+     grep -qF "arm $AWONLY: Aw refused: no attnwm check (test)" <<< "$nofast_out"; then ok 'Dt and Aw refused without their receipts'
+else bad "no dtiled / attnwm refusal: $(grep -m1 "arm $DTAW: " <<< "$nofast_out") $(grep -m1 "arm $AWONLY: " <<< "$nofast_out")"; fi
+has "Aw alone" "$(section "$AWONLY")" RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA 1
+has "Aw alone" "$(section "$AWONLY")" RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED 0
+grep -qxF "ARM $FAST" <<< "$nofast_out" && ok 'the fast arm runs without the dtiled / attnwm receipts' || bad 'the fast arm needed them'
+eval "$(sed -n '/^fast_gate() {/,/^}/p;/^dt_gate() {/p;/^aw_gate() {/p' "$W")"
+for r in 0 1 2 3; do
+  echo "ds41 dense: tiled bf16f8 GEMM on (exact), rank $r (RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED=1): 330 gemm_nt_bf16f8 ops"
+  echo "ds41 attn: WMMA sparse attention on (inexact), rank $r (RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA=1): 43 attn_sparse_sink ops"
+done > "$T/da.log"
+dt_gate "$T/da.log" 1 > /dev/null && aw_gate "$T/da.log" 1 > /dev/null && ok "dt_gate / aw_gate: every rank's marker passes" ||
+  bad "dt_gate / aw_gate refused four markers"
+dt_gate "$T/da.log" "" > /dev/null && bad "dt_gate passed a plain arm with markers" || ok "dt_gate: a plain arm with the markers is not measured"
+aw_gate "$T/da.log" "" > /dev/null && bad "aw_gate passed a plain arm with markers" || ok "aw_gate: a plain arm with the markers is not measured"
+sed -i '/attn.*rank 1/d' "$T/da.log"
+why=$(aw_gate "$T/da.log" 1) && bad "aw_gate passed three markers" || { [[ $why == *"rank 1 lacks"* ]] && ok "aw_gate: a missing rank's marker is named" || bad "aw_gate: $why"; }
+dt_gate "$T/da.log" 1 > /dev/null && ok "dt_gate: unaffected by the attention markers" || bad "dt_gate refused after an attention line was removed"
+: > "$T/da.log"
+dt_gate "$T/da.log" "" > /dev/null && aw_gate "$T/da.log" "" > /dev/null && ok "dt_gate / aw_gate: a plain arm without markers passes" ||
+  bad "dt_gate / aw_gate refused a plain arm"
 
 (( fail )) && { echo "ab_window_p1_test: FAILED (loop output in $T/loop.txt, removed on exit)"; exit 1; }
 echo "ab_window_p1_test: all checks passed"

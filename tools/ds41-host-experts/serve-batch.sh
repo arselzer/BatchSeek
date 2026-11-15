@@ -23,13 +23,18 @@
 #     NOT exact: the same bf16 weights and activations, another f32 summation order, so replies are not byte-identical
 #     to the exact engine's (bf16 outputs mostly identical, rare 1-ulp differences). Give 1 to turn it on; unmeasured
 #     until its window (FASTPREFILL-20261115.md).
+#   - --fast-dense (Dt, ..._DENSE_TILED): the FP8-stored dense linears above 64 rows on the LDS-tiled WMMA form, OFF by
+#     default. EXACT (the m64 kernel's bits; FASTDENSE-20261115.md); off until its window measured it.
+#   - --fast-attn (Aw, ..._ATTN_WMMA): the sparse attention at every height on the matrix cores, OFF by default. NOT
+#     exact: q.k and sum p k summed in another f32 order (the softmax's exp, max and normaliser the exact kernel's), so
+#     replies are not byte-identical to the exact engine's. Give 1 to turn it on (FASTDENSE-20261115.md).
 #   - --served-model-name ds41 (a name only; --served-name sets another) and --radiance-home only when given
 #     (RADIANCE_HOME otherwise).
 #
 # Usage: serve-batch.sh --model MODEL.rad --silu-table FILE [--streams 256] [--port 8000] [--reserve-mib N]
 #                       [--ctx-per-stream 1152] [--profile FILE] [--mirror DIR] [--shared-head 32] [--served-name ds41]
 #                       [--radiance-home DIR] [--hybrid 60] [--max-seq-len N] [--tiled 0|1] [--tail-once 0|1]
-#                       [--swiglu-span 0|1] [--fast-prefill 0|1] [--dry-run]
+#                       [--swiglu-span 0|1] [--fast-prefill 0|1] [--fast-dense 0|1] [--fast-attn 0|1] [--dry-run]
 #                       [-- more radiance flags, e.g. --expert-stats FILE to record a profile; outside the measured set]
 #   RADIANCE_BIN (default: radiance on PATH, else build/bin/radiance), RADIANCE_HOME as for any radiance run.
 # --dry-run prints the environment and the command and starts nothing. Otherwise the script becomes the server (exec:
@@ -37,7 +42,7 @@
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
-EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 FASTPF=0
+EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 FASTPF=0 FASTDN=0 FASTAT=0
 while (( $# )); do
   case $1 in
     --model) MODEL=${2:?}; shift ;;
@@ -57,6 +62,8 @@ while (( $# )); do
     --tail-once) TAILONCE=${2:?}; shift ;;
     --swiglu-span) SPAN=${2:?}; shift ;;
     --fast-prefill) FASTPF=${2:?}; shift ;;
+    --fast-dense) FASTDN=${2:?}; shift ;;
+    --fast-attn) FASTAT=${2:?}; shift ;;
     --dry-run) DRY=1 ;;
     --) shift; EXTRA=("$@"); break ;;
     -h|--help) sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -71,7 +78,7 @@ num --streams "$STREAMS" 1; num --port "$PORT" 1; num --ctx-per-stream "$CTX" 1;
 [[ -z "$RESERVE" ]] || num --reserve-mib "$RESERVE" 1024
 num --hybrid "$HYBRID" 0; (( 10#$HYBRID <= 400 )) || die "--hybrid takes 0 (off) or a share of 1-400 percent, not '$HYBRID'"
 [[ -z "$SEQLEN" ]] || num --max-seq-len "$SEQLEN" 64
-for v in "--tiled $TILED" "--tail-once $TAILONCE" "--swiglu-span $SPAN" "--fast-prefill $FASTPF"; do
+for v in "--tiled $TILED" "--tail-once $TAILONCE" "--swiglu-span $SPAN" "--fast-prefill $FASTPF" "--fast-dense $FASTDN" "--fast-attn $FASTAT"; do
   [[ ${v#* } == [01] ]] || die "${v% *} takes 0 or 1, not '${v#* }'"
 done
 STREAMS=$((10#$STREAMS)) CTX=$((10#$CTX))
@@ -83,7 +90,7 @@ if (( ! DRY )); then
 fi
 BIN=${RADIANCE_BIN:-$(command -v radiance || echo build/bin/radiance)}
 
-# The arm's environment (136 assignments). The empty ones are set empty, as the harness sets them, so that a value
+# The arm's environment (138 assignments). The empty ones are set empty, as the harness sets them, so that a value
 # in the caller's environment cannot change the configuration.
 ENV=(
   RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40
@@ -160,6 +167,8 @@ ENV=(
   RADIANCE_EXPERIMENTAL_DS41_P1_TILED=$TILED           # Qt
   RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=$TAILONCE    # Qz
   RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=$FASTPF           # Qw: the WMMA P1 twin, inexact (--fast-prefill)
+  RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED=$FASTDN       # Dt: the tiled bf16f8 GEMM, exact (--fast-dense)
+  RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA=$FASTAT         # Aw: the WMMA sparse attention, inexact (--fast-attn)
   RADIANCE_EXPERIMENTAL_DS41_P1=1
   RADIANCE_EXPERIMENTAL_DS41_P1_WAVE=
   RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT=

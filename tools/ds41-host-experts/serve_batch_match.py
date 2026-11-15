@@ -7,8 +7,8 @@ serve_batch_test.sh).
       its flags). Prints the serve-batch.sh arguments for it, one a line: --model, --silu-table, --streams,
       --ctx-per-stream (--max-model-len / --max-num-seqs, which must divide), --port, --served-name,
       --radiance-home, --shared-head, --hybrid (..._P1_HYBRID: QyP's P, 0 or unset off; a held share, Qyf, is
-      refused), --tiled / --tail-once / --swiglu-span / --fast-prefill (Qt / Qz / Qsp / Qw: ..._P1_TILED,
-      _P1_TAIL_ONCE, _P1_SWIGLU_SPAN, _P1_WMMA, 0 or unset off), and --profile, --mirror, --reserve-mib, --max-seq-len (SlN) where the launch has them. Exit 1
+      refused), --tiled / --tail-once / --swiglu-span / --fast-prefill / --fast-dense / --fast-attn (Qt / Qz / Qsp / Qw /
+      Dt / Aw: ..._P1_TILED, _P1_TAIL_ONCE, _P1_SWIGLU_SPAN, _P1_WMMA, _DENSE_TILED, _ATTN_WMMA, 0 or unset off), and --profile, --mirror, --reserve-mib, --max-seq-len (SlN) where the launch has them. Exit 1
       with the reason when a value is missing or does not fit.
   serve_batch_match.py compare WORDS DRYRUN [FLAG ...]
       DRYRUN: serve-batch.sh --dry-run's output. Each side resolved as the server sees it (every variable at its
@@ -26,7 +26,9 @@ HYBRID = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID"
 ADAPT = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT"
 P1_SWITCHES = (("--tiled", "RADIANCE_EXPERIMENTAL_DS41_P1_TILED"), ("--tail-once", "RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE"),
                ("--swiglu-span", "RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN"),
-               ("--fast-prefill", "RADIANCE_EXPERIMENTAL_DS41_P1_WMMA"))   # Qt, Qz, Qsp, Qw
+               ("--fast-prefill", "RADIANCE_EXPERIMENTAL_DS41_P1_WMMA"),
+               ("--fast-dense", "RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED"),
+               ("--fast-attn", "RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA"))   # Qt, Qz, Qsp, Qw, Dt, Aw
 
 
 def resolve(words):
