@@ -843,6 +843,7 @@ const RadFileEntry* Engine::source_entry(const std::string& name) const {
 }
 WeightSourceFn Engine::sources() const {
     if (source_banks_) return source_banks_->sources();
+    if (file_ && engram_file_) return engram_file_->wrap(rad_container_sources(*file_));
     if (file_) return rad_container_sources(*file_);
     return ckpt_src_ ? ckpt_src_->fn() : WeightSourceFn{};
 }
@@ -851,8 +852,15 @@ int Engine::read_metadata() {
     if(cfg_.draft_bank_expert_placement=="host"&&cfg_.draft_bank.empty()){
         RAD_ERR("--draft-bank-expert-placement host requires --draft-bank");return RAD_E_INVAL;
     }
+    const char* engram_file = std::getenv("RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE");
+    if (engram_file && !*engram_file) engram_file = nullptr;
     if (!is_container(cfg_.model)) {
         if(!cfg_.draft_bank.empty()){RAD_ERR("--draft-bank requires an ordinary canonical .rad");return RAD_E_INVAL;}
+        if (engram_file) {
+            RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE replaces a container's Engram tables, and "
+                    "%s is a checkpoint", cfg_.model.c_str());
+            return RAD_E_INVAL;
+        }
         return read_checkpoint_metadata();
     }
     file_ = std::make_unique<RadFile>();
@@ -867,6 +875,27 @@ int Engine::read_metadata() {
         source_banks_=std::make_unique<DsparkRadBanks>();std::string why;
         const int st=source_banks_->bind(*file_,draft_file_.get(),&why);
         if(st<0){RAD_ERR("--draft-bank binding refused: %s",why.c_str());return st;}
+    }
+
+    /* RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE (format/ds41_engram_file.h): the Engram tables from
+     * the release's own safetensors, checked against this container before anything is declared.
+     * They are read in place from their mapping (the mapped tier), so nothing may ask for a copy. */
+    if (engram_file) {
+        if (source_banks_ || cfg_.ngram_placement == TablePlacement::Ram ||
+            cfg_.ngram_placement == TablePlacement::Vram) {
+            RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE: the sidecar's tables are read in place "
+                    "from their mapping; use --ngram-placement disk (or auto) and no --draft-bank");
+            return RAD_E_INVAL;
+        }
+        engram_file_ = std::make_unique<Ds41EngramFile>();
+        std::string why;
+        const int st = engram_file_->open(engram_file, *file_, ds41_engram_release_spec(), &why);
+        if (st != RAD_OK) {
+            RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE=%s refused: %s", engram_file, why.c_str());
+            engram_file_.reset();
+            return st;
+        }
+        RAD_INFO("RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE: %s", engram_file_->describe().c_str());
     }
 
     /* What an earlier run left cached of the container, recorded before anything here allocates,
@@ -3304,8 +3333,49 @@ int Engine::load_weights() {
          * (rank 0 always starts at the plane's start, so it never exercises the arithmetic), and
          * an overrun would read the wrong weight. */
 
+        int64_t n_engram_file = 0;   /* weights published from RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE */
         for (size_t i = 1; i < r->program.weights.size(); ++i) {
             WeightInfo& w = r->program.weights[i];
+            /* RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE: an Engram table's planes from the sidecar's
+             * mapping, on the mapped tier as the container's would be (format/ds41_engram_file.h).
+             * Nothing else may read them: no copy, no shard, no relayout, never the file tier. */
+            if (const Ds41EngramTable* et = engram_file_ ? engram_file_->find(w.source) : nullptr) {
+                w.tier = r->plan.weight[i].tier;
+                w.site = r->plan.weight[i].site;
+                w.slab_slot = r->plan.weight[i].slab_slot;
+                w.vram_bytes = 0;
+                w.vram_pk_cap = -1;
+                w.file_offset = 0;
+                const int k = w.n_sel == 1 ? w.sel[0] : -1;
+                const char* bad =
+                    !rad_enc_equal(&et->enc, &w.enc) ? "it was declared in another encoding"
+                    : k < 0 || k > 1 ? "it reads other than one of the table's planes"
+                    : !weight_file_direct(w, cfg_.tp) ? "it is not read as stored (a shard, a widening or a relayout)"
+                    : w.tier != Tier::Mapped || w.site != Site::Host ? "it was not placed on the mapped tier for the host gather"
+                    : cfg_.ngram_resolved == TablePlacement::Ram ? "--ngram-placement resolved to a RAM copy"
+                    : et->plane_bytes[k] != w.stored_bytes ? "its plane is not the declared size"
+                    : nullptr;
+                if (bad) {
+                    RAD_ERR("rank %d: RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE: '%s' (over '%s') cannot be "
+                            "read from the sidecar in place: %s", r->index, w.name.c_str(),
+                            w.source.c_str(), bad);
+                    return RAD_E_STATE;
+                }
+                w.ptr = (void*)et->plane[k];
+                w.host_ptr = w.ptr;
+                /* MADV_RANDOM as for a mapped container weight: a gather reads a row of a page. */
+                {
+                    const uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
+                    const uintptr_t a = (uintptr_t)w.ptr & ~(pg - 1);
+                    posix_madvise((void*)a, (size_t)((uintptr_t)w.ptr + (uintptr_t)w.stored_bytes - a),
+                                  POSIX_MADV_RANDOM);
+                }
+                r->mover.publish_mapped((rad_weight)i, w.ptr);
+                ++n_mapped;
+                ++n_engram_file;
+                mapped_bytes += w.stored_bytes;
+                continue;
+            }
             /* The planes' source: a container entry or the checkpoint tensors declare resolved,
              * giving the encoding and logical shape the share is cut in. */
             const RadFile* source=file_.get();
@@ -3598,6 +3668,15 @@ int Engine::load_weights() {
                 }
             }
             ++n_loaded;
+        }
+        /* Every sidecar table read as its codes and its scale on every rank, or the switch would
+         * be silently half on (a plugin that declares the tables under other names reads the
+         * container's). */
+        if (engram_file_ && n_engram_file != 2 * (int64_t)engram_file_->tables().size()) {
+            RAD_ERR("rank %d: RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE: %lld weight(s) read the sidecar's "
+                    "%zu table(s); each table's codes and scale should, once", r->index,
+                    (long long)n_engram_file, engram_file_->tables().size());
+            return RAD_E_STATE;
         }
     }
 
