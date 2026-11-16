@@ -250,6 +250,13 @@
 # (Qy, Qyp) takes units cheapest first instead of fewest rows first, so a 3- or 4-row unit that does not fit no
 # longer blocks cheaper 5-row-or-more ones. Selection only (exact). Changes nothing at Mr4. Measured only with the
 # pool's "host experts: kernel costs" line (any other arm only without it).
+# QycM: the hybrid split's calibration (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_CAL=M, 1-3; every other arm states 0;
+# core/place/p1_hybrid.h "calibration"): bit 1 charges the CPU at a rate learnt from each split layer's completion
+# (the share's ceiling 4P), bit 2 runs one share a pass kind for every rank and makes the choice with its reservation
+# under one lock. Selection only (exact). Needs Qy or Qyp. Measured only if rank 0 logs "ds41 p1: hybrid calibration
+# on (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_CAL=M)" once at startup (any other arm only without it) and at exit
+# (qyc_gate) every rank's stats line carries "; hybrid calibration M:", with bit 1 some rank took a completion sample,
+# with bit 2 "shares coupled".
 #
 # Coordinated actual Ar1280+Ag1024 caps additionally need SELFTEST_AR_AG_SHARED=<r4d_selftest>:
 # fresh all-four-card ds41_ar_ag_shared_exact pointer/lifetime/mixed replay receipt. It supplements
@@ -879,7 +886,8 @@ kld_finish() {   # name; the run is SERVER_PID
      ! extra_why=$(dt_gate "$OUT/$name.server.log" "${ARM_DT:-}") ||
      ! extra_why=$(aw_gate "$OUT/$name.server.log" "${ARM_AW:-}") ||
      ! extra_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" exit) ||
-     ! extra_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" exit); then
+     ! extra_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" exit) ||
+     ! extra_why=$(qyc_gate "$OUT/$name.server.log" "${ARM_QYC:-}" exit); then
     log "arm $name: $extra_why; Kld not measured"; return 1
   fi
   # Qw / Aw (inexact by design): its run scored the engine against KLD_REF (--kld-ref); the engine's KL report is the
@@ -1178,6 +1186,29 @@ qx_gate() {   # log, requested K, start/exit: rank 0's early-copies line naming 
   [[ "$stage" == exit ]] || return 0
   while read -r b; do [[ -n "$b" ]] && (( b > best )) && best=$b; done < <(sed -nE 's/.*ds41 p1 stats, rank [0-3]: .*; early copies [0-9]+ \(([0-9]+) bound to their layer.*/\1/p' "$f")
   if (( best == 0 )); then echo "Qx$on, but no rank bound an early copy to its layer (the switch never acted)"; return 1; fi
+  return 0
+}
+
+qyc_gate() {   # log, requested mask, start/exit: rank 0's calibration line naming M once (every rank's counts at exit)
+  local f=$1 on=$2 stage=${3:-start} count line s n=0 ranks=0
+  if [[ -z "$on" ]]; then
+    if grep -q 'ds41 p1: hybrid calibration on' "$f"; then echo 'no Qyc part, but the hybrid calibration is on'; return 1; fi
+    return 0
+  fi
+  count=$(grep -cE "ds41 p1: hybrid calibration on \(RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_CAL=$on\)" "$f")
+  if [[ $count != 1 ]]; then echo "Qyc$on, but rank 0 lacks one 'ds41 p1: hybrid calibration on (..._P1_HYBRID_CAL=$on)' startup line"; return 1; fi
+  [[ "$stage" == exit ]] || return 0
+  while IFS= read -r line; do
+    ranks=$((ranks + 1))
+    s=$(sed -nE "s/.*; hybrid calibration $on: pool rate decode [0-9.]+ GB\/s \(([0-9]+) samples\), prefill [0-9.]+ GB\/s \(([0-9]+) samples\).*/\1 \2/p" <<< "$line")
+    if [[ -z "$s" ]]; then echo "Qyc$on, but a 'ds41 p1 stats, rank' line without its calibration counts (${line:0:80}...)"; return 1; fi
+    n=$((n + ${s% *} + ${s#* }))
+    if (( on & 2 )) && [[ "$line" != *"; hybrid calibration $on: "*"; shares coupled"* ]]; then
+      echo "Qyc$on, but a rank's stats line does not say its shares were coupled"; return 1
+    fi
+  done < <(grep -E 'ds41 p1 stats, rank [0-9]+: ' "$f")
+  (( ranks > 0 )) || { echo "Qyc$on, but no 'ds41 p1 stats, rank' line at exit"; return 1; }
+  if (( on & 1 )) && (( n == 0 )); then echo "Qyc$on, but no rank took a completion sample (the calibration never acted)"; return 1; fi
   return 0
 }
 
@@ -1586,7 +1617,8 @@ EOF2
      ! qsp_why=$(dt_gate "$OUT/$name.server.log" "${ARM_DT:-}") ||
      ! qsp_why=$(aw_gate "$OUT/$name.server.log" "${ARM_AW:-}") ||
      ! qsp_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" start) ||
-     ! qsp_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" start); then
+     ! qsp_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" start) ||
+     ! qsp_why=$(qyc_gate "$OUT/$name.server.log" "${ARM_QYC:-}" start); then
     log "arm $name: $qsp_why; not measured"; stop_server; return 1
   fi
   # In / Is (RADIANCE_EXPERIMENTAL_DS41_INSERT_NT / _SLICE_KIB) and Ph (_HOST_EXPERTS_LEAN_TILES):
@@ -1881,7 +1913,8 @@ EOF2
   local qsp_exit_why
   if ! qsp_exit_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" exit) ||
      ! qsp_exit_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" exit) ||
-     ! qsp_exit_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" exit); then
+     ! qsp_exit_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" exit) ||
+     ! qsp_exit_why=$(qyc_gate "$OUT/$name.server.log" "${ARM_QYC:-}" exit); then
     log "arm $name: $qsp_exit_why; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
@@ -1949,6 +1982,7 @@ EOF2
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
   [[ -n "${ARM_QYP:-}" ]] && grep -E 'ds41 p1 stats, rank [0-9]+: ' "$OUT/$name.server.log" | sed -nE 's/^(I\[[0-9]+\]) .*(; hybrid prefill: .*)$/\1\2/p' | tee -a "$OUT/window.log"
+  [[ -n "${ARM_QYC:-}" ]] && grep -E 'ds41 p1 stats, rank [0-9]+: ' "$OUT/$name.server.log" | sed -nE 's/^(I\[[0-9]+\]) .*(; hybrid calibration .*)$/\1\2/p' | tee -a "$OUT/window.log"
   # Pmr with a drafting Ds part (DSpark's 2+ row verify passes) at shutdown: the predictor's
   # multi-row line, and some rank's "by pass size" line with a "2 rows:" entry that planned units;
   # otherwise the switch never acted on a verify pass and the arm is set aside (mrra review B3).
@@ -3719,7 +3753,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$(arm_full "$a")"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" sg="" pcn=""
-  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qyp="" qyk="" qsp="" qt="" qw="" dt="" aw="" qz="" qx="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr="" ee=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qyp="" qyk="" qsp="" qt="" qw="" dt="" aw="" qz="" qx="" qyc="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr="" ee=""
   ctp=""   # Ctp / CtpN: the prefill chain trace (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL)
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
@@ -3964,6 +3998,10 @@ for a in $ARMS; do
                  [[ $qk == VERIFY ]] && qv=$((10#$qn))
                else log "arm $a: $p: ${p:0:2} takes $qlo-$qhi; the arm is skipped"; skip=1; fi ;;
       Qs)      q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN=start) ;;       # ...chunks aligned to the start
+      Qyc[0-9]*)                                                       # the hybrid split's calibration mask (..._P1_HYBRID_CAL=M)
+               if [[ -n "$qyc" ]]; then log "arm $a: two Qyc parts; the arm is skipped"; skip=1
+               elif [[ ${p#Qyc} =~ ^[0-9]+$ ]] && (( 10#${p#Qyc} >= 1 && 10#${p#Qyc} <= 3 )); then qyc=$((10#${p#Qyc}))
+               else log "arm $a: $p: Qyc takes 1-3 (a mask); the arm is skipped"; skip=1; fi ;;
       Qyk)                                                             # kernel costs: the pool's and the hybrid split's
                if [[ -n "$qyk" ]]; then log "arm $a: two Qyk parts; the arm is skipped"; skip=1; fi
                qyk=1 ;;
@@ -4561,6 +4599,9 @@ for a in $ARMS; do
       fi
     fi
   fi
+  # Qyc: the hybrid split's calibration, stated in every arm (0 off); with Qy or Qyp.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_CAL=${qyc:-0})
+  [[ -n "$qyc" && -z "$qy$qyp" ]] && { log "arm $a: Qyc$qyc calibrates the hybrid split, which needs Qy or Qyp; the arm is skipped"; skip=1; }
   # Qx: early ring copies, stated in every arm (0 off); with P1.
   env+=(RADIANCE_EXPERIMENTAL_DS41_P1_EARLY=${qx:-0})
   [[ -n "$qx" && -z "$p1" ]] && { log "arm $a: Qx needs P1; the arm is skipped"; skip=1; }
@@ -4795,7 +4836,7 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
   if [[ -n "$ARM_TIMEOUT" ]] && ! [[ $ARM_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]]; then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QYP=$qyp ARM_QYK=$qyk ARM_QSP=$qsp ARM_QT=$qt ARM_QW=$qw ARM_DT=$dt ARM_AW=$aw ARM_QZ=$qz ARM_QX=$qx ARM_LH=$lh ARM_EE=$ee
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QYP=$qyp ARM_QYK=$qyk ARM_QSP=$qsp ARM_QT=$qt ARM_QW=$qw ARM_DT=$dt ARM_AW=$aw ARM_QZ=$qz ARM_QX=$qx ARM_QYC=$qyc ARM_LH=$lh ARM_EE=$ee
   ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr ARM_SL=$sl ARM_CTX=$arm_ctx ARM_CR=$cr
   if [[ -n "$cr" ]]; then
     crk=${ARM_CONC:-${AB_CONCURRENCY:-1}}
