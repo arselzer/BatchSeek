@@ -55,6 +55,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
+#include <utility>
 
 namespace {
 
@@ -261,6 +262,8 @@ struct MxGemvArgs {
      * skip mark) has no rows; work items cut by row passes (the chunk prefix at bal_off: n_expert + 1 ints), at
      * most p1_rgcap row groups an item (0: no cap) and about p1_fill items a block. */
     int p1_rgcap, p1_fill;
+    /* mx_p1t_kernel: only the live experts with p1t_rlo < rows <= p1t_rhi (p1t_rhi 0: all). */
+    int p1t_rlo, p1t_rhi;
 };
 
 /* A staged row: its values with 4 floats of pad after every 32, so the lanes' blocks read different banks. */
@@ -961,8 +964,8 @@ __device__ __forceinline__ float mx_tab_at(const float* tab, uint32_t off) {
 /* One block of RPW rows into the sums: qs[r] its 16 code bytes as four dwords, PKL the packed form's order
  * (value 2i the low nibble of byte i) else block_mxfp4's (value j < 16 the low nibble of byte j, j + 16 its
  * high one), d[r] its scale; xb the staged activations at the block. mx_unit's groups, values and sums. */
-template <bool PKL, int RPW, int MC>
-__device__ __forceinline__ void mx_vp2_unit(const uint32_t (&qs)[RPW][4], const float (&d)[RPW], const float* xb,
+template <bool PKL, int RPW, int MC, typename XT>
+__device__ __forceinline__ void mx_vp2_unit(const uint32_t (&qs)[RPW][4], const float (&d)[RPW], const XT* xb,
                                             int xr, int mc, const float* tab, float (&acc)[RPW][MC]) {
     mx_for<4>([&](auto gi) {
         constexpr int G = decltype(gi)::value;
@@ -995,10 +998,22 @@ __device__ __forceinline__ void mx_vp2_unit(const uint32_t (&qs)[RPW][4], const 
 #pragma unroll
         for (int m = 0; m < MC; ++m) {
             if (MC == 1 || m < mc) {
-                const float* xp = xb + m * xr + 8 * G;
-                const float4 xa = *(const float4*)xp;
-                const float4 xc = *(const float4*)(xp + 4);
-                const float xv[8] = { xa.x, xa.y, xa.z, xa.w, xc.x, xc.y, xc.z, xc.w };
+                float xv[8];
+                if constexpr (sizeof(XT) == 2) {
+                    /* Staged as bf16 (mx_p1t_stage_h): the same widening mx_vp2_stage does, at the read, so
+                     * every value -- and so every product and sum -- is the float form's bit for bit. */
+                    const XT* xp = xb + m * xr + 8 * G;
+                    const uint2 xa = *(const uint2*)xp;
+                    const uint2 xc = *(const uint2*)(xp + 4);
+                    xv[0] = bf16w_lo(xa.x); xv[1] = bf16w_hi(xa.x); xv[2] = bf16w_lo(xa.y); xv[3] = bf16w_hi(xa.y);
+                    xv[4] = bf16w_lo(xc.x); xv[5] = bf16w_hi(xc.x); xv[6] = bf16w_lo(xc.y); xv[7] = bf16w_hi(xc.y);
+                } else {
+                    const float* xp = xb + m * xr + 8 * G;
+                    const float4 xa = *(const float4*)xp;
+                    const float4 xc = *(const float4*)(xp + 4);
+                    xv[0] = xa.x; xv[1] = xa.y; xv[2] = xa.z; xv[3] = xa.w;
+                    xv[4] = xc.x; xv[5] = xc.y; xv[6] = xc.z; xv[7] = xc.w;
+                }
 #pragma unroll
                 for (int r = 0; r < RPW; ++r)
 #pragma unroll
@@ -1011,11 +1026,11 @@ __device__ __forceinline__ void mx_vp2_unit(const uint32_t (&qs)[RPW][4], const 
 /* One block of the pass (F its place, V = U + 32 F its index) of RPW rows into the sums, from its loaded words rw
  * (mx_vp2_row's raw[F]): its codes and its scale, then mx_vp2_unit. rawm and first are the pass's raw rounds
  * (mx_vp2_raw_rows under kVpSraw, whose bytes are read here; otherwise already in rw[r][4]). */
-template <bool PK, bool SRAW, int RPW, int MC>
+template <bool PK, bool SRAW, int RPW, int MC, typename XT>
 __device__ __forceinline__ void mx_vp2_block(const MxGemvArgs& A, const uint8_t* wb, const MxPk2& v,
                                              const uint32_t (&rw)[RPW][5], const int (&nr)[RPW], int F, int U,
                                              int U1, int rr0, int xb0, const uint32_t (&rawm)[RPW],
-                                             const int (&first)[RPW], int fs, int ps, const float* xs, int xr,
+                                             const int (&first)[RPW], int fs, int ps, const XT* xs, int xr,
                                              int mc, int lane, const float* tab, float (&acc)[RPW][MC]) {
     const int V = U + 32 * F;
     if (V >= U1) return;
@@ -1055,7 +1070,7 @@ __device__ __forceinline__ void mx_vp2_block(const MxGemvArgs& A, const uint8_t*
         }
         d[r] = mx_e8m0_half(e);
     }
-    mx_vp2_unit<PK, RPW, MC>(qs, d, xs + 36 * (V - xb0), xr, mc, tab, acc);
+    mx_vp2_unit<PK, RPW, MC, XT>(qs, d, xs + 36 * (V - xb0), xr, mc, tab, acc);
 }
 
 /* A pass's loads: blocks U + 32 F (F < UF; a lane past U1 reads the last valid block again, never summed) of
@@ -1095,8 +1110,8 @@ __device__ __forceinline__ void mx_vp2_load(const MxGemvArgs& A, const uint8_t* 
  * blocks a lane a pass; the staged rows hold values from kb on, xr floats a row. PK: the packed form `v`, else
  * block_mxfp4 at `wb`. Rows past N read row N - 1 and are never stored. Each pass issues all of its loads
  * first; the compute keeps mx_row's blocks and order. FL: the form (kVpSraw, kVpRoll). */
-template <bool PK, int RPW, int MC, int UF, int FL>
-__device__ __forceinline__ void mx_vp2_row(const MxGemvArgs& A, const uint8_t* wb, const MxPk2& v, const float* xs,
+template <bool PK, int RPW, int MC, int UF, int FL, typename XT>
+__device__ __forceinline__ void mx_vp2_row(const MxGemvArgs& A, const uint8_t* wb, const MxPk2& v, const XT* xs,
                                            int xr, int kb, int U0, int U1, int n0, int mc, int lane,
                                            const float* tab, float (&acc)[RPW][MC]) {
     constexpr bool SRAW = (FL & kVpSraw) != 0, ROLL = (FL & kVpRoll) != 0;
@@ -1159,14 +1174,14 @@ __device__ __forceinline__ void mx_vp2_row(const MxGemvArgs& A, const uint8_t* w
              * branch-free form) hoisted every block's decode and spilled. */
             mx_for<UF>([&](auto fi) {
                 constexpr int F = decltype(fi)::value;
-                mx_vp2_block<PK, SRAW, RPW, MC>(A, wb, v, raw[F], nr, F, U, U1, rr0, xb0, rawm, first, fs, ps, xs,
+                mx_vp2_block<PK, SRAW, RPW, MC, XT>(A, wb, v, raw[F], nr, F, U, U1, rr0, xb0, rawm, first, fs, ps, xs,
                                                 xr, mc, lane, tab, acc);
             });
         } else {
             /* kVpRoll: block F from raw[0], then every later block's words one place up. */
 #pragma unroll 1
             for (int F = 0; F < UF; ++F) {
-                mx_vp2_block<PK, SRAW, RPW, MC>(A, wb, v, raw[0], nr, F, U, U1, rr0, xb0, rawm, first, fs, ps, xs,
+                mx_vp2_block<PK, SRAW, RPW, MC, XT>(A, wb, v, raw[0], nr, F, U, U1, rr0, xb0, rawm, first, fs, ps, xs,
                                                 xr, mc, lane, tab, acc);
 #pragma unroll
                 for (int f = 0; f + 1 < UF; ++f)
@@ -1181,14 +1196,14 @@ __device__ __forceinline__ void mx_vp2_row(const MxGemvArgs& A, const uint8_t* w
 
 /* One weight's rows: a marked entry its packed rows, or NaN sums when its header is not a packed [N, K]
  * weight's (as mx_row_vp); any other entry block_mxfp4. */
-template <int RPW, int MC, int UF, int FL>
+template <int RPW, int MC, int UF, int FL, typename XT>
 __device__ __forceinline__ void mx_vp2_rows(const MxGemvArgs& A, const uint8_t* wb, bool pk, const MxPk2& v,
-                                            const float* xs, int xr, int kb, int U0, int U1, int n0, int mc,
+                                            const XT* xs, int xr, int kb, int U0, int U1, int n0, int mc,
                                             int lane, const float* tab, float (&acc)[RPW][MC]) {
     if (!pk) {
-        mx_vp2_row<false, RPW, MC, UF, FL>(A, wb, v, xs, xr, kb, U0, U1, n0, mc, lane, tab, acc);
+        mx_vp2_row<false, RPW, MC, UF, FL, XT>(A, wb, v, xs, xr, kb, U0, U1, n0, mc, lane, tab, acc);
     } else if (v.ok) {
-        mx_vp2_row<true, RPW, MC, UF, FL>(A, wb, v, xs, xr, kb, U0, U1, n0, mc, lane, tab, acc);
+        mx_vp2_row<true, RPW, MC, UF, FL, XT>(A, wb, v, xs, xr, kb, U0, U1, n0, mc, lane, tab, acc);
     } else {
 #pragma unroll
         for (int r = 0; r < RPW; ++r)
@@ -1452,7 +1467,9 @@ __global__ __launch_bounds__(kMxThreads) void mx_vp2_kernel(MxGemvArgs A) {
  * K its LDS holds (two of gate_up's, three of down's), so at prefill heights it spends most of its time decoding
  * the same weights again. Here a work item is (live expert, 8 RN of its weight rows, RM of its rows: a tile), a
  * wave holds RN x RM sums in registers, and K goes in chunks of kP1tKc values (32 blocks, one a lane) staged once
- * a chunk for the tile's RM rows: each weight block is decoded once for RM activation rows.
+ * a chunk for the tile's RM rows: each weight block is decoded once for RM activation rows. The shape (RN, RM, and
+ * the staging as floats or as bf16 widened at each read) is kP1tShapes'; the served launch may split the live
+ * experts by their rows over two shapes (kP1tServed).
  *
  * Each output is the same sum as the decode band's, operation for operation: a chunk is one call of mx_vp2_rows
  * (UF 1, the first form), the twin's own loads, decode and mx_vp2_unit arithmetic -- lane L's blocks L, L + 32, ...
@@ -1464,13 +1481,52 @@ __global__ __launch_bounds__(kMxThreads) void mx_vp2_kernel(MxGemvArgs A) {
  * A dropped slot stores 0.0f, a tile of dropped slots only stores its zeros (as kVpZero), and a marked entry whose
  * header is not a packed [N, K] weight's gives NaN sums (mx_vp2_rows), as in every other form. The skip mark, the
  * live-tail ranges and the T4 tail fill are the twin's (mx_moe's p1 branch). */
-constexpr int kP1tRn = 4, kP1tRm = 8;   /* weight rows a wave, activation rows a tile */
 constexpr int kP1tKc = 1024;            /* values a K chunk */
 constexpr int kP1tGrid = 1024;          /* blocks a call at most (the items are spread over them) */
 
-template <int RN, int RM>
+/* mx_vp2_stage with the values kept as bf16 (XH): the same rows, chunks and layout (mx_xphys, `xr` values a row),
+ * two bytes a value, so a tile's chunk takes half the LDS. mx_vp2_unit widens each value at its read exactly as
+ * mx_vp2_stage widens it here (bf16w_lo / bf16w_hi of the same word), so the sums see the same floats. */
+template <int MC>
+__device__ __forceinline__ void mx_p1t_stage_h(const MxGemvArgs& A, uint16_t* xs, int p0, int mc, int k0, int k1,
+                                               int xr, int tid) {
+    const int c8n = (k1 - k0) >> 3;
+    for (int m = 0; m < mc; ++m) {
+        const int tok = mx_vp2_tok(A, p0 + m);
+        const uint16_t* xrow = tok >= 0 ? A.x + (long long)tok * A.x_ld + k0 : nullptr;
+        uint16_t* xd = xs + m * xr;
+        for (int c0 = 0; c0 < c8n; c0 += 4 * kMxThreads) {
+            uint32_t q[4][4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = c0 + j * kMxThreads + tid;
+                if (xrow) {
+                    mx_x8raw(xrow + 8 * (c < c8n ? c : c8n - 1), A.x_al != 0, q[j]);
+                } else {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) q[j][i] = 0u;
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = c0 + j * kMxThreads + tid;
+                if (c < c8n) {
+                    uint16_t* p = xd + mx_xphys(8 * c);
+                    *(uint2*)p = make_uint2(q[j][0], q[j][1]);
+                    *(uint2*)(p + 4) = make_uint2(q[j][2], q[j][3]);
+                }
+            }
+        }
+    }
+}
+
+/* XH: the chunk's rows staged as bf16 (mx_p1t_stage_h), else as floats (mx_vp2_stage). A.p1t_rlo / p1t_rhi (when
+ * p1t_rhi > 0): only the live experts with rlo < rows <= rhi, so two launches of different shapes over disjoint
+ * row-count ranges write every output once. */
+template <int RN, int RM, bool XH>
 __device__ __forceinline__ void mx_p1t_body(const MxGemvArgs& A) {
-    static_assert(RN * RM == 32, "a wave's sums are stored one a lane");
+    constexpr int S = RN * RM, NS = (S + 31) / 32;   /* a wave's sums; the stores a lane */
+    static_assert(RM <= 32, "a tile's live rows are one mask");
     R4D_DYN_LDS(r4d_u32x4, mx_lds);
     __shared__ __attribute__((aligned(16))) float s_kv[16];   /* kMxValues: static, at a constant address */
     __shared__ int s_nlive_v;
@@ -1482,7 +1538,8 @@ __device__ __forceinline__ void mx_p1t_body(const MxGemvArgs& A) {
     int* const live_s = live_e + A.n_expert;
     int* const live_t = live_s + A.n_expert;
     int* const tpre = (int*)(mx_smem + A.bal_off);   /* the live experts' tiles, a prefix (n_expert + 1 ints) */
-    float* const xs = (float*)(mx_smem + A.x_off);
+    using XT = typename std::conditional<XH, uint16_t, float>::type;
+    XT* const xs = (XT*)(mx_smem + A.x_off);
     /* The experts with rows, ascending, as mx_vp2_body's kVpP1 form finds them: an entry with the skip mark has
      * none (no item, no store, no byte of it read past the entry itself). */
     if (wave == 0) {
@@ -1496,6 +1553,10 @@ __device__ __forceinline__ void mx_p1t_body(const MxGemvArgs& A) {
                 const int ec = e < A.n_expert ? e : A.n_expert - 1;
                 mx_vp2_range(A, ec, &s[j], &t[j]);
                 sk[j] = ((uintptr_t)A.wtab[ec] & 2u) != 0;
+                if (A.p1t_rhi > 0) {
+                    const int n = t[j] - s[j];
+                    sk[j] = sk[j] || n <= A.p1t_rlo || n > A.p1t_rhi;
+                }
             }
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
@@ -1544,12 +1605,15 @@ __device__ __forceinline__ void mx_p1t_body(const MxGemvArgs& A) {
         if (pk) pv = mx_pk2_open(wb, A.N, A.K);
         const int p0 = rs + tile * RM, mc = min(RM, re - p0);
         const int n0 = cg * RG + wave * RN;
-        const int sr = lane % RN, sm = lane / RN;   /* the sum this lane stores: weight row n0 + sr, row p0 + sm */
         uint32_t livem = 0;                          /* the tile's live rows (a dropped slot writes zeros) */
         for (int m = 0; m < mc; ++m)
             if (mx_vp2_tok(A, p0 + m) >= 0) livem |= 1u << m;
         if (livem == 0) {   /* block-uniform: only dropped slots, whose rows are zeros in every form */
-            if (sm < mc && n0 + sr < A.N) mx_put(A.y + (long long)(p0 + sm) * A.y_ld + n0 + sr, 0.0f);
+#pragma unroll
+            for (int j = 0; j < NS; ++j) {
+                const int i = lane + 32 * j, sr = i % RN, sm = i / RN;
+                if (i < S && sm < mc && n0 + sr < A.N) mx_put(A.y + (long long)(p0 + sm) * A.y_ld + n0 + sr, 0.0f);
+            }
             continue;
         }
         float acc[RN][RM];
@@ -1560,15 +1624,18 @@ __device__ __forceinline__ void mx_p1t_body(const MxGemvArgs& A) {
         for (int k0 = 0; k0 < A.K; k0 += A.KC) {   /* every wave takes part in the barriers */
             const int k1 = min(k0 + A.KC, A.K);
             lds_barrier();
-            mx_vp2_stage<RM>(A, xs, p0, mc, k0, k1, XRC, tid);
+            if constexpr (XH) mx_p1t_stage_h<RM>(A, xs, p0, mc, k0, k1, XRC, tid);
+            else mx_vp2_stage<RM>(A, xs, p0, mc, k0, k1, XRC, tid);
             lds_barrier();
             if (n0 < A.N)
                 mx_vp2_rows<RN, RM, 1, 0>(A, wb, pk, pv, xs, XRC, k0, k0 / 32, k1 / 32, n0, mc, lane, tab, acc);
         }
         if (n0 >= A.N) continue;   /* wave-uniform */
-        /* Every sum's butterfly, then lane 0's value of sum (r, m) stored by lane r + RN m (the decode band stores
-         * lane 0's). */
-        float mine = 0.0f;
+        /* Every sum's butterfly, then lane 0's value of sum (r, m), i = r + RN m, stored by lane i mod 32 in its
+         * store i / 32 (the decode band stores lane 0's). */
+        float mine[NS];
+#pragma unroll
+        for (int j = 0; j < NS; ++j) mine[j] = 0.0f;
 #pragma unroll
         for (int r = 0; r < RN; ++r)
 #pragma unroll
@@ -1576,16 +1643,20 @@ __device__ __forceinline__ void mx_p1t_body(const MxGemvArgs& A) {
                 if (m >= mc) continue;   /* wave-uniform */
                 const float v = r4d_wave_sum(acc[r][m]);
                 const float v0 = __uint_as_float((uint32_t)__builtin_amdgcn_readfirstlane((int)__float_as_uint(v)));
-                if (lane == r + RN * m) mine = v0;
+                if (lane == (r + RN * m) % 32) mine[(r + RN * m) / 32] = v0;
             }
-        if (sm < mc && n0 + sr < A.N)
-            mx_put(A.y + (long long)(p0 + sm) * A.y_ld + n0 + sr, ((livem >> sm) & 1u) ? mine : 0.0f);
+#pragma unroll
+        for (int j = 0; j < NS; ++j) {
+            const int i = lane + 32 * j, sr = i % RN, sm = i / RN;
+            if (i < S && sm < mc && n0 + sr < A.N)
+                mx_put(A.y + (long long)(p0 + sm) * A.y_ld + n0 + sr, ((livem >> sm) & 1u) ? mine[j] : 0.0f);
+        }
     }
 }
 
-template <int RN, int RM>
+template <int RN, int RM, bool XH>
 __global__ __launch_bounds__(kMxThreads) void mx_p1t_kernel(MxGemvArgs A) {
-    mx_p1t_body<RN, RM>(A);
+    mx_p1t_body<RN, RM, XH>(A);
 }
 
 /* ================================================================== P1's WMMA twin (p1w): opt-in fast prefill
@@ -2394,6 +2465,63 @@ constexpr int kP1Fill = 8;        /* items a block on average: a tail of small i
  * a block; item size and fill within 1.5% of each other from 96 KiB and 2 a block up). */
 constexpr int kP1Grid = 512;
 
+/* mx_p1t_kernel's shapes (RN weight rows a wave, RM rows a tile, XH bf16 staging): the served one and the ones a
+ * checker can force (r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_form's form kP1tForm0 + index; forms 0-2 are the twin, the
+ * served register-tiled shape and the WMMA twin). Every shape gives the same bytes. */
+constexpr int kP1tForm0 = 100;
+struct MxP1tShape {
+    int rn, rm;
+    bool xh;
+};
+constexpr MxP1tShape kP1tShapes[] = {
+    { 4, 8, false }, { 8, 4, false }, { 8, 8, false }, { 4, 8, true },  { 8, 4, true },  { 8, 8, true },
+    { 4, 16, true }, { 2, 16, true }, { 4, 4, true },  { 2, 8, true },  { 16, 4, true }, { 8, 16, true },
+    { 2, 4, true },  { 4, 2, true },  { 16, 2, true }, { 16, 8, true },
+};
+constexpr int kP1tNShapes = (int)(sizeof(kP1tShapes) / sizeof(kP1tShapes[0]));
+/* Two launches split by an expert's rows: experts of at most `rows` rows on shape `lo`, the rest on `hi`
+ * (checker forms kP1tForm0 + kP1tSplit0 + index). */
+struct MxP1tSplit {
+    int rows, lo, hi;
+};
+constexpr int kP1tSplit0 = 64;
+constexpr MxP1tSplit kP1tSplits[] = {
+    { 4, 8, 5 }, { 4, 8, 3 }, { 8, 3, 5 }, { 4, 12, 5 }, { 8, 8, 6 }, { 16, 3, 6 }, { 4, 8, 6 }, { 8, 5, 6 },
+    { 8, 8, 3 }, { 2, 8, 3 }, { 4, 12, 3 }, { 4, 13, 3 }, { 3, 8, 3 }, { 6, 8, 3 },
+};
+constexpr int kP1tNSplits = (int)(sizeof(kP1tSplits) / sizeof(kP1tSplits[0]));
+/* The served form (a shape index, or kP1tSplit0 + a split's): split 1, experts of 1-4 rows on 4 x 4 tiles and the
+ * rest on 4 x 8, both staged as bf16. ds41_mxfp4_device_check p1shape on the R9700, real routing (layers 12/25/36),
+ * gate_up + down against the old served 4 x 8 float-staged shape: packed weights 8.4% less time at M 256, 4.5% at
+ * 512, 2.5% at 2048; block_mxfp4 1-2% (within noise). TILESHAPE-20261115.md. */
+constexpr int kP1tServed = kP1tSplit0 + 1;
+template <int I>
+int mx_p1t_emit(RadStream s, const MxGemvArgs& A, long long T, long long L, int grid_req) {
+    constexpr int RN = kP1tShapes[I].rn, RM = kP1tShapes[I].rm;
+    constexpr bool XH = kP1tShapes[I].xh;
+    MxGemvArgs B = A;
+    B.XM = RM;
+    const long long lds = B.x_off + (long long)RM * (kP1tKc + kP1tKc / 8) * (XH ? 2 : 4);
+    if (lds > 65536) return R4D_NO(RAD_E_UNSUPPORTED);
+    const long long ncg = (B.N + kMxWaves * RN - 1) / (kMxWaves * RN);
+    const long long items = ((T + RM - 1) / RM + L) * ncg;   /* at least the live tiles' items */
+    const unsigned grid = grid_req > 0 ? (unsigned)(grid_req < 65535 ? grid_req : 65535)
+                                       : (unsigned)(items < kP1tGrid ? items : kP1tGrid);
+    return R4D_EMIT(s, (mx_p1t_kernel<RN, RM, XH>), dim3(grid), dim3(kMxThreads), (unsigned)lds, B);
+}
+template <int... I>
+int mx_p1t_pick(RadStream s, const MxGemvArgs& A, int shape, long long T, long long L, int grid,
+                std::integer_sequence<int, I...>) {
+    int rc = R4D_NO(RAD_E_INVAL);
+    (void)((shape == I ? (rc = mx_p1t_emit<I>(s, A, T, L, grid), true) : false) || ...);
+    return rc;
+}
+/* One launch of mx_p1t_kernel in shape `shape` (kP1tShapes) over the call's args. */
+int mx_p1t_launch(RadStream s, const MxGemvArgs& A, int shape, long long T, long long L, int grid) {
+    if (shape < 0 || shape >= kP1tNShapes) return R4D_NO(RAD_E_INVAL);
+    return mx_p1t_pick(s, A, shape, T, L, grid, std::make_integer_sequence<int, kP1tNShapes>{});
+}
+
 /* RADIANCE_EXPERIMENTAL_DS41_P1_TILED (r4d_ds41_tall.h): the P1 twin's served calls on mx_p1t_kernel. Read once (the
  * row table states it at startup, r4d_rows.cpp). */
 bool mx_p1_tiled() { return r4d_ds41_p1_tiled(); }
@@ -2485,9 +2613,10 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
     if (p1 && gemv && table && ty == MX_FP4) {
         if (probe || force >= 0) return R4D_NO(RAD_E_UNSUPPORTED);
         const MxP1Opts o = po ? *po : MxP1Opts{};
-        /* `p1t`: a checker's form for the call (0 the twin's kernel, 1 the register-tiled one, 2 the WMMA one); else
-         * the switches (WMMA first). */
-        const int form = p1t >= 0 ? p1t : mx_p1_wmma() ? 2 : mx_p1_tiled() ? 1 : 0;
+        /* `p1t`: a checker's form for the call (0 the twin's kernel, 1 the register-tiled one in its served shape,
+         * 2 the WMMA one, kP1tForm0 + i the register-tiled one in shape or split i); else the switches (WMMA
+         * first). */
+        const int form = p1t >= 0 ? (p1t >= kP1tForm0 ? 1 : p1t) : mx_p1_wmma() ? 2 : mx_p1_tiled() ? 1 : 0;
         const bool tiled = form == 1;
         /* `p1_tail` 0 (the card expert stager's wave relaunches under RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE): no
          * tail fill this call. The layer's own launch of the same op, earlier on the stream into the same output
@@ -2527,22 +2656,30 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
             return mx_tail_zero(s, A.y, A.y_ld, A.off, A.n_expert, A.M, A.N, nullptr);
         }
         if (tiled) {
-            /* mx_p1t_kernel: tiles of kP1tRm rows, K in chunks of kP1tKc staged for a tile's rows (no whole row is
-             * staged), 8 kP1tRn weight rows an item, the items spread over at most kP1tGrid blocks (`grid` a
-             * checker's count). Dynamic LDS: the live experts' records, the tile prefix, then a chunk's rows. */
-            A.XM = kP1tRm; A.XLM = 0; A.KC = kP1tKc; A.XR = 0;
+            /* mx_p1t_kernel: tiles of RM rows, K in chunks of kP1tKc staged for a tile's rows (no whole row is
+             * staged), 8 RN weight rows an item, the items spread over at most kP1tGrid blocks (`grid` a checker's
+             * count), in the served shape (kP1tServed). Dynamic LDS: the live experts' records, the tile prefix, then
+             * a chunk's rows. */
+            A.XLM = 0; A.KC = kP1tKc; A.XR = 0;
             A.n_expert = (int)ne; A.top_k = (int)top_k; A.a_sorted = a_sorted ? 1 : 0; A.AR = (int)AR;
             A.live_end = 1;
             A.x_al = mx_al16(A_->data, x_ld) ? 1 : 0;
             A.live_off = kMxVp2Live;
             A.bal_off = (int)(kMxVp2Live + mx_r16(12LL * ne));
             A.x_off = (int)(A.bal_off + mx_r16(4LL * (ne + 1)));
-            const long long lds = A.x_off + (long long)kP1tRm * (kP1tKc + kP1tKc / 8) * 4;
-            const long long ncg = (N + kMxWaves * kP1tRn - 1) / (kMxWaves * kP1tRn);
-            const long long items = ((T + kP1tRm - 1) / kP1tRm + L) * ncg;   /* at least the live tiles' items */
-            const unsigned grid = o.grid > 0 ? (unsigned)(o.grid < 65535 ? o.grid : 65535)
-                                             : (unsigned)(items < kP1tGrid ? items : kP1tGrid);
-            const int rc = R4D_EMIT(s, (mx_p1t_kernel<kP1tRn, kP1tRm>), dim3(grid), dim3(kMxThreads), (unsigned)lds, A);
+            /* The shape: the served one, or a checker's (p1t >= kP1tForm0: kP1tShapes[p1t - kP1tForm0], or a split of
+             * two). */
+            const int sh = p1t >= kP1tForm0 ? p1t - kP1tForm0 : kP1tServed;
+            int rc = RAD_OK;
+            if (sh >= kP1tSplit0) {
+                const MxP1tSplit& sp = kP1tSplits[sh - kP1tSplit0];
+                A.p1t_rlo = 0; A.p1t_rhi = sp.rows;
+                rc = mx_p1t_launch(s, A, sp.lo, T, L, o.grid);
+                A.p1t_rlo = sp.rows; A.p1t_rhi = 0x7fffffff;
+                if (rc == RAD_OK) rc = mx_p1t_launch(s, A, sp.hi, T, L, o.grid);
+            } else {
+                rc = mx_p1t_launch(s, A, sh, T, L, o.grid);
+            }
             if (rc != RAD_OK || !tail_fill) return rc;
             /* T4: the slots routed to other ranks, [off[ne], T), are zeros after every call. */
             return mx_tail_zero(s, A.y, A.y_ld, A.off, A.n_expert, A.M, A.N, nullptr);
@@ -2694,10 +2831,14 @@ extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1(const RadArgs* a, RadStream s
     return mx_moe(a, s, true, false, nullptr, -1, false, true, -1, -1, true);
 }
 /* Checker-only: the P1 twin in form `form` for the call whatever RADIANCE_EXPERIMENTAL_DS41_P1_TILED says (0 the
- * twin's kernel, mx_vp2_kernel's kVpP1 form; 1 the register-tiled mx_p1t_kernel), on `grid` blocks (0 the
+ * twin's kernel, mx_vp2_kernel's kVpP1 form; 1 the register-tiled mx_p1t_kernel; 2 the WMMA mx_p1w_kernel;
+ * kP1tForm0 + i the register-tiled kernel in shape or split i, kP1tShapes / kP1tSplits), on `grid` blocks (0 the
  * launcher's choice), so a check holds the two to each other and to the decode band byte for byte and times both. */
 extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_form(const RadArgs* a, RadStream s, int form, int grid) {
-    if (form < 0 || form > 2 || grid < 0) return RAD_E_INVAL;
+    if (form < 0 || grid < 0) return RAD_E_INVAL;
+    if (form > 2 && !(form >= kP1tForm0 && (form - kP1tForm0 < kP1tNShapes ||
+                                            (form - kP1tForm0 >= kP1tSplit0 && form - kP1tForm0 < kP1tSplit0 + kP1tNSplits))))
+        return RAD_E_INVAL;
     MxP1Opts o;
     o.grid = grid;
     return mx_moe(a, s, true, false, nullptr, -1, false, true, -1, -1, true, &o, form);
