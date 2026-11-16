@@ -38,6 +38,17 @@
 #   - --early K (QxK, ..._P1_EARLY): up to K of the next card-path layer's units copied into the ring before its routing
 #     counts, so the link works through attention and the router; exact (scheduling only). OFF (0) until window H55
 #     measures it (OVERLAP-20261115.md).
+#   - --arena-split 0|1 (Qes, ..._P1_LEND_ARENA_SPLIT): the lent arena's slots (Qe64) taken back only by a step at the
+#     full plan, so an armed decode pass leaves their residents published (~38 more file-tier units a card stay on the
+#     card through decode at N512). Residency only, exact. OFF (0) until window H57 measures it (VRAMLEND-20261116.md).
+#   - --kv-auto T (LkT): the KV pool from the streams: --ctx-per-stream = T x 5/4 rounded up to 16 tokens, T the
+#     measured peak KV tokens a stream ((kv_tokens_used at the end + hit_cut_tokens) / streams from a run with
+#     prefix_evictions 0; NL-SQL at 512 streams: 452 -> 576 a stream, L294912). 0 (default): --ctx-per-stream as given.
+#     Placement only: VRAM the pool does not need holds static residents. OFF until H57 measures it.
+#   - --ram-per-seq-mib N (mSN, ..._RAM_PER_SEQ_MIB): the RAM budget's per-sequence growth term (the engine's 32 MiB
+#     when not given). Measured growth after serve() at 512 streams is <= 4.5 GiB in all (<= 8.8 MiB a sequence),
+#     so 16 holds it twice over and gives the expert RAM cache 8 GiB more than 32 (VRAMLEND-20261116.md). Unset by
+#     default.
 #   - --served-model-name ds41 (a name only; --served-name sets another) and --radiance-home only when given
 #     (RADIANCE_HOME otherwise).
 #
@@ -45,7 +56,8 @@
 #                       [--ctx-per-stream 1152] [--profile FILE] [--mirror DIR] [--shared-head 32] [--served-name ds41]
 #                       [--radiance-home DIR] [--hybrid 60] [--max-seq-len N] [--tiled 0|1] [--tail-once 0|1]
 #                       [--swiglu-span 0|1] [--engram-early 0|1] [--hybrid-prefill 60] [--fast-prefill 0|1]
-#                       [--fast-dense 0|1] [--fast-attn 0|1] [--early K] [--dry-run]
+#                       [--fast-dense 0|1] [--fast-attn 0|1] [--early K] [--arena-split 0|1] [--kv-auto T]
+#                       [--ram-per-seq-mib N] [--dry-run]
 #                       [-- more radiance flags, e.g. --expert-stats FILE to record a profile; outside the measured set]
 #   RADIANCE_BIN (default: radiance on PATH, else build/bin/radiance), RADIANCE_HOME as for any radiance run.
 # --dry-run prints the environment and the command and starts nothing. Otherwise the script becomes the server (exec:
@@ -53,7 +65,7 @@
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
-EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=0 FASTDN=1 FASTAT=0 EARLY=0
+EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=0 FASTDN=1 FASTAT=0 EARLY=0 ASPLIT=0 KVAUTO=0 PERSEQ=""
 while (( $# )); do
   case $1 in
     --model) MODEL=${2:?}; shift ;;
@@ -78,6 +90,9 @@ while (( $# )); do
     --fast-dense) FASTDN=${2:?}; shift ;;
     --fast-attn) FASTAT=${2:?}; shift ;;
     --early) EARLY=${2:?}; shift ;;
+    --arena-split) ASPLIT=${2:?}; shift ;;
+    --kv-auto) KVAUTO=${2:?}; shift ;;
+    --ram-per-seq-mib) PERSEQ=${2:?}; shift ;;
     --dry-run) DRY=1 ;;
     --) shift; EXTRA=("$@"); break ;;
     -h|--help) sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -94,10 +109,14 @@ num --hybrid "$HYBRID" 0; (( 10#$HYBRID <= 400 )) || die "--hybrid takes 0 (off)
 num --hybrid-prefill "$HYBPF" 0; (( 10#$HYBPF <= 400 )) || die "--hybrid-prefill takes 0 (off) or a share of 1-400 percent, not '$HYBPF'"
 [[ -z "$SEQLEN" ]] || num --max-seq-len "$SEQLEN" 64
 num --early "$EARLY" 0; (( 10#$EARLY <= 64 )) || die "--early takes 0 (off) or 1-64 units, not '$EARLY'"
-for v in "--tiled $TILED" "--tail-once $TAILONCE" "--swiglu-span $SPAN" "--engram-early $ENGEARLY" "--fast-prefill $FASTPF" "--fast-dense $FASTDN" "--fast-attn $FASTAT"; do
+num --kv-auto "$KVAUTO" 0; (( 10#$KVAUTO == 0 || (10#$KVAUTO >= 16 && 10#$KVAUTO <= 1048576) )) || die "--kv-auto takes 0 (off) or 16-1048576 tokens a stream, not '$KVAUTO'"
+[[ -z "$PERSEQ" ]] || { num --ram-per-seq-mib "$PERSEQ" 0; (( 10#$PERSEQ <= 1048576 )) || die "--ram-per-seq-mib takes 0-1048576, not '$PERSEQ'"; }
+for v in "--arena-split $ASPLIT" "--tiled $TILED" "--tail-once $TAILONCE" "--swiglu-span $SPAN" "--engram-early $ENGEARLY" "--fast-prefill $FASTPF" "--fast-dense $FASTDN" "--fast-attn $FASTAT"; do
   [[ ${v#* } == [01] ]] || die "${v% *} takes 0 or 1, not '${v#* }'"
 done
 STREAMS=$((10#$STREAMS)) CTX=$((10#$CTX))
+# LkT: the pool from the measured peak tokens a stream, x 5/4, a whole number of 16-token blocks a stream.
+(( 10#$KVAUTO > 0 )) && CTX=$(( (10#$KVAUTO * 5 + 63) / 64 * 16 ))
 (( FASTPF == 1 )) && TILED=0   # Qw takes the register-tiled twin's calls; the core refuses both switches at once (H45)
 if (( ! DRY )); then
   [[ -f "$MODEL" ]] || die "no model container at $MODEL"
@@ -136,6 +155,7 @@ ENV=(
   RADIANCE_EXPERIMENTAL_DS41_LCP=2048
   RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1
   RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=1
+  RADIANCE_EXPERIMENTAL_DS41_RAM_PER_SEQ_MIB=${PERSEQ:+$((10#$PERSEQ))}   # mSN: the budget's per-sequence term (empty: 32)
   RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1
   RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD="$SHEAD"
   RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1
@@ -199,6 +219,7 @@ ENV=(
   RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0
   RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS=
   RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=64
+  RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT=$ASPLIT   # Qes: the arena's own take-back, exact (--arena-split; 0 off until H57)
   RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=64
   RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=$((10#$HYBRID))   # QyP: hybrid decode, the CPU's share P%; 0 off
   RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT=            # empty: the share adapts (Qy, not Qyf)

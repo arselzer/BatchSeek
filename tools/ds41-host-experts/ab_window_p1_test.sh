@@ -400,6 +400,44 @@ xexpect 1 'Qx unrequested activation' "$T/qx-good.log" '' start
 xexpect 0 'Qx explicitly off' "$T/qt-off.log" '' exit
 xexpect 1 'Qx asked, no line' "$T/qt-off.log" 12 start
 
+# Qes's gates: rank 0's lent arena split line once at startup, and at exit some rank's arena residents kept through
+# armed passes above 0. mS's: the budget's per-sequence term names the arm's MiB (32 without the part).
+eval "$(sed -n '/^qes_gate() {/,/^}/p;/^ms_gate() {/,/^}/p' "$W")"
+declare -F qes_gate >/dev/null && declare -F ms_gate >/dev/null || { echo "FAIL no qes_gate / ms_gate in $W"; exit 1; }
+{
+  echo "I ds41 p1: lent arena split: on (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT=1): the 38 arena slots are taken back only by a step at the full plan ..."
+  for rank in 0 1 2 3; do
+    echo "I[$rank] ds41 p1 stats, rank $rank: passes 3; lent ring: 38 slots (38 in the activation arena), 38 residents now; 4 bursts took them back (152 residents withdrawn), 5 returns; lent arena split: 1200 passes took the ring's slots and left the arena's ($((rank * 1000)) arena residents through them), 38 arena loads begun in them from the RAM cache, the arena resident now"
+  done
+} > "$T/qes-good.log"
+sed -E "s/left the arena's \(([0-9]+) arena/left the arena's (0 arena/" "$T/qes-good.log" > "$T/qes-idle.log"
+cat "$T/qes-good.log" "$T/qes-good.log" > "$T/qes-twice.log"
+eexpect() {
+  local want=$1 label=$2 rc; shift 2
+  qes_gate "$@" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$label"; else bad "$label: exit $rc, want $want"; fi
+}
+eexpect 0 'Qes startup line' "$T/qes-good.log" 1 start
+eexpect 0 'Qes arena residents kept at exit' "$T/qes-good.log" 1 exit
+eexpect 1 'Qes line twice' "$T/qes-twice.log" 1 start
+eexpect 0 'Qes idle at startup' "$T/qes-idle.log" 1 start
+eexpect 1 'Qes never kept an arena resident' "$T/qes-idle.log" 1 exit
+eexpect 1 'Qes unrequested activation' "$T/qes-good.log" '' start
+eexpect 0 'Qes explicitly off' "$T/qt-off.log" '' exit
+eexpect 1 'Qes asked, no line' "$T/qt-off.log" 1 start
+echo "I ram budget: later 16384 MiB  per-sequence growth, 32 MiB x --max-num-seqs 512 (measured ...)" > "$T/ms-32.log"
+echo "I ram budget: later  8192 MiB  per-sequence growth, 16 MiB x --max-num-seqs 512 (measured ...)" > "$T/ms-16.log"
+mexpect() {
+  local want=$1 label=$2 rc; shift 2
+  ms_gate "$@" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$label"; else bad "$label: exit $rc, want $want"; fi
+}
+mexpect 0 'mS16 named' "$T/ms-16.log" 16
+mexpect 1 'mS16 but 32 reserved' "$T/ms-32.log" 16
+mexpect 0 'no mS: the default 32' "$T/ms-32.log" ''
+mexpect 1 'no mS, but 16 reserved' "$T/ms-16.log" ''
+mexpect 0 'no RAM budget: nothing to check' "$T/qt-off.log" 16
+
 # ---- the balance receipt: an old generic PASS is not requested-height evidence
 eval "$(sed -n '/^bal_receipt_bound() {/,/^}/p' "$W")"
 declare -F bal_receipt_bound >/dev/null || { echo "FAIL no bal_receipt_bound in $W"; exit 1; }
@@ -538,6 +576,17 @@ QXNOP=$REF-Qx12
 QXBIG=$FAST-Qx65
 QXTWO=$FAST-Qx4-Qx8
 ARMS="$ARMS $QX $QXNOP $QXBIG $QXTWO"
+QES=$FAST-Qd64-Qy60-Qes
+QESNOQE=${FAST/-Qe64/}-Qes
+QESNOP=$REF-Qes
+QESTWO=$FAST-Qes-Qes
+LK=$FAST-N8-Lk452
+LKL=$FAST-L1024-N8-Lk452
+LKNON=$FAST-Lk452
+LKLOW=$FAST-N8-Lk8
+MS=$FAST-mA-mS16
+MSNOMA=$FAST-mS16
+ARMS="$ARMS $QES $QESNOQE $QESNOP $QESTWO $LK $LKL $LKNON $LKLOW $MS $MSNOMA"
 run_loop() {   # actual balance-oracle bound; every model action remains stubbed
  (
   set +u
@@ -918,6 +967,38 @@ done
 qdskip "$QXNOP" "Qx needs P1; the arm is skipped"
 qdskip "$QXBIG" "Qx65: Qx takes 1-64 (units); the arm is skipped"
 qdskip "$QXTWO" "two Qx parts; the arm is skipped"
+# ---- 8d. Qes, LkT and mSN in the arm loop: Qes on the fast arm with Qd64-Qy60 states the switch 1 and every other arm 0;
+# Qes without the lent arena, without P1 and twice skipped. Lk452 at N8: --max-model-len 4608 (8 x 576); with an L
+# part, without an N part and under 16 tokens skipped. mS16 with mA states 16, every other arm empty; without mA
+# skipped.
+sec=$(section "$QES")
+if [[ -z "$sec" ]]; then bad "the Qes arm $QES was not launched: $(grep -m3 "arm $QES" "$T/loop.txt")"
+else
+  has "Qes" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT 1
+  has "Qes beside Qe64" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA 64
+  has "Qes beside Qd64" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS 64
+fi
+for a in "$REF" "$FAST" "$QX" "$QZ" "$LK" "$MS"; do
+  has "no Qes part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT 0
+done
+qdskip "$QESNOQE" "Qes needs P1 and the lent arena (a QeK part); the arm is skipped"
+qdskip "$QESNOP" "Qes needs P1 and the lent arena (a QeK part); the arm is skipped"
+qdskip "$QESTWO" "two Qes parts; the arm is skipped"
+sec=$(section "$LK")
+if [[ -z "$sec" ]]; then bad "the Lk arm $LK was not launched: $(grep -m3 "arm $LK" "$T/loop.txt")"
+elif grep -q "  ARGS: .*--max-model-len 4608\b" <<< "$sec" && ! grep -q "  ARGS: .*--max-model-len 4608 .*--max-model-len" <<< "$sec"; then
+  ok "Lk452 at N8: --max-model-len 4608 (8 x 576)"
+else bad "Lk452 at N8: $(grep -oE -- '--max-model-len [0-9]+' <<< "$sec" | tr '\n' ' ')"; fi
+qdskip "$LKL" "Lk452 sizes the KV pool, and an L or Lm part sets it too; the arm is skipped"
+qdskip "$LKNON" "Lk452 sizes the KV pool from the streams, and there is no N part; the arm is skipped"
+qdskip "$LKLOW" "Lk8: Lk takes 16-1048576 (tokens a stream); the arm is skipped"
+sec=$(section "$MS")
+if [[ -z "$sec" ]]; then bad "the mS arm $MS was not launched: $(grep -m3 "arm $MS" "$T/loop.txt")"
+else has "mS16" "$sec" RADIANCE_EXPERIMENTAL_DS41_RAM_PER_SEQ_MIB 16; fi
+for a in "$REF" "$FAST" "$QES" "$LK"; do
+  has "no mS part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_RAM_PER_SEQ_MIB ""
+done
+qdskip "$MSNOMA" "mS16 sets the RAM budget's per-sequence term, which needs mA; the arm is skipped"
 
 short_out=$(run_loop 2048)
 for a in "$COLD4K" "$PC4K"; do

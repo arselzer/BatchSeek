@@ -161,6 +161,15 @@ constexpr const char* kGraceEnv    = "RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS";
  * takes the ring's. The deepseek41 plugin declares at a smaller step (RadArchProbe::shape_probe_ok)
  * only beside this switch and kEnv (lend_arena_asked), so without them nothing changes. */
 constexpr const char* kLendArenaEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA";
+/* The lent arena's own take-back (kLendArenaSplitEnv=1; 0 / unset / empty off, the default, and then nothing
+ * changes): the arena's slots are taken back only by a step at the full plan, the only step whose buffers reach
+ * them; a card-path pass below it (an armed decode pass of at most the smallest level's rows above all) takes the
+ * ring's slots back as before and leaves the arena's residents published, as it leaves the slab's. The arena's
+ * slots have a grace of their own (kGraceEnv, from the last full step), so they come back during armed decode;
+ * in a pass that takes the ring a reload of an arena slot begins only from the RAM cache, never from the drive,
+ * and the kept slab's reloads still wait for both. Needs kLendArenaEnv. Residency moves, bytes do not
+ * (card_expert_stager.h, the lent arena). */
+constexpr const char* kLendArenaSplitEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT";
 /* The lent slots follow live decode routing (kLendHeatEnv=S; 0 off, the default; 1-kMaxLendHeat: at most S
  * slots a rank handed to another unit a pass). Each rank keeps, by file-tier unit, a decayed count of the
  * decode rows routed to it (pure trunk decode passes only; it halves every kLendHeatHalfEnv decode rows,
@@ -287,6 +296,7 @@ constexpr const char* kLogStats = "ds41 p1 stats, rank";        /* each rank, at
 constexpr const char* kLogChunk = "ds41 p1 chunk:";             /* rank 0, after each card-path chunk */
 constexpr const char* kLogLend  = "ds41 p1: lent ring";         /* rank 0, at startup, with kLendEnv */
 constexpr const char* kLogLendArena = "ds41 p1: lent arena";    /* rank 0, at startup, with kLendArenaEnv */
+constexpr const char* kLogLendArenaSplit = "ds41 p1: lent arena split";   /* rank 0, at startup, with kLendArenaSplitEnv */
 constexpr const char* kLogLendHeat = "ds41 p1: lent heat";      /* rank 0, at startup, with kLendHeatEnv */
 constexpr const char* kLogLendSlab = "ds41 p1: lent slab";      /* rank 0, at startup, with kLendSlabEnv */
 constexpr const char* kLogLendAudit = "ds41 p1: lent audit";    /* rank 0, at startup, with kLendAuditEnv; and every difference */

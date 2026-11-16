@@ -109,6 +109,7 @@ struct Tunables {
     int  lend_heat_prior = -1;                                  /* the prior's weight in decode rows (-1: the half-life) */
     int  lend_slab = 0;                                         /* the lent slab's slots a rank (0 off) */
     bool lend_audit = false;                                    /* every lent slot read back and compared */
+    bool lend_arena_split = false;                              /* ds41p1::kLendArenaSplitEnv: the arena's own take-back */
     int  lend_rest_ms = 0;                                      /* the rest after a long prefill (0 none) */
     int  decode_rows = 0;                                       /* decode passes on the cards from N rows (0 off) */
     int  hybrid = 0;                                            /* hybrid decode: the CPU's share, percent (0 off) */
@@ -125,7 +126,7 @@ struct Tunables {
  * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, lend_arena 0-64,
  * grace_ms 0-60000, lend_heat 0-8, lend_heat_half 1-100000000 (unset: 100, or 2000 with lend_slab),
  * lend_heat_margin 100-1000, lend_heat_prior 0-100000000 (unset: the half-life), lend_slab 0-256, lend_rest_ms 0-600000 (unset: 5000 with lend_heat or lend_slab, else
- * 0), decode_rows 0 or 17-4096, hybrid 0-400, hybrid_prefill 0-400, early 0-64), align "end" or "start", swiglu_span, lend_audit, tiled and
+ * 0), decode_rows 0 or 17-4096, hybrid 0-400, hybrid_prefill 0-400, early 0-64), align "end" or "start", swiglu_span, lend_audit, lend_arena_split, tiled and
  * tail_once 0/off or 1/on (default off), hybrid_adapt 0/off or 1/on (default on). False with the reason on anything else. */
 bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables* t, std::string* why);
 
@@ -325,6 +326,19 @@ private:
  * writes are not behind the DMA lane, the mover's stream waits on the end of every such step (as on an
  * armed pass's end), so a later reload copy lands only after the step's last reader of the arena.
  *
+ * The lent arena's own take-back (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT=1, default 0: off, the arena's slots
+ * taken back as the ring's): a card-path pass below the full plan (an armed decode pass of at most the smallest
+ * level's rows above all) writes the ring and the buffers of the level it runs at, never the arena's top, so it takes
+ * the ring's slots back alone (RingLender::set_arena, begin_pass's `arena` = the step runs at the full plan, which
+ * FileStager reads from the arena's level before the pass's first op). The arena's residents stay published through
+ * it as the slab's do: FileStager::p1_layer and the hybrid split leave a published lent resident to the plugin's own
+ * ops (Mover::file_unit_in_slab), which read it in block form at any height. The arena's slots have their own grace,
+ * from the end of the last full step, and return while armed passes go on; in such a pass an arena slot's reload
+ * begins only from the RAM cache (LendHost::load_ram), so the card path keeps the drive. A full step still takes them
+ * back before its first op (a queued reload copy fenced on the compute stream), and the mover's stream still waits on
+ * the end of every full or armed pass, so no reload copy into the arena's top lands under a full step's activations.
+ * Residency moves, bytes do not: replies are as without it.
+ *
  * The lent slots' heat (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT=S, default 0: off, the slots keep the units
  * the profile gave them): which units hold the lent slots follows live decode routing. LendHeat keeps, by
  * plan unit of the rank, a decayed count of the decode rows routed to it (FileStager counts each routed
@@ -465,6 +479,10 @@ public:
         /* The rest's (all 0 without it): passes at which a slot's reload waited for the drive, loads begun
          * from the RAM cache during it. */
         uint64_t rested = 0, rest_ram = 0;
+        /* The arena split's (all 0 without it): passes that took the ring's slots back and left the arena's
+         * residents published, the arena residents they left, and the arena loads begun in such passes (from the
+         * RAM cache). */
+        uint64_t arena_spared = 0, arena_spared_res = 0, arena_p1_loads = 0;
     };
     /* n slots, the grace in ms; the last `keep` of them (0..ds41p1::kMaxLendSlab) are kept (the slab's:
      * never taken back), the others (at most 2 x ds41p1::kMaxLend) the ring's and the arena's. Every slot
@@ -479,7 +497,22 @@ public:
      * wait on the residents' last reader). Without, once the grace has run out the reloads begin; landed
      * loads are copied, passed copies published, and further loads begun as buffers come free. Never
      * fails: a host call that fails leaves its unit on the CPU path. */
-    int  begin_pass(bool p1, int64_t now_ms);
+    int  begin_pass(bool p1, int64_t now_ms, bool arena = true);
+    /* The arena split (ds41p1::kLendArenaSplitEnv; set after init, before the first pass; off unless called):
+     * slots [first, n - kept) are the arena's, the ones before them the ring's. From here on begin_pass's
+     * `arena` says whether the pass takes the arena's slots back as well (a step at the full plan, the only one
+     * whose buffers reach them); a pass with p1 and without it takes the ring's alone and leaves the arena's
+     * residents published, as it leaves the kept slots'. Each group has its own grace (from the end of the last
+     * pass that took it) and its own return; in a pass that takes the ring, an arena slot that wants its unit
+     * begins a load only where the RAM cache gives it (LendHost::load_ram), never a drive read, and the kept
+     * slots' loads still wait until neither group is lent out. Without it (first < 0) every slot that is not kept
+     * is the ring's and `arena` is ignored: the lender as before. -1 when first is out of range or it is called
+     * twice; 0 done. */
+    int  set_arena(int first);
+    int  arena_first() const { return arena_; }
+    bool arena_slot(int k) const { return arena_ >= 0 && k >= arena_ && k < n() - keep_; }
+    /* With the split: whether the arena's slots are lent out now (always false without it). */
+    bool arena_lent() const { return arena_ >= 0 && lent_g_[1]; }
     /* Bring-up, before the first pass: the kept slots' loads worked on (landed ones copied, passed copies
      * published, further loads begun), whatever the other slots' state. Returns the kept slots still on
      * their way (wanted, reading, landed or copying); the caller calls again until 0, or stops and leaves
@@ -508,7 +541,7 @@ public:
     int  audit_residents();
     /* A pass that took the slots back ended at now_ms: the grace runs from here. */
     void end_p1(int64_t now_ms);
-    bool lent() const { return lent_; }
+    bool lent() const { return lent_g_[0] || (arena_ >= 0 && lent_g_[1]); }
     int  residents() const;
     /* Slots holding a buffer or lease (a load in flight, landed, or a copy in flight). */
     int  busy() const;
@@ -536,25 +569,36 @@ private:
      * heat policy gave the slot another unit, not yet published there (the retargets count). Lost: the
      * read-back audit gave the slot up, for good. */
     enum class St : uint8_t { Idle, Want, Reading, Landed, Copying, Resident, Failed, Lost };
-    struct Slot { St st = St::Idle; bool cancel = false; bool moved = false; bool keep = false; };
+    struct Slot { St st = St::Idle; bool cancel = false; bool moved = false; bool keep = false; uint8_t grp = 0; };
     LendHost* host_ = nullptr;
     std::vector<Slot> slot_;
     int64_t grace_ = 0, last_p1_ = 0, rest_ = 0, now_ = 0;
     bool    p1_now_ = false, held_ = false;   /* a pass that took the slots is running; the host holds drive reads */
     void hold(bool on);
     int  keep_ = 0;
-    bool lent_ = true, any_p1_ = false;
+    /* By group (0 the ring's, 1 the arena's; only 0 without the split): lent out, any pass took it yet, the end
+     * of the last pass that took it, and whether the pass running now took it (end_p1 moves those ends). */
+    bool    lent_g_[2] = { true, true }, any_g_[2] = { false, false }, took_g_[2] = { false, false };
+    int64_t last_g_[2] = { 0, 0 };
+    int     arena_ = -1;
+    bool any_p1_ = false;
     bool audit_ = false, stopped_ = false;
     Stats st_;
     /* Slot k read back and compared (LendHost::audit); false, counted, with the policy stopped when it
      * differs or could not be read. lose: the slot is given up. */
     bool audit_ok(int k, bool publish);
     void lose(int k);
-    /* Slot s is lent out: the slots are, and it is not a kept one. */
-    bool away(const Slot& s) const { return lent_ && !s.keep; }
+    /* Slot s is lent out: its group is, and it is not a kept one. */
+    bool away(const Slot& s) const { return lent_g_[s.grp] && !s.keep; }
     void settle(int k);
     void poll();
-    void pump();
+    /* Loads for the slots that want one (from the RAM cache only in the rest): All, every such slot; Back (the
+     * split, one group still lent out), those of the group that is back, not the kept ones; ArenaRam (the split,
+     * a pass that took the ring), the arena's alone and from the RAM cache only. */
+    enum class Pump : uint8_t { All, Back, ArenaRam };
+    void pump(Pump which = Pump::All);
+    /* Group g's slots, back after its grace: the idle and failed ones want their units. */
+    void give_back(int g);
 };
 
 /* The lent slots' heat (above): a rank's decayed counts of decode rows by plan unit, and the policy's

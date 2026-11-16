@@ -1859,10 +1859,18 @@ struct FakeLend final : LendHost {
      * pass, withdrawn but in a retarget, or written by the card path (its content has no generation). */
     int keep_from = 1 << 30;
     bool kept(int k) const { return k >= keep_from; }
+    /* The arena split (RingLender::set_arena): slots from arena_from up to the kept ones are the arena's, which only
+     * a step at the full plan writes (its own generation, agen), not every card-path pass. */
+    int arena_from = 1 << 30;
+    uint64_t agen = 0;
+    bool in_arena(int k) const { return k >= arena_from && !kept(k); }
     /* The rest (RingLender::set_rest): whether drive reads are held, how often that changed, the load_ram
      * calls. A drive read begun is not let land while held (the reload thread's hold). */
     bool held = false;
     int  hold_calls = 0, ram_calls = 0;
+    /* The arena split: while set, a drive read of an arena slot is a violation (a pass that took the ring back begins
+     * an arena load only from the RAM cache). */
+    bool forbid_arena_drive = false;
 
     FakeLend(unsigned seed, int n) : rng(seed) {
         s.assign((size_t)n, S{});
@@ -1903,6 +1911,8 @@ struct FakeLend final : LendHost {
     int load(int k) override {
         if (refuse.count(k)) return -1;
         if (held && !ram[(size_t)k]) bad("slot " + std::to_string(k) + "'s drive read begun in the rest");
+        if (forbid_arena_drive && in_arena(k) && !ram[(size_t)k])
+            bad("arena slot " + std::to_string(k) + "'s drive read begun in a pass that took the ring back");
         if (s[(size_t)k].src) bad("a load of slot " + std::to_string(k) + " that holds a source");
         if (ram[(size_t)k]) {
             s[(size_t)k].src = 2;
@@ -1943,7 +1953,7 @@ struct FakeLend final : LendHost {
         x.rfenced = false;
         x.copying = true;
         x.copy_done = false;
-        x.copy_gen = gen;
+        x.copy_gen = in_arena(k) ? agen : gen;
         x.copy_unit = x.load_unit;
         x.t_copy = ++seq;
         ++x.copies;
@@ -1973,9 +1983,10 @@ struct FakeLend final : LendHost {
         S& x = s[(size_t)k];
         if (on) {
             if (x.published) bad("slot " + std::to_string(k) + " published twice");
-            if (!kept(k) && x.content_gen != gen)
+            const uint64_t now_gen = in_arena(k) ? agen : gen;
+            if (!kept(k) && x.content_gen != now_gen)
                 bad("slot " + std::to_string(k) + " published from a copy of generation " + std::to_string(x.content_gen) +
-                    " in generation " + std::to_string(gen) + " (the card path may have written it since)");
+                    " in generation " + std::to_string(now_gen) + " (the card path may have written it since)");
             if (x.content_unit != x.unit)
                 bad("slot " + std::to_string(k) + " published as unit " + std::to_string(x.unit) + " holding unit " +
                     std::to_string(x.content_unit) + "'s bytes");
@@ -4518,6 +4529,9 @@ struct ArenaHost final : LendHost {
         return 0;
     }
     void retarget(int k) override { cur[(size_t)k] = next_unit++; }
+    /* The arena split's loads in a pass that took the ring: from the RAM cache only (ram_all: every unit is there). */
+    bool ram_all = false;
+    int load_ram(int k) override { return ram_all ? load(k) : 0; }
 };
 
 /* `steps` passes, about one in `full_in` at the full plan; each step's host calls let the card run a little.
@@ -5073,5 +5087,318 @@ TEST(p1_card_path_is_decided_per_layer_under_the_per_row_cut) {
                 (long long)chunks, (long long)short_layers, (long long)card_layers);
     EpCountsHostProbe::disarm(fs);
 }
+
+/* ---- the lent arena's own take-back (..._P1_LEND_ARENA_SPLIT) ------------------------------------------------
+ *
+ * RingLender::set_arena: the arena's slots are taken back only by a step at the full plan (begin_pass's `arena`), a
+ * card-path pass below it takes the ring's alone. The simulated host keeps the arena's slots in a generation of
+ * their own that only full steps advance, so a unit published in an arena slot from a copy queued before the last
+ * full step is caught; the ring's are written by every card-path pass as before. */
+TEST(p1_lend_arena_split_switch_parses_and_is_off_by_default) {
+    std::map<std::string, std::string> env;
+    auto get = [&](const char* k) -> const char* {
+        const auto it = env.find(k);
+        return it == env.end() ? nullptr : it->second.c_str();
+    };
+    Tunables t;
+    std::string why;
+    CHECK(parse_tunables(get, &t, &why));
+    CHECK(!t.lend_arena_split);
+    for (const char* off : { "", "0" }) {
+        env[ds41p1::kLendArenaSplitEnv] = off;
+        CHECK(parse_tunables(get, &t, &why));
+        CHECK(!t.lend_arena_split);
+    }
+    env[ds41p1::kLendArenaSplitEnv] = "1";
+    CHECK(parse_tunables(get, &t, &why));
+    CHECK(t.lend_arena_split);
+    for (const char* bad : { "2", "on", "yes", "-1" }) {
+        env[ds41p1::kLendArenaSplitEnv] = bad;
+        CHECK(!parse_tunables(get, &t, &why));
+        CHECK(why.find(ds41p1::kLendArenaSplitEnv) != std::string::npos);
+    }
+}
+
+namespace {
+/* A pass through the split lender: p1 arms the card path, full is a step at the full plan (which arms or not). The
+ * host's checks around it, for the groups the pass takes and the ones it leaves. */
+int split_pass(RingLender& l, FakeLend& h, bool p1, bool full, int64_t now) {
+    if (p1 || full) ++h.gen;    /* the card path writes the ring's slots in any armed pass (and the ring's in a full one) */
+    if (full) ++h.agen;         /* only a full step writes the arena's top */
+    std::vector<int> queued;
+    for (size_t k = 0; k < h.s.size(); ++k)
+        if (h.s[k].copying) queued.push_back((int)k);
+    std::vector<int> fences0;
+    std::vector<uint8_t> pub0;
+    for (const auto& x : h.s) {
+        fences0.push_back(x.fences);
+        pub0.push_back(x.published ? 1 : 0);
+    }
+    h.forbid_arena_drive = (p1 || full) && !full;
+    const int r = l.begin_pass(p1 || full, now, full);
+    h.forbid_arena_drive = false;
+    for (size_t k = 0; k < h.s.size(); ++k) {
+        const int kk = (int)k;
+        const bool arena = h.in_arena(kk), kept = h.kept(kk), ring = !arena && !kept;
+        const bool taken = (ring && (p1 || full)) || (arena && full);
+        if (taken && h.s[k].published) h.bad("slot " + std::to_string(k) + " published through a pass that takes it");
+        if (kept && pub0[k] && !h.s[k].published) h.bad("kept slot " + std::to_string(k) + " withdrawn by a pass");
+        if (arena && (p1 || full) && !full && pub0[k] && !h.s[k].published)
+            h.bad("arena slot " + std::to_string(k) + " withdrawn by a card-path pass below the full plan");
+        if (!taken && h.s[k].fences != fences0[k]) h.bad("slot " + std::to_string(k) + " fenced by a pass that leaves it");
+    }
+    for (int k : queued)
+        if (((!h.in_arena(k) && !h.kept(k) && (p1 || full)) || (h.in_arena(k) && full)) &&
+                 h.s[(size_t)k].fenced_gen != h.gen)
+            h.bad("slot " + std::to_string(k) + "'s queued copy not fenced by the pass that takes it");
+    if (l.residents() != h.published()) h.bad("the lender's residents and the host's published units differ");
+    return r;
+}
+
+int published_in(const FakeLend& h, int lo, int hi) {
+    int n = 0;
+    for (int k = lo; k < hi; ++k) n += h.s[(size_t)k].published;
+    return n;
+}
+}  // namespace
+
+TEST(p1_lend_arena_split_keeps_arena_residents_through_armed_passes_below_the_full_plan) {
+    /* Ring slots 0-1, arena slots 2-4, a kept (slab) slot 5; every unit in the RAM cache but arena slot 4's. */
+    FakeLend h(11, 6);
+    h.land_pct = h.copy_pct = 100;
+    h.keep_from = 5;
+    h.arena_from = 2;
+    for (int k = 0; k < 6; ++k) h.ram[(size_t)k] = k != 4;
+    RingLender l;
+    REQUIRE_EQ(l.init(&h, 6, 1000, 1), 0);
+    REQUIRE_EQ(l.set_arena(2), 0);
+    CHECK_EQ(l.set_arena(2), -1);   /* once */
+    CHECK(l.arena_slot(2) && l.arena_slot(4) && !l.arena_slot(1) && !l.arena_slot(5));
+    int64_t t = 0;
+    for (int i = 0; i < 20 && l.residents() < 6; ++i) split_pass(l, h, false, false, t += 10);
+    CHECK_EQ(l.residents(), 6);
+    CHECK(!l.lent());
+    /* Armed decode passes (below the full plan): the ring's two go, the arena's three and the slab's stay. */
+    for (int i = 0; i < 50; ++i) split_pass(l, h, true, false, t += 20);
+    CHECK_EQ(published_in(h, 0, 2), 0);
+    CHECK_EQ(published_in(h, 2, 5), 3);
+    CHECK_EQ(published_in(h, 5, 6), 1);
+    CHECK_EQ(l.stats().arena_spared, (uint64_t)50);
+    CHECK_EQ(l.stats().arena_spared_res, (uint64_t)150);
+    CHECK_EQ(l.stats().withdrawn, (uint64_t)2);
+    CHECK(l.lent());
+    CHECK(!l.arena_lent());
+    /* A step at the full plan (a long prefill chunk) takes the arena's slots back before it issues anything. */
+    CHECK_EQ(split_pass(l, h, true, true, t += 20), 1);
+    CHECK_EQ(published_in(h, 0, 5), 0);
+    CHECK_EQ(published_in(h, 5, 6), 1);
+    CHECK(l.arena_lent());
+    l.end_p1(t += 300);
+    const int64_t full_end = t;
+    /* Armed decode passes inside the arena's grace: nothing of the arena comes back. */
+    for (; t < full_end + 990; t += 30) split_pass(l, h, true, false, t);
+    CHECK_EQ(published_in(h, 2, 5), 0);
+    /* Past the grace, still under armed decode: the arena returns, its RAM-cache units reload and publish; slot 4
+     * (no RAM-cache copy) waits, since a pass that takes the ring begins no drive read. */
+    const int loads4 = h.s[4].loads;
+    for (int i = 0; i < 10; ++i) split_pass(l, h, true, false, t += 30);
+    CHECK_EQ(published_in(h, 2, 4), 2);
+    CHECK(!h.s[4].published);
+    CHECK_EQ(h.s[4].loads, loads4);
+    CHECK(l.stats().arena_p1_loads >= (uint64_t)2);
+    CHECK_EQ(published_in(h, 0, 2), 0);   /* the ring stays lent through armed passes */
+    /* A pass that does not arm, past the ring's grace: the ring returns, slot 4 reads the drive. */
+    t += 2000;
+    for (int i = 0; i < 20 && l.residents() < 6; ++i) split_pass(l, h, false, false, t += 10);
+    CHECK_EQ(l.residents(), 6);
+    CHECK_EQ(h.s[4].loads, loads4 + 1);
+    CHECK_EQ(h.violations, 0);
+    if (h.violations) std::fprintf(stderr, "%s\n", h.first.c_str());
+
+    /* The control, without the split: the same armed decode passes take the arena's slots back every time. */
+    FakeLend h2(12, 6);
+    h2.land_pct = h2.copy_pct = 100;
+    h2.keep_from = 5;
+    for (int k = 0; k < 6; ++k) h2.ram[(size_t)k] = 1;
+    RingLender l2;
+    REQUIRE_EQ(l2.init(&h2, 6, 1000, 1), 0);
+    int64_t t2 = 0;
+    for (int i = 0; i < 20 && l2.residents() < 6; ++i) lend_pass(l2, h2, false, t2 += 10);
+    CHECK_EQ(l2.residents(), 6);
+    for (int i = 0; i < 50; ++i) lend_pass(l2, h2, true, t2 += 20);
+    CHECK_EQ(published_in(h2, 0, 5), 0);
+    CHECK_EQ(published_in(h2, 5, 6), 1);
+    CHECK_EQ(l2.stats().arena_spared, (uint64_t)0);
+    CHECK_EQ(h2.violations, 0);
+}
+
+TEST(p1_lend_arena_split_random_passes_landings_and_failures) {
+    int runs = 0;
+    for (unsigned seed = 1; seed <= 400; ++seed) {
+        std::mt19937 rng(seed);
+        const int nr = (int)(rng() % 4), na = 1 + (int)(rng() % 6), nk = (int)(rng() % 3), n = nr + na + nk;
+        FakeLend h(seed * 7u + 3u, n);
+        h.land_pct = 20 + (int)(rng() % 70);
+        h.copy_pct = 20 + (int)(rng() % 70);
+        h.bufs = 1 + (int)(rng() % 3);
+        h.keep_from = nr + na;
+        h.arena_from = nr;
+        for (int k = 0; k < n; ++k) h.ram[(size_t)k] = rng() % 3 != 0;
+        RingLender l;
+        const int64_t grace = (int64_t)(rng() % 4) * 50;
+        REQUIRE_EQ(l.init(&h, n, grace, nk), 0);
+        REQUIRE_EQ(l.set_arena(nr), 0);
+        if (rng() % 2) l.set_rest(100);
+        int64_t t = 0, last_full_end = -1;
+        bool in_full = false;
+        std::vector<uint8_t> pub(n, 0);
+        for (int step = 0; step < 400; ++step) {
+            if (rng() % 17 == 0) h.fail_load_once.insert((int)(rng() % (unsigned)n));
+            if (rng() % 19 == 0) h.fail_copy_once.insert((int)(rng() % (unsigned)n));
+            const unsigned kind = rng() % 10;   /* 0-1 full, 2-6 armed below it, 7-9 neither */
+            const bool full = kind < 2, p1 = kind < 7;
+            for (int k = 0; k < n; ++k) pub[(size_t)k] = h.s[(size_t)k].published;
+            split_pass(l, h, p1, full, t);
+            /* An arena slot published by this pass: only once the arena's grace has run out since the last full
+             * step's end. */
+            for (int k = nr; k < nr + na; ++k)
+                if (!pub[(size_t)k] && h.s[(size_t)k].published && last_full_end >= 0 && t - last_full_end < grace && !full)
+                    h.bad("arena slot " + std::to_string(k) + " published inside the arena's grace");
+            in_full = full;
+            if (p1 || full) {
+                t += 1 + (int64_t)(rng() % 40);
+                l.end_p1(t);
+                if (in_full) last_full_end = t;
+            }
+            t += 1 + (int64_t)(rng() % 40);
+            if (h.violations) break;
+        }
+        /* Liveness: a full step (its return makes a failed slot want its unit again), then armed decode only, past
+         * the arena's grace: every arena slot whose unit the RAM cache holds comes back; then another full step and
+         * passes that do not arm bring everything back. */
+        h.fail_load_once.clear();
+        h.fail_copy_once.clear();
+        h.refuse.clear();
+        h.settle_all();
+        split_pass(l, h, true, true, t += 5);
+        l.end_p1(t += 1);
+        t += grace + 1000;
+        for (int i = 0; i < 300; ++i) {
+            h.settle_all();
+            split_pass(l, h, true, false, t += 5);
+            l.end_p1(t += 1);
+        }
+        for (int k = nr; k < nr + na; ++k)
+            if (h.ram[(size_t)k] && !h.s[(size_t)k].published && !l.lost(k))
+                h.bad("arena slot " + std::to_string(k) + " (RAM-cache unit) not back under armed decode");
+        split_pass(l, h, true, true, t += 5);
+        l.end_p1(t += 1);
+        t += grace + 1000;
+        for (int i = 0; i < 300 && l.residents() < n; ++i) {
+            h.settle_all();
+            split_pass(l, h, false, false, t += 5);
+        }
+        if (l.residents() != n) h.bad("only " + std::to_string(l.residents()) + " of " + std::to_string(n) + " resident at the end");
+        if (h.bufs_used != 0 && l.busy() == 0) h.bad("a reload buffer held with nothing in flight");
+        if (h.violations) {
+            CHECK_EQ(h.violations, 0);
+            std::fprintf(stderr, "seed %u: %s\n", seed, h.first.c_str());
+            return;
+        }
+        ++runs;
+    }
+    CHECK_EQ(runs, 400);
+}
+
+namespace {
+/* The two-stream card (ArenaHost) with the split: three pass kinds, a step at the full plan (writes the arena's top,
+ * the lender takes every lent slot back first), an armed pass below it (the card path's own buffers only: every
+ * published arena resident is read from its slot by the plugin's ops) and a plain one (reads them the same). `wrong`
+ * is the control: full steps tell the lender `arena` = false, as a split that ignored the level would. */
+int arena_split_run(unsigned seed, bool wrong, int steps, std::string* why) {
+    std::mt19937 rng(seed);
+    const int n = 1 + (int)(rng() % 8);
+    ArenaHost h(seed * 31u + 7u, n);
+    h.bufs = 1 + (int)(rng() % 3);
+    h.ram_all = true;
+    RingLender l;
+    if (l.init(&h, n, (int64_t)(rng() % 3) * 20) < 0 || l.set_arena(0) < 0) return -1;
+    int64_t t = 0;
+    int took_before_use = 0;
+    auto pass = [&](int s, int kind) {   /* 0 full, 1 armed below it, 2 neither */
+        const bool full = kind == 0, armed = kind <= 1;
+        l.begin_pass(armed, t, full && !wrong);
+        if (full) {
+            for (int k = 0; k < n; ++k)
+                if (l.resident(k)) {
+                    ++took_before_use;
+                    h.bad("arena slot " + std::to_string(k) + " still resident when full step " + std::to_string(s) +
+                          " writes the arena's top");
+                }
+            ArenaHost::Cmd c;
+            c.t = ArenaHost::FullWrite;
+            c.step = s;
+            h.push(0, c);
+            h.progress();
+            c.t = ArenaHost::FullRead;
+            h.push(0, c);
+        } else {
+            for (int k = 0; k < n; ++k)
+                if (l.resident(k)) {
+                    ArenaHost::Cmd c;
+                    c.t = ArenaHost::ResRead;
+                    c.k = k;
+                    c.unit = h.cur[(size_t)k];
+                    h.push(0, c);
+                }
+        }
+        h.progress();
+        if (armed) {
+            l.end_p1(t);
+            /* FileStager::end_pass: an armed pass's own end_pass makes the mover's stream wait on its end; a full
+             * step's too. */
+            h.record(0, h.end_ev);
+            h.wait(1, h.end_ev);
+        }
+        t += 1 + (int64_t)(rng() % 30);
+    };
+    for (int s = 0; s < steps; ++s) {
+        const unsigned r = rng() % 10;
+        pass(s, r < 2 ? 0 : r < 8 ? 1 : 2);
+    }
+    /* Armed decode only from here: the arena comes back with no pass that does not arm. */
+    for (int s = 0; s < 6 * n + 40; ++s) {
+        pass(steps + s, 1);
+        h.drain();
+        t += 100;
+    }
+    h.drain();
+    if (l.residents() != n) h.bad("only " + std::to_string(l.residents()) + " of " + std::to_string(n) + " arena slots resident under armed decode");
+    if (why && h.violations) *why = h.first;
+    return h.violations;
+}
+}  // namespace
+
+TEST(p1_lend_arena_split_full_steps_take_the_arena_back_before_use_on_the_two_streams) {
+    int runs = 0;
+    for (unsigned seed = 1; seed <= 300; ++seed) {
+        std::string why;
+        const int v = arena_split_run(seed, false, 150, &why);
+        if (v) {
+            CHECK_EQ(v, 0);
+            std::fprintf(stderr, "seed %u: %s\n", seed, why.c_str());
+            return;
+        }
+        ++runs;
+    }
+    CHECK_EQ(runs, 300);
+    /* The control: a split that left the arena's slots to a full step finds them resident at its write (or a reload
+     * copy inside its activations) in some run. */
+    int wrong = 0;
+    for (unsigned seed = 1; seed <= 300; ++seed) wrong += arena_split_run(seed, true, 150, nullptr) > 0;
+    CHECK(wrong > 0);
+    std::fprintf(stderr, "  runs that fail with the arena left to full steps: %d of 300\n", wrong);
+}
+
 
 RAD_TEST_MAIN()

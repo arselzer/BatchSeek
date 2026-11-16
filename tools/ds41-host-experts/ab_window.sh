@@ -222,6 +222,24 @@
 # only if rank 0 logs "ds41 p1: early ring copies on (RADIANCE_EXPERIMENTAL_DS41_P1_EARLY=K)" once at startup (any
 # other arm only without it) and at exit (qx_gate) some rank's stats line counts early copies bound to their layer
 # ("early copies N (B bound to their layer", B > 0): otherwise the switch never acted.
+# Qes: the lent arena's own take-back (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT=1; ds41_p1.h kLendArenaSplitEnv;
+# every other arm states 0): the arena's lent slots (QeK) are taken back only by a step at the full plan, the only
+# step whose buffers reach them; an armed pass below it (a Qd decode pass above all) takes the ring's alone and
+# leaves the arena's residents published, and the arena's slots return after their own grace from the last full
+# step, reloading from the RAM cache while armed passes run. Residency only: replies must be identical to the arm
+# without it. Needs P1 and QeK. Measured only if rank 0 logs "ds41 p1: lent arena split: on
+# (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT=1)" once at startup (any other arm only without it) and at exit
+# (qes_gate) some rank's stats line counts arena residents kept through armed passes ("lent arena split: P passes took
+# the ring's slots and left the arena's (R arena residents through them)", R > 0): otherwise the switch never acted.
+# LkT: the KV pool auto-sized from the streams (an N part, required): --max-model-len = N x T x 5/4 rounded up to a
+# whole 16-token block a stream, T the measured peak KV tokens a stream (from a run with prefix_evictions 0:
+# (kv_tokens_used at the end + hit_cut_tokens) / N; NL-SQL N512: (180,208 + 51,256) / 512 = 452 -> Lk452 = L294912).
+# Exclusive with an L or Lm part. serve-batch.sh --kv-auto T gives the same pool (it is --ctx-per-stream to the
+# matcher). Placement only (more VRAM for the static residents); a pool too small evicts prefix-cache entries first
+# (exact) and then preempts, so the arm must show preemptions 0 like every arm.
+# mSN: the RAM budget's per-sequence growth term (RADIANCE_EXPERIMENTAL_DS41_RAM_PER_SEQ_MIB=N, 0-1048576; every other
+# arm states it empty: the engine's 32): "later" = N MiB x --max-num-seqs, reserved from the expert RAM cache for growth
+# after serve(). Needs mA. Measured only if the server's budget names "per-sequence growth, N MiB x" (ms_gate).
 # QdN: decode passes on the cards (..._P1_DECODE_ROWS=N, 17 to N_Lc; every other arm states 0): a pure
 # decode pass of N rows or more (decode rows only, no draft, speculation or cut) arms the card path for its
 # routed layers as a prefill pass of the threshold's rows does, and takes the lent slots back as one does;
@@ -879,7 +897,8 @@ kld_finish() {   # name; the run is SERVER_PID
      ! extra_why=$(dt_gate "$OUT/$name.server.log" "${ARM_DT:-}") ||
      ! extra_why=$(aw_gate "$OUT/$name.server.log" "${ARM_AW:-}") ||
      ! extra_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" exit) ||
-     ! extra_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" exit); then
+     ! extra_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" exit) ||
+     ! extra_why=$(qes_gate "$OUT/$name.server.log" "${ARM_QES:-}" exit); then
     log "arm $name: $extra_why; Kld not measured"; return 1
   fi
   # Qw / Aw (inexact by design): its run scored the engine against KLD_REF (--kld-ref); the engine's KL report is the
@@ -1179,6 +1198,29 @@ qx_gate() {   # log, requested K, start/exit: rank 0's early-copies line naming 
   while read -r b; do [[ -n "$b" ]] && (( b > best )) && best=$b; done < <(sed -nE 's/.*ds41 p1 stats, rank [0-3]: .*; early copies [0-9]+ \(([0-9]+) bound to their layer.*/\1/p' "$f")
   if (( best == 0 )); then echo "Qx$on, but no rank bound an early copy to its layer (the switch never acted)"; return 1; fi
   return 0
+}
+
+qes_gate() {   # log, requested switch, start/exit: rank 0's lent arena split line once (and arena residents kept at exit)
+  local f=$1 on=$2 stage=${3:-start} count r best=0
+  if [[ -z "$on" ]]; then
+    if grep -q 'ds41 p1: lent arena split: on' "$f"; then echo 'no Qes part, but the lent arena split is on'; return 1; fi
+    return 0
+  fi
+  count=$(grep -cE "ds41 p1: lent arena split: on \(RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT=1\)" "$f")
+  if [[ $count != 1 ]]; then echo "Qes, but rank 0 lacks one 'ds41 p1: lent arena split: on (..._P1_LEND_ARENA_SPLIT=1)' startup line"; return 1; fi
+  [[ "$stage" == exit ]] || return 0
+  while read -r r; do [[ -n "$r" ]] && (( r > best )) && best=$r; done < <(sed -nE "s/.*ds41 p1 stats, rank [0-3]: .*; lent arena split: [0-9]+ passes took the ring's slots and left the arena's \(([0-9]+) arena residents through them\).*/\1/p" "$f")
+  if (( best == 0 )); then echo "Qes, but no rank kept an arena resident through an armed pass (the switch never acted)"; return 1; fi
+  return 0
+}
+
+ms_gate() {   # log, requested MiB: the RAM budget's per-sequence term names it (an arm without mS: the default 32)
+  local f=$1 on=$2 want
+  want=${on:-32}
+  grep -qE "ram budget: later +[0-9]+ MiB +per-sequence growth, $want MiB x --max-num-seqs" "$f" && return 0
+  grep -q 'ram budget: later' "$f" || return 0   # no RAM budget (no mA): nothing to check
+  echo "mS${on:-<none>}, but the server's budget does not reserve $want MiB a sequence ($(grep -m1 -oE 'per-sequence growth, [0-9]+ MiB' "$f"))"
+  return 1
 }
 
 qt_gate() {   # log, requested switch: the register-tiled twin's startup marker on every rank, or on none
@@ -1586,7 +1628,9 @@ EOF2
      ! qsp_why=$(dt_gate "$OUT/$name.server.log" "${ARM_DT:-}") ||
      ! qsp_why=$(aw_gate "$OUT/$name.server.log" "${ARM_AW:-}") ||
      ! qsp_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" start) ||
-     ! qsp_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" start); then
+     ! qsp_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" start) ||
+     ! qsp_why=$(qes_gate "$OUT/$name.server.log" "${ARM_QES:-}" start) ||
+     ! qsp_why=$(ms_gate "$OUT/$name.server.log" "${ARM_MS:-}"); then
     log "arm $name: $qsp_why; not measured"; stop_server; return 1
   fi
   # In / Is (RADIANCE_EXPERIMENTAL_DS41_INSERT_NT / _SLICE_KIB) and Ph (_HOST_EXPERTS_LEAN_TILES):
@@ -1881,7 +1925,8 @@ EOF2
   local qsp_exit_why
   if ! qsp_exit_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" exit) ||
      ! qsp_exit_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" exit) ||
-     ! qsp_exit_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" exit); then
+     ! qsp_exit_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" exit) ||
+     ! qsp_exit_why=$(qes_gate "$OUT/$name.server.log" "${ARM_QES:-}" exit); then
     log "arm $name: $qsp_exit_why; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
@@ -3719,13 +3764,13 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$(arm_full "$a")"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" sg="" pcn=""
-  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qyp="" qyk="" qsp="" qt="" qw="" dt="" aw="" qz="" qx="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr="" ee=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qyp="" qyk="" qsp="" qt="" qw="" dt="" aw="" qz="" qx="" qes="" lk="" ms="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr="" ee=""
   ctp=""   # Ctp / CtpN: the prefill chain trace (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL)
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
   axr=""   # AxrN: the worker's passes up to N rows (RADIANCE_EXPERIMENTAL_DS41_AUX_ROWS)
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
-  ARM_PROMPTS= ARM_N= ARM_LQ= rt= ARM_TIMEOUT= ARM_PROFILE= ARM_SB= ARM_NOPROF= upart="" arm_ctx=512   # arm()'s --max-model-len without Lm / L
+  ARM_PROMPTS= ARM_N= ARM_LQ= rt= ARM_TIMEOUT= ARM_PROFILE= ARM_SB= ARM_NOPROF= upart="" arm_ctx=512 lfix=""   # arm()'s --max-model-len without Lm / L
   f5="" ARM_BEFORE_PROMPTS= ARM_BEFORE_N= ARM_BEFORE_CONC= ARM_OBS_CONC=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
   fn128=""
@@ -3751,6 +3796,10 @@ for a in $ARMS; do
                  if [[ ${p#mA} =~ ^[0-9]+$ ]] && (( 10#${p#mA} >= 1024 )); then env+=(RADIANCE_EXPERIMENTAL_DS41_RAM_RESERVE_MIB=$((10#${p#mA})))
                  else log "arm $a: $p: the reserve is at least 1024 MiB; the arm is skipped"; skip=1; fi
                fi ;;
+      mS[0-9]*)                                                       # the RAM budget's per-sequence growth, N MiB (..._RAM_PER_SEQ_MIB)
+               if [[ -n "$ms" ]]; then log "arm $a: two mS parts; the arm is skipped"; skip=1
+               elif [[ ${p#mS} =~ ^[0-9]+$ ]] && (( 10#${p#mS} <= 1048576 )); then ms=$((10#${p#mS}))
+               else log "arm $a: $p: mS takes 0-1048576 (MiB a sequence); the arm is skipped"; skip=1; fi ;;
       m[0-9]*) CACHE_MIB=${p#m} ;;
       M[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=${p#M}) ;;
       Mr[0-9]*) # pool jobs of up to N token rows of one expert (1-64, default 4; above 4, jobs of 4+ rows take the many-row kernel)
@@ -3861,7 +3910,7 @@ for a in $ARMS; do
       Dm)      dm=1 ;;                     # the drafter's Markov codebooks pinned with the embedding (DSPARK_CODEBOOK_RAM; needs Er)
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       Vp)      env+=(RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1) ;;      # VRAM residents in the packed-scale form (vpack_gate)
-      Lm[0-9]*) ARGS+=(--max-model-len "${p#Lm}"); arm_ctx=${p#Lm} ;;   # a longer context (default 512), e.g. for long-prompt TTFT
+      Lm[0-9]*) ARGS+=(--max-model-len "${p#Lm}"); arm_ctx=${p#Lm}; lfix=1 ;;   # a longer context (default 512), e.g. for long-prompt TTFT
       Pc)      pc=1 ARM_NOPC= ; ARGS+=(--prefix-resume exact)                          # prefix cache on (exact resume, the default, named)
                env+=(RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1) ;;              # ... and pinned slabs not reserved twice
       Pc0)     pc=1 ARM_NOPC= ; ARGS+=(--prefix-resume exact) ;;                      # prefix cache on, the margin as before (the control)
@@ -3895,7 +3944,11 @@ for a in $ARMS; do
                cr=${p#Cr}
                if [[ $cr =~ ^[0-9]{1,4}$ ]] && (( 10#$cr >= 1 )); then cr=$((10#$cr))
                else log "arm $a: $p: a pool refills a whole number of slots, at least 1; the arm is skipped"; skip=1; fi ;;
-      L[0-9]*) ARGS+=(--max-model-len "${p#L}"); arm_ctx=${p#L} ;;    # this arm's --max-model-len (KV for N sequences)
+      L[0-9]*) ARGS+=(--max-model-len "${p#L}"); arm_ctx=${p#L}; lfix=1 ;;   # this arm's --max-model-len (KV for N sequences)
+      Lk[0-9]*)                                                        # the KV pool from N x T x 5/4 (T: measured peak tokens a stream)
+               if [[ -n "$lk" ]]; then log "arm $a: two Lk parts; the arm is skipped"; skip=1
+               elif [[ ${p#Lk} =~ ^[0-9]+$ ]] && (( 10#${p#Lk} >= 16 && 10#${p#Lk} <= 1048576 )); then lk=$((10#${p#Lk}))
+               else log "arm $a: $p: Lk takes 16-1048576 (tokens a stream); the arm is skipped"; skip=1; fi ;;
       Sl[0-9]*)                                                        # one sequence's bound below L (--max-seq-len N)
                if [[ -n "$sl" ]]; then log "arm $a: duplicate Sl part; the arm is skipped"; skip=1; fi
                sl=${p#Sl}
@@ -3942,6 +3995,9 @@ for a in $ARMS; do
       Qz)      qz=1 ;;                                                  # the twin's tail filled once a layer (..._P1_TAIL_ONCE=1)
       Dt)      dt=1 ;;                                                  # gemm_nt_bf16f8's tiled form above 64 rows, exact (..._DENSE_TILED=1)
       Aw)      aw=1 ;;                                                  # attn_sparse_sink's WMMA form, inexact (..._ATTN_WMMA=1)
+      Qes)                                                             # the lent arena's own take-back (..._P1_LEND_ARENA_SPLIT=1)
+               if [[ -n "$qes" ]]; then log "arm $a: two Qes parts; the arm is skipped"; skip=1; fi
+               qes=1 ;;
       Qx[0-9]*)                                                        # early ring copies: K of the next layer's units (..._P1_EARLY=K)
                if [[ -n "$qx" ]]; then log "arm $a: two Qx parts; the arm is skipped"; skip=1
                elif [[ ${p#Qx} =~ ^[0-9]+$ ]] && (( 10#${p#Qx} >= 1 && 10#${p#Qx} <= 64 )); then qx=$((10#${p#Qx}))
@@ -4100,6 +4156,17 @@ for a in $ARMS; do
       *)     log "arm $a: unknown part $p; the arm is skipped (it would run without what its name says)"; skip=1 ;;
     esac
   done
+  # LkT: the pool from the streams, a whole number of 16-token blocks a stream (so serve-batch.sh's --ctx-per-stream
+  # expresses it); exclusive with L / Lm.
+  if [[ -n "$lk" ]]; then
+    if [[ -n "$lfix" ]]; then log "arm $a: Lk$lk sizes the KV pool, and an L or Lm part sets it too; the arm is skipped"; skip=1
+    elif [[ -z "$nseq" ]]; then log "arm $a: Lk$lk sizes the KV pool from the streams, and there is no N part; the arm is skipped"; skip=1
+    else
+      lk_ctx=$(( (lk * 5 + 63) / 64 * 16 ))   # ceil(T x 5/4 / 16) x 16
+      arm_ctx=$(( 10#$nseq * lk_ctx )); ARGS+=(--max-model-len "$arm_ctx")
+      log "arm $a: Lk$lk: --max-model-len $arm_ctx (N${nseq} x $lk_ctx tokens: $lk x 5/4 rounded up to 16)"
+    fi
+  fi
   # gemm_nt_bf16f8 always takes gemm_bf16_nt_m64's split law; a tuned split for the bf16 rows (a
   # pin, or a tune cache in the arm's home) would make the F8 arm's bytes differ from the others'.
   if [[ -n "$f8" ]]; then
@@ -4564,6 +4631,12 @@ for a in $ARMS; do
   # Qx: early ring copies, stated in every arm (0 off); with P1.
   env+=(RADIANCE_EXPERIMENTAL_DS41_P1_EARLY=${qx:-0})
   [[ -n "$qx" && -z "$p1" ]] && { log "arm $a: Qx needs P1; the arm is skipped"; skip=1; }
+  # Qes: the lent arena's own take-back, stated in every arm (0 off); with P1 and the lent arena (QeK).
+  env+=(RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT=${qes:-0})
+  [[ -n "$qes" && ( -z "$p1" || -z "$qe" ) ]] && { log "arm $a: Qes needs P1 and the lent arena (a QeK part); the arm is skipped"; skip=1; }
+  # mS: the RAM budget's per-sequence growth, stated in every arm (empty: the engine's 32 MiB); with mA.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_RAM_PER_SEQ_MIB=${ms})
+  [[ -n "$ms" && -z "$ma" ]] && { log "arm $a: mS$ms sets the RAM budget's per-sequence term, which needs mA; the arm is skipped"; skip=1; }
   # Qz: the tail filled once a layer, stated in every arm (0 off); with P1 and the oracle's tail-once waves.
   env+=(RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=${qz:-0})
   if [[ -n "$qz" ]]; then
@@ -4795,7 +4868,7 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
   if [[ -n "$ARM_TIMEOUT" ]] && ! [[ $ARM_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]]; then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QYP=$qyp ARM_QYK=$qyk ARM_QSP=$qsp ARM_QT=$qt ARM_QW=$qw ARM_DT=$dt ARM_AW=$aw ARM_QZ=$qz ARM_QX=$qx ARM_LH=$lh ARM_EE=$ee
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QYP=$qyp ARM_QYK=$qyk ARM_QSP=$qsp ARM_QT=$qt ARM_QW=$qw ARM_DT=$dt ARM_AW=$aw ARM_QZ=$qz ARM_QX=$qx ARM_QES=$qes ARM_MS=$ms ARM_LH=$lh ARM_EE=$ee
   ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr ARM_SL=$sl ARM_CTX=$arm_ctx ARM_CR=$cr
   if [[ -n "$cr" ]]; then
     crk=${ARM_CONC:-${AB_CONCURRENCY:-1}}

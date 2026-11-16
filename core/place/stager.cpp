@@ -766,11 +766,14 @@ bool FileStager::begin_pass(const RadBatch* b) {
      * back as well (its buffers reach the arena's top), its ops behind any reload copy still queued. */
     p1_lend_took_ = false;
     if (p1_on() && p1_->lending()) {
-        p1_lend_took_ = p1_arms || (p1_arena_full_ && p1_arena_full_());
+        /* ..._P1_LEND_ARENA_SPLIT: the lender takes the arena's slots back only at the full plan (its third
+         * argument; without the split it takes every slot with p1_lend_took_, as before). */
+        const bool full = p1_arena_full_ && p1_arena_full_();
+        p1_lend_took_ = p1_arms || full;
         /* ..._P1_LEND_AUDIT: a resident withdrawn at this pass's begin is read back behind the end of the
          * pass before, the residents' last reader. */
         if (p1_tun_.lend_audit) p1_->lend_audit_behind(p1_lend_rec_ ? p1_lend_ev_ : nullptr);
-        (void)p1_->lender().begin_pass(p1_lend_took_, p1_now_ms());
+        (void)p1_->lender().begin_pass(p1_lend_took_, p1_now_ms(), full);
         /* The lent slots' heat (..._P1_LEND_HEAT): the policy's turn, here only (residency changes before
          * the weight tables are brought up to date), with the heat counted through the pass before this
          * one; then this pass's rows age it, if it is one that counts. */
@@ -5063,6 +5066,9 @@ int FileStager::p1_init(const Program& prog) {
         p1_hyb_st_ = HybStats{};
         p1_hyb_pf_st_ = HybStats{};
     }
+    if (t.lend_arena_split && t.lend_arena <= 0)
+        return refuse(fmt("%s=1 gives the lent arena's slots a take-back of their own, and none is lent (%s)",
+                          ds41p1::kLendArenaSplitEnv, ds41p1::kLendArenaEnv));
     if (t.lend_audit && t.lend <= 0 && t.lend_arena <= 0 && t.lend_slab <= 0)
         return refuse(fmt("%s=1 reads lent slots back, and none is lent (%s, %s or %s)", ds41p1::kLendAuditEnv,
                           ds41p1::kLendEnv, ds41p1::kLendArenaEnv, ds41p1::kLendSlabEnv));
@@ -5485,6 +5491,13 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
                  ds41p1::kLogLendArena, ka, ds41p1::kLendArenaEnv, t.lend_arena, arena.size(),
                  (long long)p1_arena_rows_, ka, share, (long long)p1_arena_rows_, t.grace_ms, ds41p1::kGraceEnv);
     }
+    if (plan_->rank == 0 && !at.empty() && t.lend_arena_split)
+        RAD_INFO("%s: on (%s=1): the %d arena slots are taken back only by a step at the full plan (above %lld "
+                 "tokens), the only step whose buffers reach them; a card-path pass below it (an armed decode pass "
+                 "among them) takes the ring's %d slots alone and leaves the arena's residents published, as the "
+                 "slab's; the arena's slots return %d ms after the last full step, and in a pass that takes the ring "
+                 "an arena slot's reload begins only from the RAM cache; counts in the shutdown stats line",
+                 ds41p1::kLogLendArenaSplit, ds41p1::kLendArenaSplitEnv, ka, (long long)p1_arena_rows_, nk, t.grace_ms);
     if (plan_->rank == 0 && p1_heat_) {
         /* What the heat starts from: the prior's rows and where its shares came from, or none. */
         const std::string prior =
