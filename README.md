@@ -40,7 +40,7 @@ behaves at hundreds of concurrent requests:
   prefix cache's snapshot store is sized for short batch prompts, and a RAM budget sizes the expert cache from what
   the host actually has free.
 - **Placement profiles.** baKon's port records how often each expert is used (`--expert-stats`) and keeps the
-  busiest on the GPUs (`--expert-profile`). The fork also fills the RAM cache from the profile, adds `calibrate.sh`
+  busiest on the GPUs (`--expert-profile`). The fork's RAM cache also uses the profile, to hold on to the busiest experts longer, adds `calibrate.sh`
   and profile tools, and makes profiles portable: the server then matches them to a container by its size and the
   sha256 of its metadata header, not by its path.
 - **Kernels.** Faster prompt processing (prefill; register tiling) and a tiled form of the FP8 dense layers' matrix-unit kernel (based on radiance's
@@ -112,8 +112,8 @@ API prices as charged through OpenRouter on 16 November 2026, at $1.12 per euro.
 accuracy differences are within noise. The other models ran with thinking off at their default sampling (they don't
 accept temperature 0), with prompts written for DeepSeek.
 
-The model file carries no profile: without one, the experts start in no particular order and the RAM cache fills
-while the job runs. The same 256 BIRD questions without a profile and with a recorded one:
+The model file carries no profile. Without one, the experts kept on the GPUs are an arbitrary fixed set; the RAM cache
+adapts either way, filling with the experts the job uses while it runs. The same 256 BIRD questions without a profile and with a recorded one:
 
 | Expert usage profile | Job time |
 |---|---:|
