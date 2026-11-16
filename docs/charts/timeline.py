@@ -224,7 +224,7 @@ def prepare(result, window_log, power, stats, arm, gpus, steps=None):
                 **tps_series(steps, run))
 
 
-def tps_series(steps_path, run, smooth_cells=5):
+def tps_series(steps_path, run, smooth_cells=3):
     """Decode tokens/s over time from decode_steps.py's output (--steps): per-cell values plus a centred rolling
     mean over smooth_cells cells. Empty when no steps file is given."""
     if not steps_path:

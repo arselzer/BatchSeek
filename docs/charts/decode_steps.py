@@ -18,6 +18,7 @@ from scipy.optimize import lsq_linear
 
 ap = argparse.ArgumentParser()
 ap.add_argument('result'); ap.add_argument('--grid', type=float, default=5.0); ap.add_argument('--out')
+ap.add_argument('--measured', help='t0,t1,tok_s measured directly (e.g. KV-cache growth while every request decodes): a weighted constraint on the steps in that span')
 a = ap.parse_args()
 d = json.load(open(a.result))
 rows = []
@@ -47,7 +48,12 @@ y = np.array([n for _, _, n in rows], dtype=float)
 # unknowns: steps per cell (>= 0); light smoothness penalty so empty stretches don't go wild
 lam = 0.05 * np.sqrt(len(rows))
 D = (np.eye(K, k=1) - np.eye(K))[:-1] * lam
-res = lsq_linear(np.vstack([A, D]), np.concatenate([y, np.zeros(K - 1)]), bounds=(0, np.inf))
+rowsA, rowsy = [A, D], [y, np.zeros(K - 1)]
+if a.measured:   # steps in [t0, t1] = measured tok/s / requests decoding there x duration, weighted like 50 requests
+    m0, m1, mt = (float(v) for v in a.measured.split(','))
+    nd = sum(1 for lo, hi, _ in rows if lo <= m0 and hi >= m1)
+    rowsA.append(50 * weights(m0, m1)[None, :]); rowsy.append(np.array([50 * mt / max(nd, 1) * (m1 - m0)]))
+res = lsq_linear(np.vstack(rowsA), np.concatenate(rowsy), bounds=(0, np.inf))
 steps = res.x                                     # decode steps in each cell
 mid = (edges[:-1] + edges[1:]) / 2
 dec = np.array([sum(1 for lo, hi, _ in rows if lo < m <= hi) for m in mid])
