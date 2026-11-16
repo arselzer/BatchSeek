@@ -1834,6 +1834,7 @@ struct FakeLend final : LendHost {
         int  src = 0;                  /* 0 none, 1 a reload buffer, 2 a RAM-cache lease */
         bool reading = false, copying = false, copy_done = false, published = false;
         uint64_t copy_gen = 0, content_gen = ~0ull, fenced_gen = ~0ull;
+        uint64_t copy_ep = 0, content_ep = 0;
         int  loads = 0, copies = 0, fences = 0;
         /* The heat policy's retargets: the unit the slot is for now, the one its load in flight read, the one
          * its queued copy carries, the one whose bytes the slot holds, the one last published there; whether
@@ -1863,6 +1864,10 @@ struct FakeLend final : LendHost {
      * a step at the full plan writes (its own generation, agen), not every card-path pass. */
     int arena_from = 1 << 30;
     uint64_t agen = 0;
+    /* Slot availability (RingLender::set_avail): by slot, the owner's epoch (one more each time the owner takes the
+     * slot); a unit may be published only from a copy queued in the current epoch, and never while taken. */
+    std::vector<uint64_t> ep;
+    std::vector<uint8_t> taken;
     bool in_arena(int k) const { return k >= arena_from && !kept(k); }
     /* The rest (RingLender::set_rest): whether drive reads are held, how often that changed, the load_ram
      * calls. A drive read begun is not let land while held (the reload thread's hold). */
@@ -1874,6 +1879,8 @@ struct FakeLend final : LendHost {
 
     FakeLend(unsigned seed, int n) : rng(seed) {
         s.assign((size_t)n, S{});
+        ep.assign((size_t)n, 0);
+        taken.assign((size_t)n, 0);
         ram.assign((size_t)n, 0);
         for (int k = 0; k < n; ++k) s[(size_t)k].unit = 100 + k;
     }
@@ -1954,6 +1961,8 @@ struct FakeLend final : LendHost {
         x.copying = true;
         x.copy_done = false;
         x.copy_gen = in_arena(k) ? agen : gen;
+        x.copy_ep = ep[(size_t)k];
+        if (taken[(size_t)k]) bad("slot " + std::to_string(k) + " copied into while its owner holds it");
         x.copy_unit = x.load_unit;
         x.t_copy = ++seq;
         ++x.copies;
@@ -1971,6 +1980,7 @@ struct FakeLend final : LendHost {
         if (!x.src) bad("slot " + std::to_string(k) + " let go of nothing");
         if (x.reading) bad("slot " + std::to_string(k) + "'s buffer let go while its read runs");
         if (x.copying && x.copy_done) {
+            x.content_ep = x.copy_ep;
             x.content_gen = x.copy_gen;
             x.content_unit = x.copy_unit;
         }
@@ -1983,6 +1993,10 @@ struct FakeLend final : LendHost {
         S& x = s[(size_t)k];
         if (on) {
             if (x.published) bad("slot " + std::to_string(k) + " published twice");
+            if (taken[(size_t)k]) bad("slot " + std::to_string(k) + " published while its owner holds it");
+            if (x.content_ep != ep[(size_t)k])
+                bad("slot " + std::to_string(k) + " published from a copy of epoch " + std::to_string(x.content_ep) +
+                    ", before its owner last took it");
             const uint64_t now_gen = in_arena(k) ? agen : gen;
             if (!kept(k) && x.content_gen != now_gen)
                 bad("slot " + std::to_string(k) + " published from a copy of generation " + std::to_string(x.content_gen) +
@@ -5400,5 +5414,68 @@ TEST(p1_lend_arena_split_full_steps_take_the_arena_back_before_use_on_the_two_st
     std::fprintf(stderr, "  runs that fail with the arena left to full steps: %d of 300\n", wrong);
 }
 
+
+/* The lender's half of a KV pool that lends its unused blocks (RingLender::set_avail, a prototype the engine does not
+ * call yet): an owner (the KV cache's live mark) takes the top slots back and gives them again at random pass
+ * boundaries, while passes of both kinds run and loads land and copies pass at random. Checks: a slot is never
+ * published while its owner holds it, never from a copy queued before the owner last took it, a copy still queued
+ * when the owner takes the slot is fenced first, and once every slot is given back they all come back. */
+TEST(p1_lend_slot_availability_follows_a_moving_owner_mark) {
+    int runs = 0;
+    for (unsigned seed = 1; seed <= 300; ++seed) {
+        std::mt19937 rng(seed);
+        const int n = 2 + (int)(rng() % 10);
+        FakeLend h(seed * 13u + 1u, n);
+        h.land_pct = 20 + (int)(rng() % 70);
+        h.copy_pct = 20 + (int)(rng() % 70);
+        h.bufs = 1 + (int)(rng() % 3);
+        for (int k = 0; k < n; ++k) h.ram[(size_t)k] = rng() % 2;
+        RingLender l;
+        REQUIRE_EQ(l.init(&h, n, (int64_t)(rng() % 3) * 30), 0);
+        int mark = n;   /* slots from the mark up are the owner's */
+        int64_t t = 0;
+        for (int step = 0; step < 300 && !h.violations; ++step) {
+            if (rng() % 4 == 0) {
+                const int to = (int)(rng() % (unsigned)(n + 1));
+                for (int k = to; k < mark; ++k) {   /* the owner takes slots [to, mark) */
+                    const bool queued = h.s[(size_t)k].copying;
+                    const int f0 = h.s[(size_t)k].fences;
+                    ++h.ep[(size_t)k];
+                    l.set_avail(k, false);
+                    h.taken[(size_t)k] = 1;
+                    if (h.s[(size_t)k].published) h.bad("slot " + std::to_string(k) + " still published when its owner takes it");
+                    if (queued && h.s[(size_t)k].fences == f0) h.bad("slot " + std::to_string(k) + "'s queued copy not fenced for its owner");
+                    if (l.avail(k)) h.bad("slot " + std::to_string(k) + " available after set_avail(false)");
+                }
+                for (int k = mark; k < to; ++k) {   /* and gives [mark, to) back */
+                    h.taken[(size_t)k] = 0;
+                    l.set_avail(k, true);
+                }
+                mark = to;
+            }
+            const bool p1 = rng() % 3 == 0;
+            lend_pass(l, h, p1, t);
+            if (p1) l.end_p1(t += 1 + (int64_t)(rng() % 20));
+            t += 1 + (int64_t)(rng() % 20);
+        }
+        for (int k = mark; k < n; ++k) {
+            h.taken[(size_t)k] = 0;
+            l.set_avail(k, true);
+        }
+        t += 1000;
+        for (int i = 0; i < 400 && l.residents() < n && !h.violations; ++i) {
+            h.settle_all();
+            lend_pass(l, h, false, t += 5);
+        }
+        if (l.residents() != n) h.bad("only " + std::to_string(l.residents()) + " of " + std::to_string(n) + " resident after every slot came back");
+        if (h.violations) {
+            CHECK_EQ(h.violations, 0);
+            std::fprintf(stderr, "seed %u: %s\n", seed, h.first.c_str());
+            return;
+        }
+        ++runs;
+    }
+    CHECK_EQ(runs, 300);
+}
 
 RAD_TEST_MAIN()

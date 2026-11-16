@@ -666,6 +666,51 @@ int RingLender::set_arena(int first) {
     return 0;
 }
 
+int RingLender::set_avail(int k, bool on) {
+    if (!host_ || k < 0 || k >= n() || slot_[(size_t)k].keep) return -1;
+    Slot& s = slot_[(size_t)k];
+    if (on) {
+        if (s.avail) return 0;
+        s.avail = true;
+        /* Back to wanting its unit once its group is back too; a pass's pump begins the load. */
+        if (!lent_g_[s.grp] && (s.st == St::Idle || s.st == St::Failed)) s.st = St::Want;
+        return 0;
+    }
+    if (!s.avail) return 0;
+    s.avail = false;
+    int withdrawn = 0;
+    switch (s.st) {
+    case St::Resident: {
+        const bool bad = audit_ && !audit_ok(k, false);
+        host_->publish(k, false);
+        ++st_.withdrawn;
+        withdrawn = 1;
+        if (bad) lose(k);
+        else s.st = St::Idle;
+        break;
+    }
+    case St::Lost:
+        break;
+    case St::Landed:
+        host_->drop(k);
+        ++st_.cancelled;
+        s.st = St::Idle;
+        break;
+    case St::Copying:
+        host_->fence(k);   /* the owner's writes into the slot wait for the copy */
+        s.cancel = true;
+        break;
+    case St::Reading:
+        s.cancel = true;
+        break;
+    default:
+        s.st = St::Idle;
+        break;
+    }
+    poll();
+    return withdrawn;
+}
+
 void RingLender::give_back(int g) {
     lent_g_[g] = false;
     ++st_.returns;
@@ -673,7 +718,7 @@ void RingLender::give_back(int g) {
      * return, as before). */
     const bool kept_too = !lent();
     for (Slot& s : slot_)
-        if ((s.keep ? kept_too : s.grp == g) && (s.st == St::Idle || s.st == St::Failed)) s.st = St::Want;
+        if ((s.keep ? kept_too : s.grp == g && s.avail) && (s.st == St::Idle || s.st == St::Failed)) s.st = St::Want;
 }
 
 bool RingLender::audit_ok(int k, bool publish) {
@@ -800,7 +845,7 @@ void RingLender::pump(Pump which) {
     bool waited = false;
     for (int k = 0; k < n(); ++k) {
         Slot& s = slot_[(size_t)k];
-        if (s.st != St::Want) continue;
+        if (s.st != St::Want || !s.avail) continue;
         if (arena_only && (s.keep || s.grp != 1)) continue;
         if (which == Pump::Back && (s.keep || lent_g_[s.grp])) continue;
         const int r = ram ? host_->load_ram(k) : host_->load(k);

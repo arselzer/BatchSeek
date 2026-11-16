@@ -513,6 +513,18 @@ public:
     bool arena_slot(int k) const { return arena_ >= 0 && k >= arena_ && k < n() - keep_; }
     /* With the split: whether the arena's slots are lent out now (always false without it). */
     bool arena_lent() const { return arena_ >= 0 && lent_g_[1]; }
+    /* Slot availability, the lender's half of a KV pool that lends its unused blocks (VRAMLEND-20261116.md, B;
+     * prototype: nothing in the engine calls it yet). A slot carved from memory another owner may take back at
+     * any pass boundary (KV blocks above the cache's live mark) is available only while that owner leaves it.
+     * set_avail(k, false), between passes and before the owner writes the slot: a resident is withdrawn (audited
+     * first with the audit), a queued copy is fenced (LendHost::fence: the owner's writes on the compute stream
+     * wait for it) and a load in flight is cancelled; from then on the slot is lent out whatever its group is,
+     * and nothing loads or publishes it. set_avail(k, true): the owner gave the slot back (its last writer is
+     * behind the pass before, as for any lent slot's reload); the slot wants its unit again once its group is
+     * back. Returns 1 when a resident was withdrawn, 0 otherwise, -1 for a kept or out-of-range slot. Every slot
+     * is available unless this says otherwise, so without calls the lender is as before. */
+    int  set_avail(int k, bool on);
+    bool avail(int k) const { return k >= 0 && k < n() && slot_[(size_t)k].avail; }
     /* Bring-up, before the first pass: the kept slots' loads worked on (landed ones copied, passed copies
      * published, further loads begun), whatever the other slots' state. Returns the kept slots still on
      * their way (wanted, reading, landed or copying); the caller calls again until 0, or stops and leaves
@@ -569,7 +581,7 @@ private:
      * heat policy gave the slot another unit, not yet published there (the retargets count). Lost: the
      * read-back audit gave the slot up, for good. */
     enum class St : uint8_t { Idle, Want, Reading, Landed, Copying, Resident, Failed, Lost };
-    struct Slot { St st = St::Idle; bool cancel = false; bool moved = false; bool keep = false; uint8_t grp = 0; };
+    struct Slot { St st = St::Idle; bool cancel = false; bool moved = false; bool keep = false; uint8_t grp = 0; bool avail = true; };
     LendHost* host_ = nullptr;
     std::vector<Slot> slot_;
     int64_t grace_ = 0, last_p1_ = 0, rest_ = 0, now_ = 0;
@@ -588,8 +600,8 @@ private:
      * differs or could not be read. lose: the slot is given up. */
     bool audit_ok(int k, bool publish);
     void lose(int k);
-    /* Slot s is lent out: its group is, and it is not a kept one. */
-    bool away(const Slot& s) const { return lent_g_[s.grp] && !s.keep; }
+    /* Slot s is lent out: its group is (or the slot is unavailable, set_avail), and it is not a kept one. */
+    bool away(const Slot& s) const { return (lent_g_[s.grp] || !s.avail) && !s.keep; }
     void settle(int k);
     void poll();
     /* Loads for the slots that want one (from the RAM cache only in the rest): All, every such slot; Back (the
