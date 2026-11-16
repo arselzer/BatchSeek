@@ -10943,7 +10943,11 @@ DmRun dm_run(const char* dm, int64_t seqs) {
     LcpOn on(2048, 1);
     Fixture f;
     lcp_fixture(f, 2048, 2048);
-    REQUIRE_EQ(dm_start(f, dm, seqs), RAD_OK);
+    /* Not REQUIRE_EQ: its bare `return;` does not fit a function returning DmRun. A failed start is
+     * reported and the empty run returned, which the caller's checks then fail on. */
+    const int started = dm_start(f, dm, seqs);
+    CHECK_EQ(started, RAD_OK);
+    if (started != RAD_OK) return r;
     std::vector<uint64_t> ids;
     for (int w = 0; w < 3; ++w)
         for (size_t i = 0; i < kHeldOut.size(); ++i) {
