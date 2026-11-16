@@ -4228,7 +4228,7 @@ for a in $ARMS; do
                  wl=$((10#${p#Wl})); env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE_LEAD_US=$wl)
                else log "arm $a: $p: a pre-wake lead takes 0-100000 us; the arm is skipped"; skip=1; fi ;;
       U?*)     [[ -n "$upart" ]] && { log "arm $a: $p after U$upart (one receipt an arm); the arm is skipped"; skip=1; }
-               upart=${p#U} ARM_PROMPTS=$EXTRA_PROMPTS/${p#U}-receipt.json ARM_N=999
+               upart=${p#U} ARM_PROMPTS=$EXTRA_PROMPTS/${p#U}-receipt.json ARM_N=99999
                [[ -f $ARM_PROMPTS ]] || { log "arm $a: no prompts $ARM_PROMPTS; the arm is skipped"; skip=1; } ;;
       F5post|F5warm)
                [[ -n "$f5" ]] && { log "arm $a: duplicate F5 sequence part; the arm is skipped"; skip=1; }
