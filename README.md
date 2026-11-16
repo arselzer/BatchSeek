@@ -79,10 +79,10 @@ mini-dev set (official prompts, replies up to 2048 tokens) in one batch, default
 | BIRD 2026 questions at once | Peak output tokens/s | Whole job, tokens/s | Power (avg, W) | Wh per 1,000 tokens |
 |---:|---:|---:|---:|---:|
 | 1 | ~20 | 17 | 587 | 9.4 |
-| 500 | ~340 | 112 | 589 | 1.45 |
+| 500 | ~340 | 137 | 663 | 1.34 |
 
-The job takes 49 minutes from the first request to the last reply and produces 328,110 output tokens: six minutes of
-prompt processing, then generation. The peak is measured from the KV cache's growth over 10 seconds while all 500
+The job takes 39 minutes from the first request to the last reply and produces 316,824 output tokens: four and a half
+minutes of prompt processing, then generation. The peak is measured from the KV cache's growth over 10 seconds while all 500
 generate. Replies vary a lot in length, so for most of the second half only a shrinking group of long answers is still
 running. Power is GPUs + CPU, from their own sensors.
 
@@ -91,7 +91,7 @@ accepts it), and the cost of the 2026 job:
 
 | Who runs the model | BIRD 2026 accuracy | BIRD 2026 cost | BIRD original accuracy | BIRD original cost |
 |---|---:|---:|---:|---:|
-| **This box** (default mode, BIRD training profile) | **50.2%** | **€0.14** at €0.30/kWh | **61.6%** | **€0.014** |
+| **This box** (default mode, BIRD training profile) | **50.6%** | **€0.13** at €0.30/kWh | **61.6%** | **€0.014** |
 | DeepSeek API | 50.8% | €0.22 | 59.8% | €0.031 |
 | DeepInfra | 47.2% | €0.12 | 60.2% | €0.015 |
 | Wafer | 49.0% | €0.16 | 60.2% | €0.021 |
