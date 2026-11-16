@@ -95,5 +95,5 @@ The container keeps the release's native MXFP4 routed-expert codes and scales un
 
 - `ds41-converter.patch` is the converter tree that made the container, as a diff against `bd65d4e5`, with one code
   comment reworded since. Comments do not change the converter's output.
-- After a rebuild, a short smoke test on the cards (see the main README's quick start) shows that the container
+- After a rebuild, a short smoke test on the cards (see "From zero" in the main README) shows that the container
   loads. No reference reply is pinned here.

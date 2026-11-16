@@ -27,7 +27,7 @@ def throughput():
     vmax = max(p["tok_s"] for p in pts if p["tok_s"] is not None)
     ymax, step = vmax * 1.15, 100
     def Y(v): return H - B - v / ymax * (H - T - B)
-    b = [text(0, 20, "Decode throughput, all streams together", TITLE, "ink", weight="600"),
+    b = [text(0, 20, "Output tokens per second, all requests together", TITLE, "ink", weight="600"),
          text(0, 39, "output tokens per second, four RX 9070 XT", LABEL, "ink2")]
     v = 0.0
     while v <= ymax:
@@ -56,9 +56,9 @@ def throughput():
                 b.append(text(x - 9, y - 9, lab, LABEL, "ink", "end", "600", HALO))
     if any(p.get("pending") and p["tok_s"] is not None for p in pts):
         b.append(text(W - 2 * PAD - R, 60, "* earlier build, being re-measured", SMALL, "muted", "end"))
-    desc = "; ".join(f"{p['streams']} streams: " + (f"{p['tok_s']} tok/s" if p["tok_s"] is not None else "pending")
+    desc = "; ".join(f"{p['streams']} requests: " + (f"{p['tok_s']} tok/s" if p["tok_s"] is not None else "pending")
                      + f" ({p['kind']})" for p in pts)
-    return doc(W, H, wrap("".join(b)), "Decode throughput by number of concurrent streams", desc)
+    return doc(W, H, wrap("".join(b)), "Output tokens per second by number of requests at once", desc)
 
 
 def bar(x0, x1, y, h, col, r=4):
@@ -110,5 +110,5 @@ erows = [{"job": r["job"], "kwh": (r["j_per_req"] / 3600 if r["j_per_req"] is no
          for r in data["energy"]["rows"]]
 open(os.path.join(D, "energy.svg"), "w").write(hbars(
     erows, [("kwh", "energy", "s1")],
-    "Energy per 1,000 requests", "kWh, GPU boards + CPU package", "kWh", "Energy per 1,000 requests by job", fmt="{:.2f}"))
+    "Energy per 1,000 requests", "kWh, GPUs + CPU", "kWh", "Energy per 1,000 requests by job", fmt="{:.2f}"))
 print("wrote throughput.svg jobs.svg energy.svg in", D)

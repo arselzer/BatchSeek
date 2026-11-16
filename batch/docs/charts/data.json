@@ -1,7 +1,7 @@
 {
-  "_note": "Edit the numbers here and run make_charts.py. null = pending (drawn as a labelled placeholder, never a guessed value).",
+  "_note": "Edit the numbers here and run make_charts.py.",
   "throughput": {
-    "_source": "decode tok/s summed over all streams, four RX 9070 XT. 1-8 streams: chat configuration windows (Nov 3, CG/CQ). 128/256:). 512:, clean RAM). 8/32/64 with the batch preset:. 8/32/64 batch:, C8/C32/C64; decode-only = tokens / stats.step_ns_decode). 512 updated to.8). 512 = 44,998 decode tokens (first tokens excluded) / 167.46 s.",
+    "_source": "Output tokens per second while generating, all requests together, four RX 9070 XT. 1 request: chat configuration; 8-512: batch configuration (512: best configuration measured).",
     "points": [
       {
         "streams": 1,
@@ -51,7 +51,7 @@
     ]
   },
   "jobs": {
-    "_source": "client wall time for the whole batch (all requests sent at once, so it equals the server step time within 0.3 s). Plain engine: Nov 11-12 windows. BatchSeek:) for BIRD and 512,.7 s and 512 565.7 s.",
+    "_source": "Wall time of whole batch jobs, from the first request to the last reply.",
     "rows": [
       {
         "job": "256 BIRD SQL questions",
@@ -71,7 +71,7 @@
     ]
   },
   "energy": {
-    "_source": "GPU boards + CPU package only (no RAM, board, fans, PSU loss; no wall meter). Mean sampled power x server step time (timestamps, not sample counts)., BIRD 500 default),, reproducible). kWh per 1,000 requests = J/request / 3600.",
+    "_source": "GPUs + CPU from their own sensors (no RAM, board, fans or PSU loss); mean power x job time.",
     "rows": [
       {
         "job": "256 BIRD questions",

@@ -46,7 +46,8 @@ behaves at hundreds of concurrent requests:
   with unchanged results. Optionally, prompt reading and attention on the matrix units in another summation order: faster, but replies can then
   depend on the batch (see "Reproducible mode").
 - **Reproducibility checks and measurement harness.** `tools/ds41-host-experts/ab_window.sh` runs A/B measurement
-  windows. Each optimization was accepted only if replies, logits and prompt-reading hashes stayed byte-identical to the
+  windows. Each optimization (except the two opt-out fast modes below) was accepted only if replies, logits and
+  prompt-reading hashes stayed byte-identical to the
   same engine with that optimization off.
 
 Configuration, switches and measurements: [tools/ds41-host-experts/README.md](tools/ds41-host-experts/README.md).
@@ -71,22 +72,22 @@ Four RX 9070 XT (TP4), EPYC 7443 (24 cores), 256 GB DDR4-2666, one 2 TB NVMe dri
 
 ![A 512-request job over time: requests waiting, reading prompts and generating, output tokens per second, KV cache, power](batch/docs/charts/timeline-512.svg)
 
-One batch of 512 SQL questions, from the first request to the last reply.
+One batch of 512 SQL questions from my own workload (not public), from the first request to the last reply.
 
 | Requests at once | Output tokens/s, all together | Per request | vs. 1 request | Power (avg, W) | Wh per 1,000 tokens |
 |---:|---:|---:|---:|---:|---:|
 | 1 | 31 | 31 | 1× | ~580 | ~5.2 |
 | 8 | 55 | 6.9 | 1.8× | 634 | 3.2 |
 | 64 | 86 | 1.34 | 2.8× | 725 | 2.3 |
-| 256 | 203 | 0.79 | 6.6× | 908 | 1.3 |
+| 256 | 203 | 0.79 | 6.6× | 908 | 1.2 |
 | **512** | **269** | **0.53** | **8.7×** | **965** | **1.0** |
 
 Output tokens per second while generating, all requests together. Power is GPUs + CPU.
 
 ![Output tokens per second by number of requests at once](batch/docs/charts/throughput.svg)
 
-Whole jobs, from the first request to the last reply, prompts included: 512 SQL questions take 566 s, and labeling
-256 COCO photos takes 532 s.
+Whole jobs, from the first request to the last reply, prompts included: the 512 SQL questions take 566 s with the best
+configuration measured (the launcher's defaults: about 600 s).
 
 ![Energy per 1,000 requests by job](batch/docs/charts/energy.svg)
 
@@ -109,7 +110,7 @@ API prices as charged through OpenRouter on 16 November 2026, at $1.12 per euro.
 accuracy differences are within noise. The other models ran with thinking off at their default sampling (they don't
 accept temperature 0), with prompts written for DeepSeek.
 
-The same BIRD 256 job with three placement profiles:
+The same BIRD 256 job with two placement profiles:
 
 | Placement profile | BIRD 256 |
 |---|---:|
@@ -151,15 +152,15 @@ cd model && cat model.rad.part-0{1..8} > model.rad && sha256sum -c SHA256SUMS --
   && rm model.rad.part-* && cd ..
 
 # 3. Serve (takes a few minutes to load; ready when http://localhost:8000/v1/models answers)
-export RADIANCE_HOME=$PWD/build/radiance_home
+export RADIANCE_HOME=$PWD/build/radiance_home RADIANCE_BIN=$PWD/build/bin/radiance
 cd batch
 ./serve-batch.sh --model ../model/model.rad --silu-table ../silu_table_gfx1201.bin --streams 512 \
   --profile profiles/bird-train.profile.json \
   --engram-file ../model/engram-fp8/model-00047-of-00048.safetensors,../model/engram-fp8/model-00048-of-00048.safetensors &
 
 # 4. A first test with 8 questions, then the whole file
-head -8 questions.jsonl > first8.jsonl && python3 batch_client.py first8.jsonl first8-answers.jsonl
-python3 batch_client.py questions.jsonl answers.jsonl --concurrency 512
+head -8 my-questions.jsonl > first8.jsonl && python3 batch_client.py first8.jsonl first8-answers.jsonl
+python3 batch_client.py my-questions.jsonl answers.jsonl --concurrency 512
 ```
 
 Disk: joining the parts needs room for the parts and `model.rad` at once (about 830 GB), plus 203 GB for
@@ -167,7 +168,7 @@ Disk: joining the parts needs room for the parts and `model.rad` at once (about 
 bundled in `model.rad`; both ran at the same speed with similar accuracy in our tests. Or rebuild `model.rad` from
 DeepSeek's release with `batch/convert/convert.sh` (CPU only; see [convert/README.md](batch/convert/README.md)).
 
-`questions.jsonl` has one `{"prompt": "...", "system": "...", "id": "..."}` a line; put text that prompts share (a
+`my-questions.jsonl` is your own file, with one `{"prompt": "...", "system": "...", "id": "..."}` a line; put text that prompts share (a
 schema, instructions) in `system`, so the prefix cache reads it once. `batch_client.py --help` lists the rest.
 
 **Long prompts.** Each request gets `--ctx-per-stream` tokens for prompt plus reply (default 1,152, enough for short
@@ -254,7 +255,7 @@ python3 profile_blend_test.py
 ## What was not tested
 
 Upstream radiance serves many other models and has many other features (other architectures, speculative decoding,
-vision and audio models, Docker deployments, other GPUs and card counts). None of them were tested in this fork's
+vision and audio input, Docker deployments, other GPUs and card counts). None of them were tested in this fork's
 setup, and the fork's changes may affect them. For those, see
 [upstream radiance](https://codeberg.org/StillDeadcode/radiance) and its README.
 

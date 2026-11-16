@@ -41,7 +41,7 @@ case $WORK in /*) ;; *) WORK=$PWD/$WORK ;; esac
 
 # ------------------------------------------------------------------------------------------ pins
 RADIANCE_URL=https://codeberg.org/StillDeadcode/radiance
-RADIANCE_FALLBACK_URL=https://github.com/arselzer/radiance-ramcache   # its main branch contains the base commit
+RADIANCE_FALLBACK_URL=https://github.com/arselzer/BatchSeek   # its main branch contains the base commit
 RADIANCE_REV=bd65d4e58f7c4233de09ad5245a82c9510eb8962
 OFFICIAL_REPO=deepseek-ai/DeepSeek-V4.1-Flash-1017
 OFFICIAL_REV=1bae0e1088993b9b82de08f59de5be5a34e42170
