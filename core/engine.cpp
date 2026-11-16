@@ -2866,6 +2866,7 @@ std::string Engine::engine_info() const {
     e["n_vocab"]     = meta_.n_vocab;
     e["n_ctx_train"] = meta_.n_ctx_train;
     e["container"]   = cfg_.model;
+    if (engram_file_) e["engram_file"] = engram_file_->describe();
 
     e["tensor_parallel"]        = cfg_.tp;
     e["tp_wire"]                = cfg_.tp > 1 ? (cfg_.tp_wire_exact ? "exact" : "wht6") : "n/a";

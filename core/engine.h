@@ -38,6 +38,7 @@
 #include "format/table_copy.h"
 #include "format/table_share.h"
 #include "format/dspark_rad_banks.h"
+#include "format/ds41_engram_file.h"
 #include "place/vram_packed.h"
 #include "place/aux_expert_worker.h"
 #include "place/aux_control.h"
@@ -164,6 +165,10 @@ private:
     /* Both borrowed owners outlive every rank, queued copy and cached source reference. */
     std::unique_ptr<RadFile> draft_file_;
     std::unique_ptr<DsparkRadBanks> source_banks_;
+    /* RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE (format/ds41_engram_file.h): the Engram tables read
+     * from the release's safetensors instead of the container; null without it. Mapped for the
+     * engine's life, like file_. */
+    std::unique_ptr<Ds41EngramFile> engram_file_;
     const RadFileEntry* source_entry(const std::string& name) const;
     std::unique_ptr<Checkpoint> ckpt_;
     std::unique_ptr<CheckpointSources> ckpt_src_;

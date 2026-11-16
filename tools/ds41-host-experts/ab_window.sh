@@ -689,6 +689,13 @@ lcp_check() {   # name
     return 1
   fi
   [[ -n "${ARM_EE:-}" ]] && grep -m1 -E 'deepseek41: Engram rows early' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # Ef: the engine's sidecar line at startup, in an Ef arm only (ef_gate).
+  local ef_why
+  if declare -F ef_gate >/dev/null && ! ef_why=$(ef_gate "$OUT/$name.server.log" "${ARM_EF:-}"); then
+    log "arm $name: $ef_why; not measured"
+    return 1
+  fi
+  [[ -n "${ARM_EF:-}" ]] && grep -m1 -F 'RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE: ' "$OUT/$name.server.log" | cut -c1-400 | tee -a "$OUT/window.log"
   # QlK: rank 0's "ds41 p1: lent ring: K of the ring's" line at startup, in a Ql arm only.
   local lend_lines
   lend_lines=$(grep -c 'ds41 p1: lent ring: ' "$OUT/$name.server.log")
@@ -883,7 +890,7 @@ bal_receipt_bound() {   # log, requested C; actual checked maximum on stdout, or
 # later one's records must equal it byte for byte. KLD_TIMEOUT (900 s) bounds a run. An Ax arm's run is
 # gated as a serving Ax arm is (aux_kld_check: its "on:" line, every rank's jobs at exit, the extra
 # card's clients), and only an arm of passes of at most 16 rows may have both parts (the arm loop).
-KLD_REF=
+KLD_REF= KLD_REF_EF=
 kld_finish() {   # name; the run is SERVER_PID
   local name=$1 t=0 rc spid=$SERVER_PID
   while kill -0 "$SERVER_PID" 2>/dev/null; do
@@ -945,13 +952,24 @@ kld_finish() {   # name; the run is SERVER_PID
     # The reference must be a plain 16-token arm's bits: a feature arm first (the plain one failed
     # or is missing) would let a later feature arm be compared with another one. An Ax / Axv arm as the
     # reference would leave the worker's records compared with nothing.
-    if [[ -n "${ARM_XT:-}${ARM_LC:-}${ARM_N128:-}${ARM_AR_ROWS:-}${ARM_AG_ROWS:-}" || ( -n "${ARM_AX:-}" && "${ARM_AX}" != 0 ) ]]; then
-      log "arm $name: an Xt, Lc, Fn128, Ar, Ag or Ax arm cannot be the window's kld reference (no plain Kld arm finished before it); not compared"
+    if [[ -n "${ARM_XT:-}${ARM_LC:-}${ARM_N128:-}${ARM_AR_ROWS:-}${ARM_AG_ROWS:-}${ARM_EF:-}" || ( -n "${ARM_AX:-}" && "${ARM_AX}" != 0 ) ]]; then
+      log "arm $name: an Xt, Lc, Fn128, Ar, Ag or Ax arm cannot be the window's kld reference (nor an Ef arm; no plain Kld arm finished before it); not compared"
       return 1
     fi
     KLD_REF=$OUT/kld-$name
     log "arm $name: the window's kld reference"
     return 0
+  fi
+  # An Ef arm's tables are the release's FP8 ones, the reference's the container's IQ4_NL ones: it differs by design, so
+  # its KL against the reference is reported instead (ab_requests.py --kld-between). Its first Ef Kld arm is in turn the
+  # reference every later Ef Kld arm must equal byte for byte (KLD_REF_EF).
+  if [[ -n "${ARM_EF:-}" ]]; then
+    python3 -I "$HERE/ab_requests.py" --kld-between "$KLD_REF" "$OUT/kld-$name" 2>&1 | tee -a "$OUT/window.log"
+    if [[ -z "${KLD_REF_EF:-}" ]]; then
+      KLD_REF_EF=$OUT/kld-$name; log "arm $name: the window's kld reference for Ef arms"; return 0
+    fi
+    python3 -I "$HERE/ab_requests.py" --kld-compare "$KLD_REF_EF" "$OUT/kld-$name" 2>&1 | tee -a "$OUT/window.log"
+    return
   fi
   python3 -I "$HERE/ab_requests.py" --kld-compare "$KLD_REF" "$OUT/kld-$name" 2>&1 | tee -a "$OUT/window.log"
 }
@@ -1101,6 +1119,23 @@ ee_gate() {   # log, Ee (non-empty: on), start/exit
   (( ranks > 0 )) || { echo "Ee, but no 'rank R: Engram rows early:' line at exit"; return 1; }
   (( refused == 0 )) || { echo "Ee, but $refused read-ahead(s) refused (a malformed call)"; return 1; }
   (( started > 0 )) || { echo "Ee, but no rank started a read-ahead: the switch never acted"; return 1; }
+  return 0
+}
+
+# Ef (RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE=$ENGRAM_FILE, core/format/ds41_engram_file.h): the Engram tables read
+# from the release's own FP8 shards instead of the container's IQ4_NL ones. At start the engine's
+# "RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE: per_layer_token_embd.l1.weight ... fp8_e4m3 ..." line (it refuses to start on
+# any mismatch) in an Ef arm, none in any other. Replies are NOT those of an arm without Ef (other table precision);
+# compare Ef arms with Ef arms. Arguments: the log, the arm's flag (empty: no Ef part). 0 when the arm may be measured.
+ef_gate() {   # log, Ef (non-empty: on)
+  local f=$1 ef=$2 n
+  n=$(grep -c 'RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE: per_layer_token_embd' "$f")
+  if [[ -z "$ef" ]]; then
+    (( n == 0 )) || { echo "no Ef part, but the server reads the Engram tables from a sidecar (the knob set for the window?)"; return 1; }
+    return 0
+  fi
+  (( n > 0 )) || { echo "Ef, but the server log has no 'RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE: per_layer_token_embd' line ($(grep -m1 'ENGRAM_FILE' "$f" | cut -c1-300))"; return 1; }
+  grep -m1 'RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE: ' "$f" | grep -q 'fp8_e4m3' || { echo "Ef, but its sidecar line names no fp8_e4m3 table"; return 1; }
   return 0
 }
 
@@ -3751,7 +3786,10 @@ for a in $ARMS; do
 # the RAM cache's profile-hot units get N second chances before eviction; Ee behind an Engram layer's host
 # gather the next Engram layer's table rows are asked for on a helper thread, each rank its quarter, so the
 # drive reads them beside the layers between (RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY; exact: the gathers
-# and their bytes are unchanged, the call only advises pages; ee_gate checks its lines); Ei a routed layer's card
+# and their bytes are unchanged, the call only advises pages; ee_gate checks its lines); Ef the Engram tables read from
+# the release's FP8 shards ENGRAM_FILE names instead of the container's IQ4_NL ones (RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE;
+# NOT exact against an arm without Ef: other table precision; ef_gate checks its line; a Kld arm reports its KL against the
+# window's plain Kld reference, and later Ef Kld arms must equal the first one); Ei a routed layer's card
 # ops (gate_up, swiglu, down, shared expert) issued ahead of its counts sync, the CPU's share chosen
 # at its gather (RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE; needs all, M16 and B1); Fl the counts and
 # the CPU's rows fetched in one ranged copy instead of four (RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST;
@@ -3857,7 +3895,7 @@ for a in $ARMS; do
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" bp="" sg="" pcn=""
   dmin=""  # DmN: decode first at N ready rows (RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN; Dm alone is the drafter's codebooks)
-  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qyp="" qyk="" qsp="" qt="" qw="" dt="" aw="" qz="" qx="" qo="" qyc="" qes="" kvl="" lk="" ms="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr="" ee=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qyp="" qyk="" qsp="" qt="" qw="" dt="" aw="" qz="" qx="" qo="" qyc="" qes="" kvl="" lk="" ms="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr="" ee="" ef=""
   ctp=""   # Ctp / CtpN: the prefill chain trace (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL)
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
@@ -3904,6 +3942,9 @@ for a in $ARMS; do
       H3)      ARM_HOME=${RADIANCE_HOME_DIR3:?H3 needs RADIANCE_HOME_DIR3} ;;
       Es)      env+=(RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT=1) ;;   # engram_kv rows split over the ranks
       Ee)      ee=1; env+=(RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY=1) ;;   # the next Engram layer's rows read ahead (ee_gate)
+      Ef)      ef=1                                                    # the Engram tables from the release's FP8 shards (ef_gate)
+               if [[ -z "${ENGRAM_FILE:-}" ]]; then log "arm $a: Ef needs ENGRAM_FILE=<shard 47>,<shard 48>; the arm is skipped"; skip=1
+               else env+=(RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE=$ENGRAM_FILE); fi ;;
       Pa)      env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1) ;;   # next layer's attention weights into the on-die cache
       Pm[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MIB=${p#Pm}) ;;   # on-die reads: a budget, use order
       Pl?*)    env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SET=${p#Pl}) ;;   # on-die reads: these, in order
@@ -5005,7 +5046,7 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
   if [[ -n "$ARM_TIMEOUT" ]] && ! [[ $ARM_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]]; then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QYP=$qyp ARM_QYK=$qyk ARM_QSP=$qsp ARM_QT=$qt ARM_QW=$qw ARM_DT=$dt ARM_AW=$aw ARM_QZ=$qz ARM_QX=$qx ARM_QO=$qo ARM_QYC=$qyc ARM_QES=$qes ARM_KVL=$kvl ARM_MS=$ms ARM_LH=$lh ARM_EE=$ee
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QYP=$qyp ARM_QYK=$qyk ARM_QSP=$qsp ARM_QT=$qt ARM_QW=$qw ARM_DT=$dt ARM_AW=$aw ARM_QZ=$qz ARM_QX=$qx ARM_QO=$qo ARM_QYC=$qyc ARM_QES=$qes ARM_KVL=$kvl ARM_MS=$ms ARM_LH=$lh ARM_EE=$ee ARM_EF=$ef
   ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr ARM_SL=$sl ARM_CTX=$arm_ctx ARM_CR=$cr
   if [[ -n "$cr" ]]; then
     crk=${ARM_CONC:-${AB_CONCURRENCY:-1}}

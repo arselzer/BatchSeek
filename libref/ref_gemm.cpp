@@ -582,8 +582,10 @@ int ref_embed_lookup(const RadArgs* a, RadStream) {
  *
  * Codes are i8 or u8, or 4-bit (u4 an unsigned index, i4 signed) elements of a bit stream along the
  * row, lowest bits first (rad_encoding.h). This is how llama.cpp's Q8_0, Q4_0 and IQ4_NL blocks
- * decode once imported as planes (libquant/lq_ggml_planes.h), product for product. Padding, bounds
- * and `vocab_offset` behave as embed_lookup's. */
+ * decode once imported as planes (libquant/lq_ggml_planes.h), product for product. Codes may also
+ * be FP8 (e4m3 or e5m2, no table), each code its own value: DeepSeek-V4.1's release ships its Engram
+ * tables as `fp8_e4m3*e8m0[1x32]`, which the gather reads as stored. Padding, bounds and
+ * `vocab_offset` behave as embed_lookup's. */
 int ref_embed_lookup_planes(const RadArgs* a, RadStream) {
     if (a->n_t < 5 || !rad_arg_in(a, 0) || !rad_arg_in(a, 1) || !rad_arg_in(a, 2) || !rad_arg_in(a, 4))
         return RAD_E_INVAL;
@@ -596,10 +598,14 @@ int ref_embed_lookup_planes(const RadArgs* a, RadStream) {
         cd.shape[1] != E || sc.rank != 2 || sc.shape[0] < V || sc.shape[1] != E / G)
         return RAD_E_SHAPE;
     const uint32_t cdt = cd.dtype;
-    const int bits = (cdt == RAD_U4 || cdt == RAD_I4) ? 4 : (cdt == RAD_U8 || cdt == RAD_I8) ? 8 : 0;
+    const bool fp8 = cdt == RAD_F8E4M3 || cdt == RAD_F8E5M2;
+    const int bits = (cdt == RAD_U4 || cdt == RAD_I4) ? 4
+                   : (cdt == RAD_U8 || cdt == RAD_I8 || fp8) ? 8 : 0;
     if (!bits) return RAD_E_DTYPE;
-    /* A table is indexed by an unsigned code and must hold every one of them. */
-    if (tab && (cdt == RAD_I4 || cdt == RAD_I8 || numel(&tb) < (int64_t)1 << bits)) return RAD_E_DTYPE;
+    /* A table is indexed by an unsigned code and must hold every one of them; an FP8 code is a
+     * value, never an index. */
+    if (tab && (cdt == RAD_I4 || cdt == RAD_I8 || fp8 || numel(&tb) < (int64_t)1 << bits))
+        return RAD_E_DTYPE;
     const int64_t rb = rad_dtype_bytes(cdt, E);
     const int64_t M = numel(&x) / E;
     if (rb <= 0 || M <= 0 || numel(&tok) < M) return RAD_E_SHAPE;
@@ -616,6 +622,11 @@ int ref_embed_lookup_planes(const RadArgs* a, RadStream) {
         }
         const uint8_t* row = (const uint8_t*)cd.data + id * rb;
         const int64_t sb = rowoff(&sc, id, E / G), ss = laststride(&sc);
+        if (fp8) {
+            for (int64_t i = 0; i < E; ++i)
+                stt(&x, xb + i * xs, ld_dt(cdt, row, i) * ldt(&sc, sb + (i / G) * ss) * mult);
+            continue;
+        }
         for (int64_t i = 0; i < E; ++i) {
             int code;
             if (bits == 8) {

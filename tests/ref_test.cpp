@@ -1222,6 +1222,66 @@ TEST(embed_lookup_planes_gathers_imported_ggml_tables_in_place) {
     CHECK(ran >= 2);
 }
 
+/* embed_lookup_planes over DeepSeek-V4.1's release Engram table as stored, `fp8_e4m3*e8m0[1x32]`:
+ * each gathered element is its e4m3 code times the e8m0 power of two of its 32, exactly (the
+ * product of a 4-bit significand and a power of two, so bf16 holds it too); padding and an id
+ * past the vocabulary as embed_lookup; e5m2 codes read the same way; a codebook beside FP8 codes,
+ * which are values and never indices, is refused. */
+TEST(embed_lookup_planes_gathers_fp8_codes_with_e8m0_scales) {
+    const int64_t V = 6, E = 64, G = 32;
+    std::vector<uint8_t> cb((size_t)(V * E)), sb((size_t)(V * E / G));
+    for (int64_t i = 0; i < V * E; ++i) {
+        uint8_t c = (uint8_t)((i * 37 + 11) & 0xff);
+        if ((c & 0x7f) == 0x7f) c ^= 1;                         /* e4m3's NaN codes */
+        cb[(size_t)i] = c;
+    }
+    for (int64_t i = 0; i < V * E / G; ++i) sb[(size_t)i] = (uint8_t)(120 + (i * 5) % 15);
+    for (uint32_t odt : { (uint32_t)RAD_BF16, (uint32_t)RAD_F32 }) {
+        T codes(RAD_F8E4M3, {V, E}); codes.raw(cb);
+        T scale(RAD_E8M0, {V, E / G}); scale.raw(sb);
+        T tok(RAD_I32, {4}); tok.n({5, -1, 0, 3});
+        T x(odt, {4, E});
+        A a; a.t(tok).t(codes).t(scale).tnull().t(x)
+              .i("M", 4).i("n_embd", E).i("n_vocab", V).i("group", G).s("dtype", odt == RAD_BF16 ? "bf16" : "f32");
+        REQUIRE_EQ(run("embed_lookup_planes", a), RAD_OK);
+        const int64_t ids[] = {5, -1, 0, 3};
+        int64_t bad = 0;
+        for (int64_t m = 0; m < 4; ++m)
+            for (int64_t i = 0; i < E; ++i) {
+                const float want = ids[m] < 0 ? 0.0f
+                    : rad_fp8e4m3_to_f32(cb[(size_t)(ids[m] * E + i)]) *
+                      std::ldexp(1.0f, (int)sb[(size_t)(ids[m] * (E / G) + i / G)] - 127);
+                bad += x.at(m * E + i) != want;
+            }
+        CHECK_EQ(bad, (int64_t)0);
+        T past(RAD_I32, {4}); past.n({0, 6, 1, 2});
+        A b; b.t(past).t(codes).t(scale).tnull().t(x)
+              .i("M", 4).i("n_embd", E).i("n_vocab", V).i("group", G).s("dtype", "f32");
+        CHECK(run("embed_lookup_planes", b) < 0);
+        T table(RAD_F32, {1, 256});
+        A c; c.t(tok).t(codes).t(scale).t(table).t(x)
+              .i("M", 4).i("n_embd", E).i("n_vocab", V).i("group", G).s("dtype", "f32");
+        CHECK(run("embed_lookup_planes", c) < 0);
+    }
+    /* e5m2 codes, one scale group a row */
+    std::vector<uint8_t> c5((size_t)(2 * E));
+    for (int64_t i = 0; i < 2 * E; ++i) c5[(size_t)i] = (uint8_t)((i * 29 + 3) & 0x7b);   /* finite */
+    T codes(RAD_F8E5M2, {2, E}); codes.raw(c5);
+    T scale(RAD_E8M0, {2, 1}); scale.raw({127, 128});
+    T tok(RAD_I32, {2}); tok.n({1, 0});
+    T x(RAD_F32, {2, E});
+    A a; a.t(tok).t(codes).t(scale).tnull().t(x)
+          .i("M", 2).i("n_embd", E).i("n_vocab", 2).i("group", E).s("dtype", "f32");
+    REQUIRE_EQ(run("embed_lookup_planes", a), RAD_OK);
+    int64_t bad = 0;
+    for (int64_t m = 0; m < 2; ++m)
+        for (int64_t i = 0; i < E; ++i) {
+            const int64_t r = m == 0 ? 1 : 0;
+            bad += x.at(m * E + i) != fp8e5m2_to_f32(c5[(size_t)(r * E + i)]) * (r ? 2.0f : 1.0f);
+        }
+    CHECK_EQ(bad, (int64_t)0);
+}
+
 TEST(manifold_sinkhorn_first_pass_and_epsilon_are_distinct) {
     T h(RAD_F32, {1, 2}); h.f({1, 3});
     T fn(RAD_F32, {8, 2}), scale(RAD_F32, {3}); scale.f({1, 1, 1});
