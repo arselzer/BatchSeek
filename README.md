@@ -32,9 +32,8 @@ Unofficial; not affiliated with DeepSeek, BIRD or radiance.
 - `calibrate.sh` records a placement profile on your own prompts in one command.
 - `profile_blend.py` blends, checks and shows placement profiles; `profiles/profile_rebind.py` makes one portable
   (`strip`) or ties it to your copy of the container (`bind`).
-- `profiles/` holds two placement profiles (counts of how often each expert is used; no prompts):
-  `bird-train.profile.json`, recorded on 64 public BIRD training questions, and `nlsql-agent3.profile.json`,
-  recorded partly on private SQL prompts.
+- `profiles/bird-train.profile.json` is a placement profile (counts of how often each expert is used; no prompts)
+  recorded on 64 public BIRD training questions.
 - `bird/` builds the BIRD request sets from the official downloads and scores replies.
 - `docs/charts/` has the charts below and the scripts that draw them.
 
@@ -66,8 +65,7 @@ and hardware before most of the batch work:
 | Job | Earlier configuration | Batched | Speedup |
 |---|---:|---:|---:|
 | 256 BIRD questions (public) | 1,025 s | 146 s | 7.0x |
-| 256 text-to-SQL questions (private set) | 911 s | 247 s | 3.7x |
-| 512 of the same | | 566 s | |
+| 512 SQL questions | | 566 s | |
 | 256 COCO photos to object labels | | 532 s | |
 
 ![Energy per 1,000 requests by job](docs/charts/energy.svg)
@@ -97,7 +95,6 @@ The same BIRD 256 job with three placement profiles:
 |---|---:|
 | Built into the model file | 221 s |
 | Recorded from 64 public BIRD *training* questions (different databases) | **146 s** |
-| Recorded partly from my private SQL prompts | 160 s |
 
 The measured numbers used a community IQ4_NL conversion of the Engram tables. The engine is switching to the
 release's official FP8 Engram tables, which measured the same speed (170 s vs 172 s) and a slightly lower NLL (0.688
