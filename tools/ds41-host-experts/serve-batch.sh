@@ -35,6 +35,9 @@
 #   - --fast-attn (Aw, ..._ATTN_WMMA): the sparse attention at every height on the matrix cores, OFF by default. NOT
 #     exact: q.k and sum p k summed in another f32 order (the softmax's exp, max and normaliser the exact kernel's), so
 #     replies are not byte-identical to the exact engine's. Give 1 to turn it on (FASTDENSE-20261115.md).
+#   - --early K (QxK, ..._P1_EARLY): up to K of the next card-path layer's units copied into the ring before its routing
+#     counts, so the link works through attention and the router; exact (scheduling only). OFF (0) until window H55
+#     measures it (OVERLAP-20261115.md).
 #   - --served-model-name ds41 (a name only; --served-name sets another) and --radiance-home only when given
 #     (RADIANCE_HOME otherwise).
 #
@@ -42,7 +45,7 @@
 #                       [--ctx-per-stream 1152] [--profile FILE] [--mirror DIR] [--shared-head 32] [--served-name ds41]
 #                       [--radiance-home DIR] [--hybrid 60] [--max-seq-len N] [--tiled 0|1] [--tail-once 0|1]
 #                       [--swiglu-span 0|1] [--engram-early 0|1] [--hybrid-prefill 60] [--fast-prefill 0|1]
-#                       [--fast-dense 0|1] [--fast-attn 0|1] [--dry-run]
+#                       [--fast-dense 0|1] [--fast-attn 0|1] [--early K] [--dry-run]
 #                       [-- more radiance flags, e.g. --expert-stats FILE to record a profile; outside the measured set]
 #   RADIANCE_BIN (default: radiance on PATH, else build/bin/radiance), RADIANCE_HOME as for any radiance run.
 # --dry-run prints the environment and the command and starts nothing. Otherwise the script becomes the server (exec:
@@ -50,7 +53,7 @@
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
-EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=0 FASTDN=1 FASTAT=0
+EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=0 FASTDN=1 FASTAT=0 EARLY=0
 while (( $# )); do
   case $1 in
     --model) MODEL=${2:?}; shift ;;
@@ -74,6 +77,7 @@ while (( $# )); do
     --fast-prefill) FASTPF=${2:?}; shift ;;
     --fast-dense) FASTDN=${2:?}; shift ;;
     --fast-attn) FASTAT=${2:?}; shift ;;
+    --early) EARLY=${2:?}; shift ;;
     --dry-run) DRY=1 ;;
     --) shift; EXTRA=("$@"); break ;;
     -h|--help) sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -89,6 +93,7 @@ num --streams "$STREAMS" 1; num --port "$PORT" 1; num --ctx-per-stream "$CTX" 1;
 num --hybrid "$HYBRID" 0; (( 10#$HYBRID <= 400 )) || die "--hybrid takes 0 (off) or a share of 1-400 percent, not '$HYBRID'"
 num --hybrid-prefill "$HYBPF" 0; (( 10#$HYBPF <= 400 )) || die "--hybrid-prefill takes 0 (off) or a share of 1-400 percent, not '$HYBPF'"
 [[ -z "$SEQLEN" ]] || num --max-seq-len "$SEQLEN" 64
+num --early "$EARLY" 0; (( 10#$EARLY <= 64 )) || die "--early takes 0 (off) or 1-64 units, not '$EARLY'"
 for v in "--tiled $TILED" "--tail-once $TAILONCE" "--swiglu-span $SPAN" "--engram-early $ENGEARLY" "--fast-prefill $FASTPF" "--fast-dense $FASTDN" "--fast-attn $FASTAT"; do
   [[ ${v#* } == [01] ]] || die "${v% *} takes 0 or 1, not '${v#* }'"
 done
@@ -182,6 +187,7 @@ ENV=(
   RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=$FASTPF           # Qw: the WMMA P1 twin, inexact (--fast-prefill)
   RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED=$FASTDN       # Dt: the tiled bf16f8 GEMM, exact (--fast-dense)
   RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA=$FASTAT         # Aw: the WMMA sparse attention, inexact (--fast-attn)
+  RADIANCE_EXPERIMENTAL_DS41_P1_EARLY=$((10#$EARLY))   # QxK: early ring copies, exact (--early K; 0 off until a window measures it)
   RADIANCE_EXPERIMENTAL_DS41_P1=1
   RADIANCE_EXPERIMENTAL_DS41_P1_WAVE=
   RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT=
