@@ -168,11 +168,12 @@ time is many times slower). `batch_client.py` is a small helper that does that f
 keeps the answers in order. `my-questions.jsonl` is your own file, with one `{"prompt": "...", "system": "...", "id": "..."}` a line; put text that prompts share (a
 schema, instructions) in `system`, so the prefix cache processes it once. `batch_client.py --help` lists the rest.
 
-**Long prompts.** Each request gets `--ctx-per-stream` tokens for prompt plus reply (default 1,152, enough for short
-SQL questions). For longer prompts or replies, raise it and lower `--streams` so that streams x ctx-per-stream stays
-at most about 720,000 tokens: the pool takes VRAM from the experts kept on the GPUs, and a larger pool slows
-everything down (`--streams 512 --ctx-per-stream 1408` for all 500 of BIRD's 2026 prompts at once; prompts that share a
-schema share its KV through the prefix cache). The launcher warns above about 786,000. `--dry-run` shows the resulting settings.
+**Long prompts.** The KV pool is shared by all streams: `--streams` x `--ctx-per-stream` tokens (default 256 x 1,152).
+Prompts that share a schema share its KV through the prefix cache, so the pool only has to hold what the requests hold
+at once, not each request's longest possible length; a single request may run up to `--max-seq-len` tokens. Keep the
+pool at most about 720,000 tokens: it takes VRAM from the experts kept on the GPUs, and a larger pool slows everything
+down (the launcher warns above about 786,000). For all 500 of BIRD's 2026 prompts at once (about 4,000-token prompts,
+replies up to 2,048): `--streams 512 --ctx-per-stream 1408 --max-seq-len 8192`. `--dry-run` shows the resulting settings.
 
 ## Calibration
 
