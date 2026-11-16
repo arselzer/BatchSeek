@@ -5246,6 +5246,12 @@ int FileStager::p1_init(const Program& prog) {
                  ds41p1::kLogHybridPrefill, (long long)p1_min_rows_, t.hybrid_prefill, ds41p1::kHybridPrefillEnv,
                  t.hybrid_prefill, hx_pool_->cpu_bytes_per_ns(), hx_pool_->link_bytes_per_ns(),
                  t.hybrid_adapt ? "adapts per rank from each layer's outcome, at most that" : "is held (..._P1_HYBRID_ADAPT=0)");
+    if (plan_->rank == 0 && t.early > 0)
+        RAD_INFO("ds41 p1: early ring copies on (%s=%d): behind each card-path layer's waves, up to %d RAM-cache units "
+                 "of the pass's next card-path layer, the profile's likeliest first, are copied into the ring before its "
+                 "routing counts; a selected one is a wave's from its early slot, the rest go unread; counts in the "
+                 "shutdown stats line",
+                 ds41p1::kEarlyEnv, t.early, std::min(t.early, p1_->ring_slots()));
     if (plan_->rank == 0 && lcp_spec_)
         RAD_INFO("ds41 p1: prompt-lookup speculation admitted (--num-speculative-tokens %d, no draft head): a verify "
                  "step of at most %lld decode rows never arms the card path; its residents run in the plugin's own ops "
@@ -5698,10 +5704,25 @@ int FileStager::p1_layer(int32_t li, RadStream s, bool hyb) {
     return RAD_OK;
 }
 
+int FileStager::p1_early(int32_t li) {
+    const int32_t nx = li + 1;
+    if ((size_t)nx >= layers_.size() || !will_issue(nx) || !p1_layer_on(nx)) return RAD_OK;
+    const std::vector<int32_t>* pooled = (size_t)nx < p1_pool_.size() ? &p1_pool_[(size_t)nx] : nullptr;
+    p1_early_.clear();
+    for (int32_t u : layers_[(size_t)nx].units) {
+        if (mover_->ring_resident(u) || mover_->file_unit_in_slab(u) || !mover_->unit_cached(u)) continue;
+        if (pooled && std::find(pooled->begin(), pooled->end(), u) != pooled->end()) continue;
+        p1_early_.push_back(u);
+    }
+    std::stable_sort(p1_early_.begin(), p1_early_.end(), [&](int32_t a, int32_t c) {
+        return plan_->units[(size_t)a].profile_share > plan_->units[(size_t)c].profile_share;
+    });
+    return p1_->early(nx, p1_early_);
+}
+
 /* ..._P1_HYBRID (p1_hybrid.h): the layer's selected units (want_) as candidates, slab units neither side's,
  * and the pool's cost model's choice into p1_hyb_to_. Returns the units chosen. */
 int FileStager::p1_hyb_pick(int32_t li) {
-    (void)li;
     const size_t n = want_.size();
     p1_hyb_cand_.assign(n, p1hyb::Cand{});
     p1_hyb_to_.assign(n, 0);
@@ -5712,7 +5733,8 @@ int FileStager::p1_hyb_pick(int32_t li) {
         p1hyb::Cand& c = p1_hyb_cand_[i];
         c.rows = e >= 0 && e < counts_cap_ ? counts_host_[e] : 0;
         c.bytes = plan_->units[(size_t)u].bytes;
-        c.cached = mover_->unit_cached(u);
+        /* An early copy waits in the ring for this unit (p1_early): the card's, as any ring unit. */
+        c.cached = mover_->unit_cached(u) && !p1_->early_for(li, u);
     }
     const p1hyb::Split sp = p1hyb::choose(p1_hyb_cand_.data(), (int)n, hx_pool_->backlog(), hx_pool_->cpu_bytes_per_ns(),
                                           hx_pool_->link_bytes_per_ns(), p1_hyb_shr().share(), p1_hyb_to_.data(),
@@ -5839,6 +5861,7 @@ int FileStager::after_op(rad_op h, RadStream s) {
     /* ..._P1_HYBRID: an event behind the layer's waves, which hx_finish queries once the CPU's rows are in:
      * passed means the card had nothing left of the layer and waited for them (a late layer). */
     if (p1_hyb_li_ == li && hx_li_ == li && hx_stage_ == 2 && rad_event_record(p1_hyb_ev_, s) >= 0) p1_hyb_rec_ = true;
+    if (p1_->tunables().early > 0) RAD_TRY(p1_early(li));
     if (p1_->tunables().verify > 0) return p1_verify(li, s);
     return RAD_OK;
 }

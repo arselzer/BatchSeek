@@ -178,6 +178,7 @@ struct Sim final : Device {
     /* What the current layer's waves must compute: expert -> (unit, packed). */
     std::map<int, std::pair<int, bool>> expect;
     std::map<std::pair<int, int>, int> computed;   /* (layer, expert) -> waves that computed it */
+    std::map<std::pair<int, int>, int> read_unit;  /* (layer, expert) -> the unit its wave's slot held */
     std::set<int> copied;                          /* units whose copy has run */
     std::set<int> queued;                          /* units whose copy was queued */
     std::map<std::pair<int, int>, int> handle_unit;
@@ -219,6 +220,8 @@ struct Sim final : Device {
                     bad("layer " + std::to_string(c.layer) + ": a wave read slot " + std::to_string(r.first) +
                         " holding " + std::to_string(ring[(size_t)r.first]) + " for unit " + std::to_string(r.second));
             for (int e : c.es) ++computed[{ c.layer, e }];
+            for (size_t i = 0; i < c.es.size() && i < c.reads.size(); ++i)
+                read_unit[{ c.layer, c.es[i] }] = ring[(size_t)c.reads[i].first];
             break;
         }
     }
@@ -987,6 +990,308 @@ TEST(p1_ring_stress_two_slots_waves_of_one_random_completion) {
                 ++runs;
             }
     CHECK_EQ(runs, (2 + 3 + 3 + 3) * 40);
+}
+
+/* ---- early copies (ds41p1::kEarlyEnv) ---------------------------------------------------------------------------
+ *
+ * Between layers the stager copies the next layer's likely units into the ring before that layer's counts. The
+ * simulated card checks what it checks for any copy: a wave reads the unit its table names (so an early slot is
+ * never overwritten under a bound unit's reader, nor a lapped slot under an earlier wave's), and a source goes
+ * only after its copy ran. On top: every selected unit is computed by exactly one wave, an unbound early copy by
+ * none, early() never waits on the host, and the waves of a layer compute the same (expert, unit) pairs as
+ * without early copies. */
+namespace {
+
+struct EUnit { int e, rows, unit; bool drive, packed; };
+
+Source ram_src(int u, bool packed) {
+    return Source{ src_gu(u), packed ? 11999296 : ds41p1::kDnOff, src_dn(u), packed ? 6001984 : 6266880, packed };
+}
+
+/* A layer with given unit ids; the early units of `early` (unit -> packed) are bound with add_early when the layer
+ * selects them as RAM units (and their bytes agree), the rest added as run_layer does. Returns the units bound. */
+int run_layer_ids(Sim& sim, CardExpertStager& st, int layer, const std::vector<EUnit>& us, int* bound) {
+    sim.layer = layer;
+    sim.expect.clear();
+    *bound = 0;
+    if (st.begin_layer(layer & 1) < 0) return -1;
+    for (const EUnit& x : us) {
+        sim.expect[x.e] = { x.unit, x.packed };
+        if (x.drive) {
+            sim.drive_pending.push_back({ x.unit, x.e });
+            sim.drive_packed_form[x.unit] = x.packed;
+            if (st.add_drive(x.e, x.unit, x.rows) < 0) return -1;
+            continue;
+        }
+        if (st.is_early(x.unit)) {
+            const int b = st.add_early(x.e, x.unit, x.rows, ram_src(x.unit, x.packed));
+            if (b < 0) return -1;
+            if (b == 0) {
+                ++*bound;
+                continue;
+            }
+        }
+        const int h = sim.next_handle++;
+        sim.handle_unit[{ (int)Kind::Ram, h }] = x.unit;
+        if (st.add_ram(x.e, x.unit, x.rows, ram_src(x.unit, x.packed), h) < 0) return -1;
+    }
+    if (st.start() < 0) return -1;
+    return st.run();
+}
+
+/* Posts early copies of `units` (unit -> packed) the way CardExpertPath::early does; returns those queued. */
+int post_early(Sim& sim, CardExpertStager& st, const std::vector<std::pair<int, bool>>& units) {
+    int n = 0;
+    for (const auto& up : units) {
+        const int h = sim.next_handle++;
+        sim.handle_unit[{ (int)Kind::Ram, h }] = up.first;
+        const int r = st.early(up.first, ram_src(up.first, up.second), h);
+        if (r < 0) return -1;
+        if (r > 0) {   /* not taken: the caller lets its lease go at once */
+            sim.handle_unit.erase({ (int)Kind::Ram, h });
+            continue;
+        }
+        ++n;
+    }
+    return n;
+}
+
+}  // namespace
+
+TEST(p1_early_copies_tunable_is_default_off_and_takes_0_to_64) {
+    std::map<std::string, std::string> env;
+    auto get = [&](const char* k) -> const char* {
+        const auto it = env.find(k);
+        return it == env.end() ? nullptr : it->second.c_str();
+    };
+    Tunables t;
+    std::string why;
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.early, 0);
+    env[ds41p1::kEarlyEnv] = "";
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.early, 0);
+    for (const char* ok : { "0", "1", "12", "64" }) {
+        env[ds41p1::kEarlyEnv] = ok;
+        REQUIRE(parse_tunables(get, &t, &why));
+        CHECK_EQ(t.early, std::atoi(ok));
+    }
+    for (const char* bad : { "65", "-1", "x", "1.5", " 4" }) {
+        env[ds41p1::kEarlyEnv] = bad;
+        CHECK(!parse_tunables(get, &t, &why));
+        CHECK(why.find(ds41p1::kEarlyEnv) != std::string::npos);
+    }
+}
+
+TEST(p1_early_copies_bound_units_run_once_from_their_slots_unbound_ones_never_and_no_host_wait) {
+    Sim sim(77, 12);
+    CardExpertStager st;
+    std::string why;
+    sim.st = &st;
+    REQUIRE_EQ(st.init(&sim, g_ring, 12, 2, 96, g_alias, 6, &why), 0);
+    sim.lag = 0;   /* nothing runs until the host waits */
+    std::vector<EUnit> l0, l1;
+    for (int i = 0; i < 20; ++i) l0.push_back({ i, 100 + i, 1 + i, false, (i & 1) != 0 });
+    for (int i = 0; i < 20; ++i) l1.push_back({ 50 + i, 100 + i, 100 + i, i == 19, (i & 2) != 0 });
+    int bound = 0;
+    REQUIRE_EQ(run_layer_ids(sim, st, 0, l0, &bound), 0);
+    CHECK_EQ(bound, 0);
+    /* Early: eight of layer 1's RAM units (one with other bytes than layer 1 will name) and four it never selects. */
+    std::vector<std::pair<int, bool>> ear;
+    for (int i = 0; i < 8; ++i) ear.push_back({ 100 + i, i == 5 ? !((i & 2) != 0) : (i & 2) != 0 });
+    for (int i = 0; i < 4; ++i) ear.push_back({ 900 + i, false });
+    ear.push_back({ 950, false });   /* the thirteenth: the ring is full of early units */
+    const uint64_t syncs = st.stats().release_syncs;
+    CHECK_EQ(post_early(sim, st, ear), 12);
+    CHECK_EQ(st.stats().release_syncs, syncs);   /* early() never waited on the host */
+    CHECK_EQ(st.early_units(), 12);
+    CHECK(st.is_early(103));
+    CHECK(!st.is_early(950));
+    REQUIRE_EQ(run_layer_ids(sim, st, 1, l1, &bound), 0);
+    CHECK_EQ(bound, 7);   /* unit 105's bytes differ: added as usual, its early copy unread */
+    CHECK_EQ(st.stats().early, (uint64_t)12);
+    CHECK_EQ(st.stats().early_bound, (uint64_t)7);
+    CHECK_EQ(st.stats().early_unread, (uint64_t)5);
+    CHECK_EQ(st.early_units(), 0);
+    /* The bound units' waves came first, in their copy order: the first wave reads units 100 and 101. */
+    REQUIRE_EQ(st.end_pass(), 0);
+    sim.drain();
+    CHECK_EQ(sim.violations, 0);
+    if (sim.violations) std::fprintf(stderr, "%s\n", sim.first.c_str());
+    for (const EUnit& x : l1) CHECK_EQ(sim.computed[std::make_pair(1, x.e)], 1);
+    for (const EUnit& x : l0) CHECK_EQ(sim.computed[std::make_pair(0, x.e)], 1);
+    CHECK_EQ(st.held(), 0);
+    CHECK_EQ(sim.released.size(), sim.handle_unit.size());
+}
+
+TEST(p1_early_copies_are_refused_in_an_open_layer_and_go_unread_into_another_layer_or_the_pass_end) {
+    Sim sim(3, 6);
+    CardExpertStager st;
+    std::string why;
+    sim.st = &st;
+    REQUIRE_EQ(st.init(&sim, g_ring, 6, 2, 96, g_alias, 6, &why), 0);
+    REQUIRE_EQ(st.begin_layer(0), 0);
+    CHECK(st.early(5, ram_src(5, false), 1) < 0);   /* a layer is open */
+    CHECK(st.add_early(1, 5, 10, ram_src(5, false)) == 1);   /* nothing early */
+    REQUIRE_EQ(st.start(), 0);
+    REQUIRE_EQ(st.run(), 0);
+    /* Early units, then the pass ends with no layer taking them. */
+    CHECK_EQ(post_early(sim, st, { { 7, false }, { 8, true }, { 9, false } }), 3);
+    REQUIRE_EQ(st.end_pass(), 0);
+    CHECK_EQ(st.held(), 0);
+    CHECK_EQ(st.early_units(), 0);
+    CHECK_EQ(st.stats().early_unread, (uint64_t)3);
+    sim.drain();
+    CHECK_EQ(sim.violations, 0);
+    CHECK_EQ(sim.released.size(), sim.handle_unit.size());
+}
+
+/* The stress: rings of 2 to 12 slots, waves of 1 to 3, random completion, layers with drive units (and ready-slot
+ * pressure), early sets that overlap the next layer by a random share and name units it never selects, and passes
+ * that end with early units waiting. Every selected unit runs in exactly one wave from bytes the card holds for it,
+ * no source goes before its copy, every source goes by the pass end, and the (layer, expert) -> unit pairs the
+ * waves compute are the ones the layers selected. */
+TEST(p1_early_copies_stress_random_rings_waves_overlap_and_completion) {
+    int runs = 0;
+    uint64_t bound_total = 0, unread_total = 0;
+    for (int n_slots : { 2, 3, 4, 7, 12 })
+        for (int wave = 1; wave <= std::min(3, n_slots); ++wave)
+            for (unsigned seed = 1; seed <= 30; ++seed) {
+                const bool defer = (seed & 1) != 0;   /* half the runs retire sources late (set_defer) */
+                Sim sim(seed * 104729u + (unsigned)n_slots * 17u + (unsigned)wave, n_slots);
+                sim.lag = 1 + (int)(seed % 6);
+                sim.max_hand = 1 + (int)(seed % 3);
+                CardExpertStager st;
+                std::string why;
+                sim.st = &st;
+                const int ready = 1 + (int)(seed % 6);
+                sim.ready_cap = ready;
+                REQUIRE_EQ(st.init(&sim, g_ring, n_slots, wave, 96, g_alias, ready, &why), 0);
+                st.set_defer(defer);
+                std::mt19937 rng(seed * 3u + 1u);
+                int uid = 1;
+                for (int pass = 0; pass < 2; ++pass) {
+                    std::vector<std::vector<EUnit>> layers;
+                    for (int layer = 0; layer < 6; ++layer) {
+                        const auto lu = random_layer(rng, (int)(rng() % 30), (int)(rng() % 60), 50);
+                        std::vector<EUnit> us;
+                        for (const LUnit& x : lu) us.push_back({ x.e, x.rows, uid++, x.drive, x.packed });
+                        layers.push_back(us);
+                    }
+                    for (int layer = 0; layer < 6; ++layer) {
+                        int bound = 0;
+                        REQUIRE_EQ(run_layer_ids(sim, st, pass * 100 + layer, layers[(size_t)layer], &bound), 0);
+                        bound_total += (uint64_t)bound;
+                        /* Early for the next layer (or, after the last, for a layer that never comes). */
+                        std::vector<std::pair<int, bool>> ear;
+                        if (layer + 1 < 6)
+                            for (const EUnit& x : layers[(size_t)layer + 1])
+                                if (!x.drive && (int)(rng() % 100) < 70) ear.push_back({ x.unit, x.packed });
+                        for (int k = (int)(rng() % 4); k > 0; --k) ear.push_back({ 100000 + uid++, false });
+                        std::shuffle(ear.begin(), ear.end(), rng);
+                        REQUIRE(post_early(sim, st, ear) >= 0);
+                        CHECK(st.early_units() <= n_slots);
+                    }
+                    REQUIRE_EQ(st.end_pass(), 0);
+                    REQUIRE_EQ(st.held(), 0);
+                }
+                unread_total += st.stats().early_unread;
+                sim.drain();
+                if (sim.violations) {
+                    CHECK_EQ(sim.violations, 0);
+                    std::fprintf(stderr, "slots %d wave %d seed %u: %s\n", n_slots, wave, seed, sim.first.c_str());
+                    return;
+                }
+                for (const auto& kv : sim.computed)
+                    if (kv.second != 1) {
+                        CHECK_EQ(kv.second, 1);
+                        return;
+                    }
+                CHECK_EQ(sim.released.size(), sim.handle_unit.size());
+                CHECK_EQ(st.stats().early, st.stats().early_bound + st.stats().early_unread);
+                ++runs;
+            }
+    CHECK_EQ(runs, (2 + 3 + 3 + 3 + 3) * 30);
+    CHECK(bound_total > 1000);
+    CHECK(unread_total > 100);
+}
+
+/* Deferred retirement (set_defer, on with early copies): the issuing thread never syncs for a slot's last copy in
+ * queue_one, yet every source still goes only after its copy ran (the simulated card flags any other release), every
+ * unit is computed once, and the pinned ready slots never starve the packer (drive units at a ready cap of 1-3). */
+TEST(p1_deferred_retirement_drops_release_syncs_and_keeps_every_source_until_its_copy) {
+    for (unsigned seed = 1; seed <= 60; ++seed) {
+        const int drive_pct = (seed & 1) ? 25 : 0;
+        for (int defer = 0; defer < 2; ++defer) {
+            Sim sim(seed * 7u + 1u, 12);
+            sim.lag = 1 + (int)(seed % 4);
+            sim.ready_cap = 1 + (int)(seed % 3);
+            CardExpertStager st;
+            std::string why;
+            sim.st = &st;
+            REQUIRE_EQ(st.init(&sim, g_ring, 12, 2, 96, g_alias, sim.ready_cap, &why), 0);
+            st.set_defer(defer != 0);
+            std::mt19937 rng(seed);
+            int uid = 1;
+            for (int layer = 0; layer < 6; ++layer)
+                REQUIRE_EQ(run_layer(sim, st, layer, random_layer(rng, 10 + (int)(rng() % 40), drive_pct, 50), &uid), 0);
+            /* Without drive units nothing but the pass end may sync once retirement is deferred (with them, run()
+             * syncs for a held pinned ready slot when the packer needs one). */
+            if (defer && drive_pct == 0) CHECK_EQ(st.stats().release_syncs, (uint64_t)0);
+            REQUIRE_EQ(st.end_pass(), 0);
+            CHECK_EQ(st.held(), 0);
+            sim.drain();
+            CHECK_EQ(sim.violations, 0);
+            if (sim.violations) std::fprintf(stderr, "seed %u defer %d: %s\n", seed, defer, sim.first.c_str());
+            for (const auto& kv : sim.computed) CHECK_EQ(kv.second, 1);
+            CHECK_EQ(sim.released.size(), sim.handle_unit.size());
+        }
+    }
+}
+
+/* With and without early copies the waves of each layer compute the same experts from the same units: only the
+ * copies' timing moves. */
+TEST(p1_early_copies_compute_the_same_expert_unit_pairs_as_without) {
+    for (unsigned seed = 1; seed <= 20; ++seed) {
+        std::map<std::pair<int, int>, int> pairs[2];
+        for (int with = 0; with < 2; ++with) {
+            Sim sim(seed, 12);
+            sim.lag = 2;
+            CardExpertStager st;
+            std::string why;
+            sim.st = &st;
+            REQUIRE_EQ(st.init(&sim, g_ring, 12, 2, 96, g_alias, 6, &why), 0);
+            std::mt19937 rng(seed);
+            int uid = 1;
+            std::vector<std::vector<EUnit>> layers;
+            for (int layer = 0; layer < 8; ++layer) {
+                const auto lu = random_layer(rng, 5 + (int)(rng() % 40), 20, 50);
+                std::vector<EUnit> us;
+                for (const LUnit& x : lu) us.push_back({ x.e, x.rows, uid++, x.drive, x.packed });
+                layers.push_back(us);
+            }
+            for (int layer = 0; layer < 8; ++layer) {
+                int bound = 0;
+                REQUIRE_EQ(run_layer_ids(sim, st, layer, layers[(size_t)layer], &bound), 0);
+                if (with && layer + 1 < 8) {
+                    std::vector<std::pair<int, bool>> ear;
+                    for (const EUnit& x : layers[(size_t)layer + 1])
+                        if (!x.drive) ear.push_back({ x.unit, x.packed });
+                    REQUIRE(post_early(sim, st, ear) >= 0);
+                }
+            }
+            REQUIRE_EQ(st.end_pass(), 0);
+            sim.drain();
+            CHECK_EQ(sim.violations, 0);
+            for (const auto& kv : sim.computed) CHECK_EQ(kv.second, 1);
+            if (with) CHECK(st.stats().early_bound > 0);
+            pairs[with] = sim.read_unit;
+            size_t n = 0;
+            for (const auto& l : layers) n += l.size();
+            CHECK_EQ(pairs[with].size(), n);
+        }
+        CHECK(pairs[0] == pairs[1]);
+    }
 }
 
 /* ---- units the plan pinned in the host pool ---------------------------------------------------------------

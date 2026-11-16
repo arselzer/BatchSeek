@@ -214,6 +214,14 @@
 # attention on (inexact), rank R" once at startup (any other arm only without it). Inexact as Qw: its replies are
 # reported "differ from reference: k of n (inexact arm, Aw)", never the reference, its Kh hashes left out, and with
 # Kld it scores against the window's reference (--kld-ref).
+# QxK: early ring copies (RADIANCE_EXPERIMENTAL_DS41_P1_EARLY=K, 1-64; ds41_p1.h kEarlyEnv; every other arm states 0):
+# behind each card-path layer's waves, up to K (at most the ring's slots) RAM-cache units of the pass's next card-path
+# layer, the profile's likeliest first, are copied into the ring before its routing counts, so the DMA lane works
+# through the attention and router; a selected one is a wave's from its early slot (the bytes add_ram's copy would
+# have), the rest go unread. Scheduling only: replies must be identical to the arm without it. Needs P1. Measured
+# only if rank 0 logs "ds41 p1: early ring copies on (RADIANCE_EXPERIMENTAL_DS41_P1_EARLY=K)" once at startup (any
+# other arm only without it) and at exit (qx_gate) some rank's stats line counts early copies bound to their layer
+# ("early copies N (B bound to their layer", B > 0): otherwise the switch never acted.
 # QdN: decode passes on the cards (..._P1_DECODE_ROWS=N, 17 to N_Lc; every other arm states 0): a pure
 # decode pass of N rows or more (decode rows only, no draft, speculation or cut) arms the card path for its
 # routed layers as a prefill pass of the threshold's rows does, and takes the lent slots back as one does;
@@ -870,7 +878,8 @@ kld_finish() {   # name; the run is SERVER_PID
      ! extra_why=$(qw_gate "$OUT/$name.server.log" "${ARM_QW:-}") ||
      ! extra_why=$(dt_gate "$OUT/$name.server.log" "${ARM_DT:-}") ||
      ! extra_why=$(aw_gate "$OUT/$name.server.log" "${ARM_AW:-}") ||
-     ! extra_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" exit); then
+     ! extra_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" exit) ||
+     ! extra_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" exit); then
     log "arm $name: $extra_why; Kld not measured"; return 1
   fi
   # Qw / Aw (inexact by design): its run scored the engine against KLD_REF (--kld-ref); the engine's KL report is the
@@ -1155,6 +1164,20 @@ qz_gate() {   # log, requested switch, start/exit: the tail-once marker on every
     n=$(sed -nE "s/.*ds41 p1 stats, rank $rank: .*; wave tail fills skipped ([0-9]+).*/\\1/p" "$f" | tail -1)
     if [[ -z "$n" ]] || (( n == 0 )); then echo "Qz, but rank $rank skipped no wave tail fill (${n:-no counter})"; return 1; fi
   done
+  return 0
+}
+
+qx_gate() {   # log, requested K, start/exit: rank 0's early-copies line naming K once (and bound copies at exit)
+  local f=$1 on=$2 stage=${3:-start} count line b best=0
+  if [[ -z "$on" ]]; then
+    if grep -q 'ds41 p1: early ring copies on' "$f"; then echo 'no Qx part, but early ring copies are on'; return 1; fi
+    return 0
+  fi
+  count=$(grep -cE "ds41 p1: early ring copies on \(RADIANCE_EXPERIMENTAL_DS41_P1_EARLY=$on\)" "$f")
+  if [[ $count != 1 ]]; then echo "Qx$on, but rank 0 lacks one 'ds41 p1: early ring copies on (..._P1_EARLY=$on)' startup line"; return 1; fi
+  [[ "$stage" == exit ]] || return 0
+  while read -r b; do [[ -n "$b" ]] && (( b > best )) && best=$b; done < <(sed -nE 's/.*ds41 p1 stats, rank [0-3]: .*; early copies [0-9]+ \(([0-9]+) bound to their layer.*/\1/p' "$f")
+  if (( best == 0 )); then echo "Qx$on, but no rank bound an early copy to its layer (the switch never acted)"; return 1; fi
   return 0
 }
 
@@ -1562,7 +1585,8 @@ EOF2
      ! qsp_why=$(qw_gate "$OUT/$name.server.log" "${ARM_QW:-}") ||
      ! qsp_why=$(dt_gate "$OUT/$name.server.log" "${ARM_DT:-}") ||
      ! qsp_why=$(aw_gate "$OUT/$name.server.log" "${ARM_AW:-}") ||
-     ! qsp_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" start); then
+     ! qsp_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" start) ||
+     ! qsp_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" start); then
     log "arm $name: $qsp_why; not measured"; stop_server; return 1
   fi
   # In / Is (RADIANCE_EXPERIMENTAL_DS41_INSERT_NT / _SLICE_KIB) and Ph (_HOST_EXPERTS_LEAN_TILES):
@@ -1856,7 +1880,8 @@ EOF2
   fi
   local qsp_exit_why
   if ! qsp_exit_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" exit) ||
-     ! qsp_exit_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" exit); then
+     ! qsp_exit_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" exit) ||
+     ! qsp_exit_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" exit); then
     log "arm $name: $qsp_exit_why; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
@@ -3694,7 +3719,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$(arm_full "$a")"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" sg="" pcn=""
-  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qyp="" qyk="" qsp="" qt="" qw="" dt="" aw="" qz="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr="" ee=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qyp="" qyk="" qsp="" qt="" qw="" dt="" aw="" qz="" qx="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr="" ee=""
   ctp=""   # Ctp / CtpN: the prefill chain trace (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL)
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
@@ -3917,6 +3942,10 @@ for a in $ARMS; do
       Qz)      qz=1 ;;                                                  # the twin's tail filled once a layer (..._P1_TAIL_ONCE=1)
       Dt)      dt=1 ;;                                                  # gemm_nt_bf16f8's tiled form above 64 rows, exact (..._DENSE_TILED=1)
       Aw)      aw=1 ;;                                                  # attn_sparse_sink's WMMA form, inexact (..._ATTN_WMMA=1)
+      Qx[0-9]*)                                                        # early ring copies: K of the next layer's units (..._P1_EARLY=K)
+               if [[ -n "$qx" ]]; then log "arm $a: two Qx parts; the arm is skipped"; skip=1
+               elif [[ ${p#Qx} =~ ^[0-9]+$ ]] && (( 10#${p#Qx} >= 1 && 10#${p#Qx} <= 64 )); then qx=$((10#${p#Qx}))
+               else log "arm $a: $p: Qx takes 1-64 (units); the arm is skipped"; skip=1; fi ;;
       Qw[0-9]*|Qi[0-9]*|Qr[0-9]*|Qa[0-9]*|Qv[0-9]*|Qm[0-9]*|Ql[0-9]*|Qh[0-9]*|Qe[0-9]*|Qd[0-9]*)   # ...wave / in flight / ready / read-ahead / verify / threshold / lent slots / its hold / lent arena slots / decode passes
                qn=${p:2}
                case ${p:0:2} in
@@ -4532,6 +4561,9 @@ for a in $ARMS; do
       fi
     fi
   fi
+  # Qx: early ring copies, stated in every arm (0 off); with P1.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_P1_EARLY=${qx:-0})
+  [[ -n "$qx" && -z "$p1" ]] && { log "arm $a: Qx needs P1; the arm is skipped"; skip=1; }
   # Qz: the tail filled once a layer, stated in every arm (0 off); with P1 and the oracle's tail-once waves.
   env+=(RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=${qz:-0})
   if [[ -n "$qz" ]]; then
@@ -4763,7 +4795,7 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
   if [[ -n "$ARM_TIMEOUT" ]] && ! [[ $ARM_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]]; then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QYP=$qyp ARM_QYK=$qyk ARM_QSP=$qsp ARM_QT=$qt ARM_QW=$qw ARM_DT=$dt ARM_AW=$aw ARM_QZ=$qz ARM_LH=$lh ARM_EE=$ee
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QYP=$qyp ARM_QYK=$qyk ARM_QSP=$qsp ARM_QT=$qt ARM_QW=$qw ARM_DT=$dt ARM_AW=$aw ARM_QZ=$qz ARM_QX=$qx ARM_LH=$lh ARM_EE=$ee
   ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr ARM_SL=$sl ARM_CTX=$arm_ctx ARM_CR=$cr
   if [[ -n "$cr" ]]; then
     crk=${ARM_CONC:-${AB_CONCURRENCY:-1}}

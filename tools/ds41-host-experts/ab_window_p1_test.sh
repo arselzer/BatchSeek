@@ -373,6 +373,33 @@ zexpect 1 'Qz no fill skipped' "$T/qz-idle.log" 1 exit
 zexpect 1 'Qz unrequested activation' "$T/qz-good.log" '' start
 zexpect 0 'Qz explicitly off' "$T/qt-off.log" '' exit
 
+# Qx's gates: rank 0's early-copies line naming K once at startup, and at exit some rank's bound early copies above 0.
+eval "$(sed -n '/^qx_gate() {/,/^}/p' "$W")"
+declare -F qx_gate >/dev/null || { echo "FAIL no qx_gate in $W"; exit 1; }
+{
+  echo "I ds41 p1: early ring copies on (RADIANCE_EXPERIMENTAL_DS41_P1_EARLY=12): behind each card-path layer's waves, ..."
+  for rank in 0 1 2 3; do
+    echo "I[$rank] ds41 p1 stats, rank $rank: passes 3; wave tail fills skipped 412; early copies 960 ($((rank * 100)) bound to their layer, 12 unread, 0 not in the RAM cache when posted)"
+  done
+} > "$T/qx-good.log"
+sed -E 's/\(([0-9]+) bound/(0 bound/' "$T/qx-good.log" > "$T/qx-idle.log"
+sed 's/P1_EARLY=12/P1_EARLY=8/' "$T/qx-good.log" > "$T/qx-other.log"
+cat "$T/qx-good.log" "$T/qx-good.log" > "$T/qx-twice.log"
+xexpect() {
+  local want=$1 label=$2 rc; shift 2
+  qx_gate "$@" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$label"; else bad "$label: exit $rc, want $want"; fi
+}
+xexpect 0 'Qx startup line' "$T/qx-good.log" 12 start
+xexpect 0 'Qx bound copies at exit' "$T/qx-good.log" 12 exit
+xexpect 1 'Qx line names another K' "$T/qx-other.log" 12 start
+xexpect 1 'Qx line twice' "$T/qx-twice.log" 12 start
+xexpect 0 'Qx idle at startup' "$T/qx-idle.log" 12 start
+xexpect 1 'Qx never bound a copy' "$T/qx-idle.log" 12 exit
+xexpect 1 'Qx unrequested activation' "$T/qx-good.log" '' start
+xexpect 0 'Qx explicitly off' "$T/qt-off.log" '' exit
+xexpect 1 'Qx asked, no line' "$T/qt-off.log" 12 start
+
 # ---- the balance receipt: an old generic PASS is not requested-height evidence
 eval "$(sed -n '/^bal_receipt_bound() {/,/^}/p' "$W")"
 declare -F bal_receipt_bound >/dev/null || { echo "FAIL no bal_receipt_bound in $W"; exit 1; }
@@ -506,6 +533,11 @@ AWKLD=$FAST-Aw-Kld
 DTKLD=$FAST-Dt-Kld
 AWONLY=$FAST-Aw
 ARMS="$ARMS $DTAW $DTNOLC $DTNOF8 $AWNOLC $AWKLD $DTKLD $AWONLY"
+QX=$FAST-Qd64-Qy60-Qx12
+QXNOP=$REF-Qx12
+QXBIG=$FAST-Qx65
+QXTWO=$FAST-Qx4-Qx8
+ARMS="$ARMS $QX $QXNOP $QXBIG $QXTWO"
 run_loop() {   # actual balance-oracle bound; every model action remains stubbed
  (
   set +u
@@ -867,6 +899,25 @@ for a in "$REF" "$FAST" "$QD200" "$QY60" "$QY25"; do
   has "no Ee part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY ""
   grep -qx "  ARM_EE: " <<< "$(section "$a")" && ok "no Ee part ($a): ARM_EE empty" || bad "no Ee part ($a): ARM_EE is '$(grep '  ARM_EE:' <<< "$(section "$a")")'"
 done
+# ---- 8c. Qx in the arm loop: on the fast arm with Qd64-Qy60 the switch at 12 and every other switch as the fast arm
+# with Qd64-Qy60; every arm without the part states it 0; Qx without P1, Qx65 and two Qx parts skipped.
+sec=$(section "$QX")
+if [[ -z "$sec" ]]; then bad "the Qx arm $QX was not launched: $(grep -m3 "arm $QX" "$T/loop.txt")"
+else
+  has "Qx" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_EARLY 12
+  has "Qx beside Qd64" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS 64
+  has "Qx beside Qy60" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID 60
+  for v in RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA \
+           RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE RADIANCE_EXPERIMENTAL_DS41_P1_TILED; do
+    has "Qx as the fast arm" "$sec" "$v" "$(val "$fast" "$v")"
+  done
+fi
+for a in "$REF" "$NEW" "$FAST" "$QD200" "$QY25" "$QZ" "$QT"; do
+  has "no Qx part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_P1_EARLY 0
+done
+qdskip "$QXNOP" "Qx needs P1; the arm is skipped"
+qdskip "$QXBIG" "Qx65: Qx takes 1-64 (units); the arm is skipped"
+qdskip "$QXTWO" "two Qx parts; the arm is skipped"
 
 short_out=$(run_loop 2048)
 for a in "$COLD4K" "$PC4K"; do

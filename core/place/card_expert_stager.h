@@ -43,6 +43,23 @@
  * occupant. A wave waits (on the compute stream) on the copy events of its units. A unit's source (a
  * RAM-cache lease, a pinned ready slot) is let go only once the host has seen its copy's event pass.
  *
+ * ---- early copies (ds41p1::kEarlyEnv) ------------------------------------------------------------
+ *
+ * A layer's copies cannot begin before its routing counts, so without them the DMA lane is idle from a
+ * layer's last copy through the next layer's attention, router and counts sync (a fifth of an N512 decode
+ * pass, a third of a prefill pass; OVERLAP-20261115.md). With them, right after a layer's waves are issued
+ * (no layer open, every queued unit launched), early() copies up to the ring's slots of the next card-path
+ * layer's likely RAM-cache units into the ring, each as queue_one would: slot = head mod n, behind the
+ * slot's free event (its previous occupant's wave, or nothing ever read it), the source held by the slot.
+ * The next layer then binds a unit it selects to its early copy (add_early, with the same bytes add_ram
+ * would copy) and start() queues the bound ones first, oldest first, so they launch in their copy order
+ * like any queued unit; an unbound one is never read and its slot is reused like any other. Reuse is
+ * guarded per slot: a copy is queued into a slot only once its occupant was launched or never bound
+ * (Slot::pending), which without early copies is the old count rule (fewer than n queued, unlaunched).
+ * An early copy never waits on the host: the slot's previous source, if its copy is still running, is let
+ * go once the slot's next copy event passes (one lane, in order), not synced for. Which bytes a wave
+ * reads and which rows it writes are unchanged; only when the copies run moves.
+ *
  * ---- testable without a card ---------------------------------------------------------------------
  *
  * CardExpertStager is the scheduling alone, against the Device interface: tests/p1_stager_test.cpp
@@ -102,12 +119,13 @@ struct Tunables {
     bool tiled = false;                                         /* ds41p1::kTiledEnv: the register-tiled twin */
     bool tail_once = false;                                     /* ds41p1::kTailOnceEnv: waves skip the tail fill */
     bool wmma = false;                                          /* ds41p1::kWmmaEnv: the WMMA twin (inexact) */
+    int  early = 0;                                             /* ds41p1::kEarlyEnv: next layer's units copied early (0 off) */
 };
 /* The tunables from `get` (getenv for the engine): each a whole number in its range (wave 1-16,
  * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, lend_arena 0-64,
  * grace_ms 0-60000, lend_heat 0-8, lend_heat_half 1-100000000 (unset: 100, or 2000 with lend_slab),
  * lend_heat_margin 100-1000, lend_heat_prior 0-100000000 (unset: the half-life), lend_slab 0-256, lend_rest_ms 0-600000 (unset: 5000 with lend_heat or lend_slab, else
- * 0), decode_rows 0 or 17-4096, hybrid 0-400, hybrid_prefill 0-400), align "end" or "start", swiglu_span, lend_audit, tiled and
+ * 0), decode_rows 0 or 17-4096, hybrid 0-400, hybrid_prefill 0-400, early 0-64), align "end" or "start", swiglu_span, lend_audit, tiled and
  * tail_once 0/off or 1/on (default off), hybrid_adapt 0/off or 1/on (default on). False with the reason on anything else. */
 bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables* t, std::string* why);
 
@@ -167,6 +185,9 @@ public:
     struct Stats {
         uint64_t layers = 0, ram = 0, drive = 0, pool = 0, waves = 0, copies = 0, copy_bytes = 0;
         uint64_t drive_waits = 0, ring_full_waits = 0, release_syncs = 0, max_waves = 0;
+        uint64_t early = 0, early_bound = 0, early_unread = 0;   /* early copies queued, bound, never read */
+        uint64_t release_sync_ns = 0;   /* the issuing thread's time blocked in release syncs */
+        uint64_t deferred = 0;          /* sources whose release was deferred instead of synced for (set_defer) */
     };
 
     /* `ring_base`: the ring's first slot (n_slots of ds41p1::kSlotBytes); `alias_base`: the address
@@ -189,6 +210,22 @@ public:
     int  start();
     int  run();
     bool layer_open() const { return open_; }
+    /* Early copies (above): between layers of a pass (no layer open), unit's bytes `s` (a RAM-cache lease,
+     * `handle`) copied into the ring for the next layer. 0 queued; 1 not now (the ring holds as many early
+     * units as slots, or the unit is early already); < 0 refused. */
+    int  early(int32_t unit, const Source& s, int32_t handle);
+    bool is_early(int32_t unit) const;
+    /* Deferred source retirement (on with early copies): a copy into a slot whose last source's copy has not
+     * passed keeps that source with the slot (Slot::stale) and lets it go once the slot's next copy event passes,
+     * instead of the issuing thread syncing for it; the pinned ready slots' accounting counts such sources, so
+     * the drive's packer is never starved (run() syncs for them only then). Buffer lifetimes are the same rule:
+     * a source goes only after the host has seen its copy (or a later one on the same lane) pass. */
+    void set_defer(bool on) { defer_ = on; }
+    int  early_units() const { return (int)early_.size(); }
+    /* In an open layer before start: expert e's unit, early copied with exactly the bytes `s` names, bound to
+     * the layer (a wave's from its early slot; nothing more to copy or let go). 0 bound; 1 not an early unit or
+     * other bytes (the caller adds it as usual, and the early copy goes unread); < 0 refused. */
+    int  add_early(int e, int32_t unit, int rows, const Source& s);
     int  layer_units() const { return (int)u_.size(); }
     /* The pass is over: every copy's event seen, every source let go. Refuses (after releasing all)
      * if a layer was left unfinished. */
@@ -215,9 +252,23 @@ private:
         int     copy_ev = -1, free_ev = -1;
         bool    free_rec = false;
         bool    held = false;          /* a source not yet let go */
+        bool    pending = false;       /* its occupant is queued (or early and maybe bound), not launched */
         Kind    kind = Kind::Ram;
         int32_t handle = -1;
+        /* Earlier occupants' sources whose copies had not passed when an early copy took the slot: let go
+         * with the held one, once the slot's copy event (recorded after theirs on the one lane) passes. */
+        std::vector<std::pair<Kind, int32_t>> stale;
     };
+    struct Early {
+        int32_t unit = -1, handle = -1;
+        Source  src;
+        int     slot = -1;
+        int     bound = -1;            /* its index in u_ once the layer binds it */
+    };
+    std::vector<Early> early_;         /* in copy order */
+    bool defer_ = false;
+    /* Lets go of slot s's sources if its copy has passed, else (defer_) keeps the held one as stale. */
+    int  retire(int s);
     Device*     dev_ = nullptr;
     const char* ring_ = nullptr;
     const void* alias_ = nullptr;
@@ -729,6 +780,12 @@ public:
     }
     int  run(RadStream s);
     bool layer_open() const { return st_.layer_open(); }
+    /* Early copies (ds41p1::kEarlyEnv; CardExpertStager::early): right after a layer's run, up to `early` of
+     * `units` (the next card-path layer's RAM-cache units, likeliest first) borrowed read-only and copied into
+     * the ring for layer next_li; a unit the RAM cache does not give is skipped. Nothing without the switch. */
+    int  early(int32_t next_li, const std::vector<int32_t>& units);
+    /* Unit u has an early copy waiting for layer li (the hybrid split leaves it to the card). */
+    bool early_for(int32_t li, int32_t u) const { return early_li_ >= 0 && early_li_ == li && st_.is_early(u); }
 
     /* ---- the lent ring, the lent arena and the lent slab (RingLender's host) ----
      * lend_init: units[k] (its two weights' offsets and sizes in the unit's layout, as the plan lays it
@@ -809,6 +866,7 @@ public:
         uint64_t lend_ram = 0, lend_ram_packed = 0, lend_ram_packed_ns = 0;
         uint64_t lend_drive = 0, lend_drive_ns = 0, lend_read_failed = 0;
         uint64_t lend_audit_ns = 0;   /* the issuing thread's time in the read-back audit */
+        uint64_t early_missed = 0;    /* early candidates the RAM cache did not give */
     };
     Counts& counts_mut() { return c_; }
     const Counts& counts() const { return c_; }
@@ -851,6 +909,7 @@ private:
     bool       layer_counts_ok_ = false;
     int64_t    rows_ = 0;
     int32_t    li_ = -1;
+    int32_t    early_li_ = -1;      /* the layer the early copies are for (-1 none) */
     std::chrono::steady_clock::time_point t_pass_{};
     /* RAM leases by handle */
     std::vector<std::unique_ptr<Mover::HostUnit>> hu_;

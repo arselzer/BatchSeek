@@ -239,6 +239,15 @@ constexpr int kMaxHybridPct = 400;
  * rows before its gather, the same bytes the card path writes (core/place/p1_hybrid.h). Independent of kHybridEnv
  * (either or both); the same refusals, except that it does not need kDecodeRowsEnv. */
 constexpr const char* kHybridPrefillEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL";
+/* Early ring copies (kEarlyEnv=K; 0 off, the default; else 1 to kMaxEarly, at most the ring's slots used): right
+ * after a card-path layer's waves are issued, up to K RAM-cache units of the pass's next card-path layer, by the
+ * sealed profile's share, are copied into the ring on the DMA lane, so the link works through that layer's
+ * attention and router instead of waiting for its routing counts (card_expert_stager.h, "early copies"). A unit
+ * the next layer selects is then a wave's like any ring unit (its bytes are its RAM-cache lease's, as add_ram's
+ * copy would be); one it does not select is never read and its slot is reused. Scheduling only: which unit a
+ * wave computes, from which bytes, and every row it writes are as without it. */
+constexpr const char* kEarlyEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_EARLY";
+constexpr int kMaxEarly = 64;
 constexpr const char* kLendRestEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_REST_MS";
 constexpr int kDefLendRestMs = 5000, kMaxLendRestMs = 600000;
 constexpr int kDefWave = 2, kDefInflight = 16, kDefReady = 6, kDefAhead = 8, kDefMinRows = 320;

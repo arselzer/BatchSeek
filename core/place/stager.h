@@ -835,7 +835,7 @@ private:
         return (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::steady_clock::now().time_since_epoch()).count();
     }
-    std::vector<int32_t> p1_nonres_, p1_ahead_;
+    std::vector<int32_t> p1_nonres_, p1_ahead_, p1_early_;
     /* By routed layer: its routed units the plan pinned in the host pool, which the card would read
      * across the link once a row pass; an armed layer copies the selected ones to the ring as it does
      * a RAM-cache unit (p1_layer). p1_pool_sel_: this layer's selected ones, published skipped. */
@@ -916,6 +916,9 @@ private:
         return armed && have_event && (decode ? hybrid > 0 : hybrid_prefill > 0);
     }
     int  p1_hyb_pick(int32_t li);
+    /* ds41p1::kEarlyEnv: behind layer li's waves, the next card-path layer's RAM-cache units (not lent, not
+     * in the slab or the host pool), the sealed profile's likeliest first, copied into the ring early. */
+    int  p1_early(int32_t li);
     bool p1_hyb_borrow(int32_t u, int rows, bool admit);
     int  p1_hyb_submit(int32_t li);
     void p1_hyb_done(bool early, uint64_t waited_ns);
