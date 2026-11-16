@@ -1,0 +1,112 @@
+{
+  "_note": "Edit the numbers here and run make_charts.py. null = pending (drawn as a labelled placeholder, never a guessed value).",
+  "throughput": {
+    "_source": "Decode tokens/s summed over all streams, four RX 9070 XT, reproducible mode. 1-8 streams: the chat configuration; 8-512: the batch configuration (decode-only rate = decode tokens / decode step time). 512: best of the measured runs, 44,998 decode tokens (first tokens excluded) / 167.46 s.",
+    "points": [
+      {
+        "streams": 1,
+        "tok_s": 30.9,
+        "kind": "chat"
+      },
+      {
+        "streams": 4,
+        "tok_s": 37.8,
+        "kind": "chat"
+      },
+      {
+        "streams": 8,
+        "tok_s": 41.5,
+        "kind": "chat"
+      },
+      {
+        "streams": 8,
+        "tok_s": 55.3,
+        "kind": "batch"
+      },
+      {
+        "streams": 32,
+        "tok_s": 67.5,
+        "kind": "batch"
+      },
+      {
+        "streams": 64,
+        "tok_s": 86.1,
+        "kind": "batch"
+      },
+      {
+        "streams": 128,
+        "tok_s": 134.3,
+        "kind": "batch"
+      },
+      {
+        "streams": 256,
+        "tok_s": 202.6,
+        "kind": "batch"
+      },
+      {
+        "streams": 512,
+        "tok_s": 268.7,
+        "kind": "batch"
+      }
+    ]
+  },
+  "jobs": {
+    "_source": "Client wall time for the whole batch (all requests sent at once, so it equals the server step time within 0.3 s). Earlier configuration: the same engine before most of the batch work. Batched, reproducible mode: BIRD 256 with the public BIRD-train profile; the private SQL set with a profile recorded partly from private prompts.",
+    "rows": [
+      {
+        "job": "256 BIRD SQL questions",
+        "plain_s": 1025,
+        "batch_s": 146
+      },
+      {
+        "job": "256 SQL questions (private set)",
+        "plain_s": 911,
+        "batch_s": 247
+      },
+      {
+        "job": "128 SQL questions (private set)",
+        "plain_s": 539,
+        "batch_s": 150
+      },
+      {
+        "job": "512 SQL questions (private set)",
+        "plain_s": null,
+        "batch_s": 566
+      },
+      {
+        "job": "256 COCO images -> labels",
+        "plain_s": null,
+        "batch_s": 532
+      }
+    ]
+  },
+  "energy": {
+    "_source": "GPU boards + CPU package only (no RAM, board, fans, PSU loss; no wall meter). Mean sampled power x server step time (timestamps, not sample counts). BIRD 256 reproducible mode, BIRD 500 default mode, 256/512 private SQL reproducible mode. kWh per 1,000 requests = J/request / 3600.",
+    "rows": [
+      {
+        "job": "256 BIRD questions",
+        "j_per_req": 520,
+        "n": 256,
+        "out_tok": 16254
+      },
+      {
+        "job": "500 BIRD questions (default mode)",
+        "j_per_req": 345,
+        "n": 500,
+        "out_tok": 31601
+      },
+      {
+        "job": "256 SQL questions (private set)",
+        "j_per_req": 875,
+        "n": 256,
+        "out_tok": 22710
+      },
+      {
+        "job": "512 SQL questions (private set)",
+        "j_per_req": 1067,
+        "n": 512,
+        "out_tok": 45510
+      }
+    ]
+  }
+}
