@@ -159,7 +159,7 @@ function mv(e){var r=s.getBoundingClientRect(),vb=s.viewBox.baseVal,x=(e.clientX
  q('th').style.display='';q('thl').setAttribute('x1',px);q('thl').setAttribute('x2',px);
  var bx=px+12>X1-210?px-218:px+12,by=Y0+40,b=q('thb');b.setAttribute('x',bx);b.setAttribute('y',by);
  var L=[Math.round(t)+' s',
-  'waiting '+f(S.wait[i])+', reading prompt '+f(S.pre[i]),'generating '+f(S.dec[i]),
+  'waiting '+f(S.wait[i])+', processing prompt '+f(S.pre[i]),'generating '+f(S.dec[i]),
   S.tps.length?'output \u2248'+f(S.tps[i])+' tokens/s':'',S.kv.length?'KV cache '+f(S.kv[i]/1000)+'k tokens':'',
   'GPUs '+f(S.gpu[i])+' W',S.cpu.length?'CPU '+f(S.cpu[i])+' W':''].filter(function(z){return z});
  for(var k=0;k<7;k++){var el=q('tht'+k);el.textContent=L[k]||'';el.setAttribute('x',bx+10);el.setAttribute('y',by+17+k*14.5)}
@@ -401,7 +401,7 @@ def render(a):
                 col, op = ("s1", 0.30) if st else ("neutral", 0.30)
                 body.append(f"<rect x='{x0:.1f}' y='{y-13:.1f}' width='{max(x1-x0-1.5, 1):.1f}' height='19' rx='3' "
                             f"fill='var(--{col})' fill-opacity='{op}'/>")
-                name = "generating" if st else "reading prompts"
+                name = "generating" if st else "processing prompts"
                 if text_w(name, SMALL) + 10 < x1 - x0:
                     body.append(text((x0 + x1) / 2, y + 1, name, SMALL, "ink", "middle", "600"))
         y += 30
@@ -421,7 +421,7 @@ def render(a):
                 i = min(max(bisect.bisect_left(ts, t - g / 2), 0), len(ts) - 1)
                 return r["dec_active"][i][1]
             base = [("generating", "s1", [(t, v if act(t) else 0) for t, v in dec], zero),
-                    ("prompt read, waiting", "neutral", [(t, 0 if act(t) else v) for t, v in dec], zero)]
+                    ("prompt processed, waiting", "neutral", [(t, 0 if act(t) else v) for t, v in dec], zero)]
         else:
             base = [("first token received", "s1", dec, zero)]
         # queued and prefilling together: requests whose prompt is not read yet

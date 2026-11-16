@@ -30,10 +30,10 @@ behaves at hundreds of concurrent requests:
 
 - **RAM expert cache with CPU-computed experts.** A packed RAM cache holds most of the experts that are not on the
   GPUs. The CPU computes some of them each step instead of sending them over PCIe (while generating and while
-  reading prompts). The CPU kernels use the GPU's arithmetic, so the results are bit-identical to the GPU's.
+  prompt processing). The CPU kernels use the GPU's arithmetic, so the results are bit-identical to the GPU's.
 - **Expert placement in VRAM.** Hot experts stay on the GPUs and follow live routing. The VRAM that the KV pool and
   other arenas do not need holds more experts.
-- **Batch admission and scheduling.** Requests that arrive together have their prompts read together in large
+- **Batch admission and scheduling.** Requests that arrive together have their prompts processed together in large
   chunks, and generation starts once the prompts are in, so each step generates a token for as many requests as
   possible. Each expert sent to a GPU serves every token in the batch that needs it.
 - **Prefix cache and memory sizing.** Shared prompt heads (for example a database schema) are read once. The
@@ -42,12 +42,12 @@ behaves at hundreds of concurrent requests:
 - **Placement profiles.** `--expert-stats` records how often each expert is used; `--expert-profile` loads such
   counts at startup to choose which experts live on the GPUs and in RAM. Profiles can be made portable: the server
   then matches them to a container by its size and the sha256 of its metadata header, not by its path.
-- **Kernels.** Faster prompt reading (register tiling) and the GPUs' matrix units for the FP8 dense layers, both
-  with unchanged results. Optionally, prompt reading and attention on the matrix units in another summation order: faster, but replies can then
+- **Kernels.** Faster prompt processing (prefill; register tiling) and the GPUs' matrix units for the FP8 dense layers, both
+  with unchanged results. Optionally, prompt processing and attention on the matrix units in another summation order: faster, but replies can then
   depend on the batch (see "Reproducible mode").
 - **Reproducibility checks and measurement harness.** `tools/ds41-host-experts/ab_window.sh` runs A/B measurement
   windows. Each optimization (except the two opt-out fast modes below) was accepted only if replies, logits and
-  prompt-reading hashes stayed byte-identical to the
+  prompt-processing hashes stayed byte-identical to the
   same engine with that optimization off.
 
 Configuration, switches and measurements: [tools/ds41-host-experts/README.md](tools/ds41-host-experts/README.md).
@@ -70,7 +70,7 @@ Configuration, switches and measurements: [tools/ds41-host-experts/README.md](to
 
 Four RX 9070 XT (TP4), EPYC 7443 (24 cores), 256 GB DDR4-2666, one 2 TB NVMe drive.
 
-![A 512-request job over time: requests waiting, reading prompts and generating, output tokens per second, KV cache, power](batch/docs/charts/timeline-512.svg)
+![A 512-request job over time: requests waiting, processing prompts and generating, output tokens per second, KV cache, power](batch/docs/charts/timeline-512.svg)
 
 One batch of 512 SQL questions from my own workload (not public), from the first request to the last reply.
 
@@ -171,7 +171,7 @@ DeepSeek's release with `batch/convert/convert.sh` (CPU only; see [convert/READM
 The server speaks the OpenAI API, so any client works as long as it sends many requests at once (one request at a
 time gets about 31 tokens/s instead of 269). `batch_client.py` is a small helper that does that for a JSONL file and
 keeps the answers in order. `my-questions.jsonl` is your own file, with one `{"prompt": "...", "system": "...", "id": "..."}` a line; put text that prompts share (a
-schema, instructions) in `system`, so the prefix cache reads it once. `batch_client.py --help` lists the rest.
+schema, instructions) in `system`, so the prefix cache processes it once. `batch_client.py --help` lists the rest.
 
 **Long prompts.** Each request gets `--ctx-per-stream` tokens for prompt plus reply (default 1,152, enough for short
 SQL questions). For longer prompts or replies, raise it and lower `--streams` so that streams x ctx-per-stream stays
@@ -194,7 +194,7 @@ instead keeps a profile per container in DIR and refreshes it from every run.
 
 ## Reproducible vs default mode
 
-By default, prompt reading and attention run on the GPUs' matrix units, summed in a different order, so a reply can change with
+By default, prompt processing and attention run on the GPUs' matrix units, summed in a different order, so a reply can change with
 the batch around it. `--reproducible` (alias `--exact`) turns those two modes off: every reply is then
 byte-identical whether a request runs alone or among hundreds of others, and the same whichever placement profile is
 used. On 500 BIRD questions the default finished the job 8% faster (260 s to 240 s) at similar accuracy (61.6% vs
