@@ -47,7 +47,7 @@ lcp_check() { return 0; }
 ar_rows_server_check() { return 0; }
 n128_server_gate() { return 0; }
 vp_server_gate() { return 0; }
-qsp_gate() { return 0; }; qt_gate() { return 0; }; qw_gate() { return 0; }; dt_gate() { return 0; }; aw_gate() { return 0; }; qz_gate() { return 0; }
+qsp_gate() { return 0; }; qt_gate() { return 0; }; qw_gate() { return 0; }; dt_gate() { return 0; }; aw_gate() { return 0; }; qz_gate() { return 0; }; qx_gate() { return 0; }; qo_gate() { return 0; }; qes_gate() { return 0; }; kvl_gate() { return 0; }; qyc_gate() { return 0; }
 ARGS=()
 kill() { return 1; }
 wait() { return 0; }
