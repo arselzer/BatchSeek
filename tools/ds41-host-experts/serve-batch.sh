@@ -41,6 +41,9 @@
 #   - --arena-split 0|1 (Qes, ..._P1_LEND_ARENA_SPLIT): the lent arena's slots (Qe64) taken back only by a step at the
 #     full plan, so an armed decode pass leaves their residents published (~38 more file-tier units a card stay on the
 #     card through decode at N512). Residency only, exact. OFF (0) until window H57 measures it (VRAMLEND-20261116.md).
+#   - --kv-lend 0|1 (Kvl, ..._KV_LEND): the KV pool's free tail (above the cache's held blocks less two chunks) lent
+#     to expert slots carved from its FULL groups, taken back before the cache hands a block out. Residency only, exact.
+#     OFF (0) until window H57 measures it (VRAMLEND-20261116.md).
 #   - --kv-auto T (LkT): the KV pool from the streams: --ctx-per-stream = T x 5/4 rounded up to 16 tokens, T the
 #     measured peak KV tokens a stream ((kv_tokens_used at the end + hit_cut_tokens) / streams from a run with
 #     prefix_evictions 0; NL-SQL at 512 streams: 452 -> 576 a stream, L294912). 0 (default): --ctx-per-stream as given.
@@ -57,7 +60,7 @@
 #                       [--radiance-home DIR] [--hybrid 60] [--max-seq-len N] [--tiled 0|1] [--tail-once 0|1]
 #                       [--swiglu-span 0|1] [--engram-early 0|1] [--hybrid-prefill 60] [--fast-prefill 0|1]
 #                       [--fast-dense 0|1] [--fast-attn 0|1] [--early K] [--arena-split 0|1] [--kv-auto T]
-#                       [--ram-per-seq-mib N] [--dry-run]
+#                       [--ram-per-seq-mib N] [--kv-lend 0|1] [--dry-run]
 #                       [-- more radiance flags, e.g. --expert-stats FILE to record a profile; outside the measured set]
 #   RADIANCE_BIN (default: radiance on PATH, else build/bin/radiance), RADIANCE_HOME as for any radiance run.
 # --dry-run prints the environment and the command and starts nothing. Otherwise the script becomes the server (exec:
@@ -65,7 +68,7 @@
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
-EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=0 FASTDN=1 FASTAT=0 EARLY=0 ASPLIT=0 KVAUTO=0 PERSEQ=""
+EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=0 FASTDN=1 FASTAT=0 EARLY=0 ASPLIT=0 KVAUTO=0 PERSEQ="" KVLEND=0
 while (( $# )); do
   case $1 in
     --model) MODEL=${2:?}; shift ;;
@@ -91,6 +94,7 @@ while (( $# )); do
     --fast-attn) FASTAT=${2:?}; shift ;;
     --early) EARLY=${2:?}; shift ;;
     --arena-split) ASPLIT=${2:?}; shift ;;
+    --kv-lend) KVLEND=${2:?}; shift ;;
     --kv-auto) KVAUTO=${2:?}; shift ;;
     --ram-per-seq-mib) PERSEQ=${2:?}; shift ;;
     --dry-run) DRY=1 ;;
@@ -111,7 +115,7 @@ num --hybrid-prefill "$HYBPF" 0; (( 10#$HYBPF <= 400 )) || die "--hybrid-prefill
 num --early "$EARLY" 0; (( 10#$EARLY <= 64 )) || die "--early takes 0 (off) or 1-64 units, not '$EARLY'"
 num --kv-auto "$KVAUTO" 0; (( 10#$KVAUTO == 0 || (10#$KVAUTO >= 16 && 10#$KVAUTO <= 1048576) )) || die "--kv-auto takes 0 (off) or 16-1048576 tokens a stream, not '$KVAUTO'"
 [[ -z "$PERSEQ" ]] || { num --ram-per-seq-mib "$PERSEQ" 0; (( 10#$PERSEQ <= 1048576 )) || die "--ram-per-seq-mib takes 0-1048576, not '$PERSEQ'"; }
-for v in "--arena-split $ASPLIT" "--tiled $TILED" "--tail-once $TAILONCE" "--swiglu-span $SPAN" "--engram-early $ENGEARLY" "--fast-prefill $FASTPF" "--fast-dense $FASTDN" "--fast-attn $FASTAT"; do
+for v in "--kv-lend $KVLEND" "--arena-split $ASPLIT" "--tiled $TILED" "--tail-once $TAILONCE" "--swiglu-span $SPAN" "--engram-early $ENGEARLY" "--fast-prefill $FASTPF" "--fast-dense $FASTDN" "--fast-attn $FASTAT"; do
   [[ ${v#* } == [01] ]] || die "${v% *} takes 0 or 1, not '${v#* }'"
 done
 STREAMS=$((10#$STREAMS)) CTX=$((10#$CTX))
@@ -219,6 +223,8 @@ ENV=(
   RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0
   RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS=
   RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=64
+  RADIANCE_EXPERIMENTAL_DS41_KV_LEND=$KVLEND             # Kvl: the KV pool's free tail lent, exact (--kv-lend; 0 off until H57)
+  RADIANCE_EXPERIMENTAL_DS41_KV_LEND_MARGIN=
   RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT=$ASPLIT   # Qes: the arena's own take-back, exact (--arena-split; 0 off until H57)
   RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=64
   RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=$((10#$HYBRID))   # QyP: hybrid decode, the CPU's share P%; 0 off

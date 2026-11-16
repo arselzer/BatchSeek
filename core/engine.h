@@ -720,6 +720,19 @@ private:
     void loan_tick(bool idle);
     bool     lending_ = false;
     uint64_t loan_last_ns_ = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_KV_LEND (ds41_p1.h kKvLendEnv): the KV pool's free tail lent to the P1 lender's KV
+     * slots (FileStager::p1_kv_set). kv_lend_tokens_ is the loan every rank's lender follows at a pass's begin: the
+     * scheduler lowers it before the cache's mark (the reclaim hook, a shrinking tick) and raises it after. */
+    bool     kv_lend_ = false;
+    std::atomic<int64_t> kv_lend_tokens_{ 0 };
+    int64_t  kv_lend_margin_ = 0, kv_lend_max_ = 0;
+    uint64_t kv_lend_reclaims_ = 0, kv_lend_shrinks_ = 0, kv_lend_grows_ = 0;
+    bool     kv_lend_reported_ = false;
+    void     kv_lend_tick();
+    int      kv_lend_bringup(std::string* why);
+public:
+    void     kv_lend_report();
+private:
     /* The activation arena's loan (Engine::arena_step). `arena_rows_[k]` is the largest step Ctx
      * level k serves (level 0 is the full plan); empty when the arena lends nothing. The floor is
      * the largest recent step: the loan grows past it only after no step that large has run for a

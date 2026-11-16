@@ -425,6 +425,29 @@ eexpect 1 'Qes never kept an arena resident' "$T/qes-idle.log" 1 exit
 eexpect 1 'Qes unrequested activation' "$T/qes-good.log" '' start
 eexpect 0 'Qes explicitly off' "$T/qt-off.log" '' exit
 eexpect 1 'Qes asked, no line' "$T/qt-off.log" 1 start
+# Kvl's gates: the lent KV line once at startup, and at exit some rank's peak KV residents above 0.
+eval "$(sed -n '/^kvl_gate() {/,/^}/p' "$W")"
+declare -F kvl_gate >/dev/null || { echo "FAIL no kvl_gate in $W"; exit 1; }
+{
+  echo "I ds41 p1: lent KV: on (RADIANCE_EXPERIMENTAL_DS41_KV_LEND=1): 52 lent slots a rank carved from the top of ..."
+  for rank in 0 1 2 3; do
+    echo "I[$rank] ds41 p1 stats, rank $rank: passes 3; lent ring: 90 slots (38 in the activation arena), 60 residents now; lent KV: 52 slots, 20 available and 18 resident now, peak 40 available and $((rank * 10)) resident (12.5 resident a pass), 60 made available, 20 withdrawn in 3 reclaims, largest loan 200000 tokens, 0.010 ms a pass in the sync"
+  done
+} > "$T/kvl-good.log"
+sed -E 's/available and [0-9]+ resident \(/available and 0 resident (/' "$T/kvl-good.log" > "$T/kvl-idle.log"
+cat "$T/kvl-good.log" "$T/kvl-good.log" > "$T/kvl-twice.log"
+kexpect() {
+  local want=$1 label=$2 rc; shift 2
+  kvl_gate "$@" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$label"; else bad "$label: exit $rc, want $want"; fi
+}
+kexpect 0 'Kvl startup line' "$T/kvl-good.log" 1 start
+kexpect 0 'Kvl KV residents at exit' "$T/kvl-good.log" 1 exit
+kexpect 1 'Kvl line twice' "$T/kvl-twice.log" 1 start
+kexpect 1 'Kvl never held a KV resident' "$T/kvl-idle.log" 1 exit
+kexpect 1 'Kvl unrequested activation' "$T/kvl-good.log" '' start
+kexpect 0 'Kvl explicitly off' "$T/qt-off.log" '' exit
+kexpect 1 'Kvl asked, no line' "$T/qt-off.log" 1 start
 echo "I ram budget: later 16384 MiB  per-sequence growth, 32 MiB x --max-num-seqs 512 (measured ...)" > "$T/ms-32.log"
 echo "I ram budget: later  8192 MiB  per-sequence growth, 16 MiB x --max-num-seqs 512 (measured ...)" > "$T/ms-16.log"
 mexpect() {
@@ -586,7 +609,10 @@ LKNON=$FAST-Lk452
 LKLOW=$FAST-N8-Lk8
 MS=$FAST-mA-mS16
 MSNOMA=$FAST-mS16
-ARMS="$ARMS $QES $QESNOQE $QESNOP $QESTWO $LK $LKL $LKNON $LKLOW $MS $MSNOMA"
+KVL=$FAST-Qd64-Kvl
+KVLNOQE=${FAST/-Qe64/}-Kvl
+KVLTWO=$FAST-Kvl-Kvl
+ARMS="$ARMS $QES $QESNOQE $QESNOP $QESTWO $LK $LKL $LKNON $LKLOW $MS $MSNOMA $KVL $KVLNOQE $KVLTWO"
 run_loop() {   # actual balance-oracle bound; every model action remains stubbed
  (
   set +u
@@ -999,6 +1025,17 @@ for a in "$REF" "$FAST" "$QES" "$LK"; do
   has "no mS part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_RAM_PER_SEQ_MIB ""
 done
 qdskip "$MSNOMA" "mS16 sets the RAM budget's per-sequence term, which needs mA; the arm is skipped"
+sec=$(section "$KVL")
+if [[ -z "$sec" ]]; then bad "the Kvl arm $KVL was not launched: $(grep -m3 "arm $KVL" "$T/loop.txt")"
+else
+  has "Kvl" "$sec" RADIANCE_EXPERIMENTAL_DS41_KV_LEND 1
+  has "Kvl margin" "$sec" RADIANCE_EXPERIMENTAL_DS41_KV_LEND_MARGIN ""
+fi
+for a in "$REF" "$FAST" "$QES" "$MS"; do
+  has "no Kvl part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_KV_LEND 0
+done
+qdskip "$KVLNOQE" "Kvl needs P1 and the lent arena (a QeK part); the arm is skipped"
+qdskip "$KVLTWO" "two Kvl parts; the arm is skipped"
 
 short_out=$(run_loop 2048)
 for a in "$COLD4K" "$PC4K"; do

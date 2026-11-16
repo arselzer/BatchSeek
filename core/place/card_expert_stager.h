@@ -510,7 +510,14 @@ public:
      * twice; 0 done. */
     int  set_arena(int first);
     int  arena_first() const { return arena_; }
-    bool arena_slot(int k) const { return arena_ >= 0 && k >= arena_ && k < n() - keep_; }
+    bool arena_slot(int k) const { return k >= 0 && k < n() && slot_[(size_t)k].grp == 1; }
+    /* The KV pool's lent slots (RADIANCE_EXPERIMENTAL_DS41_KV_LEND; set after init and set_arena, before the first
+     * pass): slots [first, first + count) form a third group that no pass takes back (no pass writes the KV pool's
+     * lent blocks) and that knows no grace; each is unavailable (set_avail) until its owner lends the blocks under
+     * it, and loads (from the RAM cache only in a pass that takes the ring) whenever it is available and wants its
+     * unit. -1 when the range is out of bounds, overlaps a kept slot, or it is called twice. */
+    int  set_kv(int first, int count);
+    bool kv_slot(int k) const { return k >= 0 && k < n() && slot_[(size_t)k].grp == 2; }
     /* With the split: whether the arena's slots are lent out now (always false without it). */
     bool arena_lent() const { return arena_ >= 0 && lent_g_[1]; }
     /* Slot availability, the lender's half of a KV pool that lends its unused blocks (VRAMLEND-20261116.md, B;
@@ -590,9 +597,10 @@ private:
     int  keep_ = 0;
     /* By group (0 the ring's, 1 the arena's; only 0 without the split): lent out, any pass took it yet, the end
      * of the last pass that took it, and whether the pass running now took it (end_p1 moves those ends). */
-    bool    lent_g_[2] = { true, true }, any_g_[2] = { false, false }, took_g_[2] = { false, false };
-    int64_t last_g_[2] = { 0, 0 };
+    bool    lent_g_[3] = { true, true, false }, any_g_[3] = { false, false, false }, took_g_[3] = { false, false, false };
+    int64_t last_g_[3] = { 0, 0, 0 };
     int     arena_ = -1;
+    bool    has_kv_ = false;   /* set_kv: group 2 exists (never lent, never taken by a pass) */
     bool any_p1_ = false;
     bool audit_ = false, stopped_ = false;
     Stats st_;
@@ -604,10 +612,10 @@ private:
     bool away(const Slot& s) const { return (lent_g_[s.grp] || !s.avail) && !s.keep; }
     void settle(int k);
     void poll();
-    /* Loads for the slots that want one (from the RAM cache only in the rest): All, every such slot; Back (the
-     * split, one group still lent out), those of the group that is back, not the kept ones; ArenaRam (the split,
-     * a pass that took the ring), the arena's alone and from the RAM cache only. */
-    enum class Pump : uint8_t { All, Back, ArenaRam };
+    /* Loads for the slots that want one (from the RAM cache only in the rest): All, every such slot; Back (a group
+     * still lent out), those of the groups that are back, not the kept ones; Spared (a pass that took slots back),
+     * those of the groups it did not take and that are back, from the RAM cache only. */
+    enum class Pump : uint8_t { All, Back, Spared };
     void pump(Pump which = Pump::All);
     /* Group g's slots, back after its grace: the idle and failed ones want their units. */
     void give_back(int g);
@@ -853,7 +861,10 @@ public:
     struct LendUnit { int32_t unit = -1; int64_t off[2] = { 0, 0 }, bytes[2] = { 0, 0 }; };
     int  lend_init(const std::vector<LendUnit>& units, const std::vector<int>& ring_slots,
                    const std::vector<char*>& arena_slots, const std::vector<char*>& slab_slots, int64_t grace_ms,
-                   bool audit, std::string* why);
+                   bool audit, std::string* why, const std::vector<char*>& kv_slots = {});
+    /* The KV pool's lent slots (kv_slots at lend_init, after the arena's): the first's lender index and count. */
+    int  lend_kv_first() const { return lkv_first_; }
+    int  lend_kv_slots() const { return lkv_n_; }
     /* The read-back audit (`audit` at lend_init: one pinned slot of host memory and an event more): before
      * the lender's begin_pass, the event the compute stream recorded at the end of the pass before (null:
      * none yet), behind which a withdrawn resident's slot is read back. */
@@ -871,7 +882,7 @@ public:
     /* Lent slot k's ring slot, or -1 (an arena slot); its address; the arena's lent slots. */
     int  lend_ring_slot(int k) const { return k >= 0 && k < (int)lring_.size() ? lring_[(size_t)k] : -1; }
     char* lend_slot(int k) const { return k >= 0 && k < (int)lat_.size() ? lat_[(size_t)k] : nullptr; }
-    int  lend_arena_slots() const { return (int)(lat_.size() - lring_.size()) - lend_.kept(); }
+    int  lend_arena_slots() const { return (int)(lat_.size() - lring_.size()) - lend_.kept() - lkv_n_; }
     int32_t lend_unit(int k) const { return k >= 0 && k < (int)lu_.size() ? lu_[(size_t)k].unit : -1; }
     /* The heat policy's retargets (FileStager::p1_heat_policy, between passes): lent slots ks[i], each a
      * resident's, go to units[i] (laid out as lend_init's; n at most ds41p1::kMaxLendHeat, slots and units
@@ -923,6 +934,11 @@ public:
         uint64_t lend_drive = 0, lend_drive_ns = 0, lend_read_failed = 0;
         uint64_t lend_audit_ns = 0;   /* the issuing thread's time in the read-back audit */
         uint64_t early_missed = 0;    /* early candidates the RAM cache did not give */
+        /* The KV pool's lent slots (FileStager::p1_kv_sync): withdrawn when the loan shrank (and the passes that
+         * withdrew any), made available when it grew, the most available and resident at a pass's begin, the
+         * residents summed over the passes counted, the issuing thread's time in the sync, the largest target. */
+        uint64_t kv_withdrawn = 0, kv_reclaims = 0, kv_given = 0, kv_avail_peak = 0, kv_res_peak = 0;
+        uint64_t kv_res_sum = 0, kv_passes = 0, kv_sync_ns = 0, kv_target_max = 0;
     };
     Counts& counts_mut() { return c_; }
     const Counts& counts() const { return c_; }
@@ -1028,6 +1044,7 @@ private:
     RadEvent lfence_ = nullptr;
     bool     lfenced_ = false;
     int      lprimed_ = 0;       /* the slab slots lend_prime left holding their unit */
+    int      lkv_first_ = -1, lkv_n_ = 0;   /* the KV pool's lent slots (RingLender::set_kv) */
     /* The read-back audit (null and -1 without the switch): a pinned slot of host memory the card's copy
      * is read into, its event, the residents' last-reader event of this pass, and the digests. */
     uint8_t* laud_buf_ = nullptr;

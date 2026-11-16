@@ -170,6 +170,18 @@ constexpr const char* kLendArenaEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA"
  * and the kept slab's reloads still wait for both. Needs kLendArenaEnv. Residency moves, bytes do not
  * (card_expert_stager.h, the lent arena). */
 constexpr const char* kLendArenaSplitEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT";
+/* The KV pool's free tail lent to expert slots (kKvLendEnv=1; 0 / unset / empty off, the default, and then nothing
+ * changes): the static pool (--max-model-len) keeps its size, but the blocks above the cache's held blocks plus a
+ * margin (kKvLendMarginEnv tokens; unset: two chunks, 2 x --max-num-batched-tokens) are lent through the KV cache's
+ * in-place loan (KVManager::set_loan) to whole lent slots carved from the top of each FULL group's layer stripes.
+ * A slot holds a file-tier unit as a decode resident while the loan covers it; when the cache needs the blocks back
+ * (an allocation short of free blocks, or the margin) the loan shrinks at once on the scheduler's side and every
+ * rank withdraws the uncovered residents and fences their queued copies at the begin of the next pass, before that
+ * pass's first op (the first that can write those blocks); a slot the loan covers again reloads behind the end of
+ * the pass before. Needs kEnv, kLendArenaEnv (the lender's bring-up) and a static plan without the expert slab's
+ * own KV loan. Residency moves, bytes do not. */
+constexpr const char* kKvLendEnv = "RADIANCE_EXPERIMENTAL_DS41_KV_LEND";
+constexpr const char* kKvLendMarginEnv = "RADIANCE_EXPERIMENTAL_DS41_KV_LEND_MARGIN";
 /* The lent slots follow live decode routing (kLendHeatEnv=S; 0 off, the default; 1-kMaxLendHeat: at most S
  * slots a rank handed to another unit a pass). Each rank keeps, by file-tier unit, a decayed count of the
  * decode rows routed to it (pure trunk decode passes only; it halves every kLendHeatHalfEnv decode rows,
@@ -297,6 +309,7 @@ constexpr const char* kLogChunk = "ds41 p1 chunk:";             /* rank 0, after
 constexpr const char* kLogLend  = "ds41 p1: lent ring";         /* rank 0, at startup, with kLendEnv */
 constexpr const char* kLogLendArena = "ds41 p1: lent arena";    /* rank 0, at startup, with kLendArenaEnv */
 constexpr const char* kLogLendArenaSplit = "ds41 p1: lent arena split";   /* rank 0, at startup, with kLendArenaSplitEnv */
+constexpr const char* kLogKvLend = "ds41 p1: lent KV";   /* engine, at startup, with kKvLendEnv */
 constexpr const char* kLogLendHeat = "ds41 p1: lent heat";      /* rank 0, at startup, with kLendHeatEnv */
 constexpr const char* kLogLendSlab = "ds41 p1: lent slab";      /* rank 0, at startup, with kLendSlabEnv */
 constexpr const char* kLogLendAudit = "ds41 p1: lent audit";    /* rank 0, at startup, with kLendAuditEnv; and every difference */

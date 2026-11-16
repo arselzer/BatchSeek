@@ -4766,6 +4766,11 @@ int Engine::start() {
             why = fmt("the activation arena has no smaller level (the '%s' plugin declares at a smaller step only "
                       "beside %s=1 and this switch: rebuild it from a tree that does; the levels' lines above say "
                       "why a level was dropped)", plugins_.arch_plugin.c_str(), ds41p1::kEnv);
+        /* ..._KV_LEND: the KV pool's lent slots, handed to every rank's stager before its lending starts. */
+        if (why.empty()) {
+            std::string w;
+            if (kv_lend_bringup(&w) < 0) why = w;
+        }
         for (size_t i = 0; why.empty() && i < ranks_.size(); ++i) {
             Rank& r = *ranks_[i];
             RAD_TRY(rad_dev_set(r.device));
@@ -4796,6 +4801,49 @@ int Engine::start() {
             return RAD_E_INVAL;
         }
         arena_rows_ = { cfg_.max_tok, ranks_[0]->arena_levels[li].rows };
+        /* ..._KV_LEND: the lending is on once rank 0's lender holds KV slots. The reclaim hook only lowers the
+         * target every rank's lender follows (and the followers' marks): the ranks withdraw at their next pass's
+         * begin, before its first op, which is the first that can write a block handed out from here. It never
+         * fails, so no allocation fails for it. */
+        if (kv_lend_margin_ > 0) {
+            const int nkv = ranks_[0]->fstager.p1_kv_lent_slots();
+            for (auto& r : ranks_)
+                if (r->fstager.p1_kv_lent_slots() != nkv) {
+                    RAD_ERR("%s refused: rank %d holds %d KV slots, rank 0 %d", ds41p1::kKvLendEnv, r->index,
+                            r->fstager.p1_kv_lent_slots(), nkv);
+                    return RAD_E_INVAL;
+                }
+            if (nkv > 0) {
+                kv_lend_ = true;
+                kv_lend_tokens_.store(0, std::memory_order_release);
+                ranks_[0]->kv.set_reclaim([this](int64_t tokens) -> int {
+                    const int64_t t = std::max<int64_t>(tokens, 0);
+                    if (t < kv_lend_tokens_.load(std::memory_order_acquire)) {
+                        kv_lend_tokens_.store(t, std::memory_order_release);
+                        ++kv_lend_reclaims_;
+                    }
+                    for (size_t i = 1; i < ranks_.size(); ++i) {
+                        KVManager& f = ranks_[i]->kv;
+                        if (t < f.loan_tokens()) (void)f.set_loan(t);
+                    }
+                    return RAD_OK;
+                });
+                RAD_INFO("%s: on (%s=1): %d lent slots a rank carved from the top of the KV pool's FULL groups' layer "
+                         "stripes (the pool stays --max-model-len) hold the next hottest file-tier units while the "
+                         "cache's loan covers them; the loan follows the cache's free tail less a margin of %lld tokens "
+                         "(%s), grown every 100 ms in steps of a chunk and shrunk at once (an allocation short of "
+                         "blocks lowers it first); each rank withdraws uncovered residents at its next pass's begin; "
+                         "counts in the shutdown stats line",
+                         ds41p1::kLogKvLend, ds41p1::kKvLendEnv, nkv, (long long)kv_lend_margin_, ds41p1::kKvLendMarginEnv);
+            } else {
+                RAD_WARN("%s: no KV slot fits the pool's FULL groups or no unit is left to lend; nothing is lent",
+                         ds41p1::kKvLendEnv);
+            }
+        }
+    } else if (const char* kv = std::getenv(ds41p1::kKvLendEnv); kv && ds41p1::env_state(kv) == 1) {
+        RAD_ERR("%s=1 refused: it needs the lent arena (%s, with %s) for the lender's bring-up", ds41p1::kKvLendEnv,
+                ds41p1::kLendArenaEnv, ds41p1::kEnv);
+        return RAD_E_INVAL;
     }
     /* RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS (engine_aux.cpp): every rank's stager is up and the lent units
      * are known; the worker's set, lanes, load and binding. A configuration it cannot serve refuses; anything
@@ -5040,6 +5088,120 @@ int Engine::load_vocab() {
     RAD_INFO("gbnf: vocabulary index built in %.0f ms, %s", gi.build_ms,
              humanb((int64_t)gi.bytes).c_str());
     return RAD_OK;
+}
+
+
+/* ..._KV_LEND, at bring-up (the lent arena's block, before each rank's lending starts): whole slots from the top of
+ * every FULL group's layer stripes, each with the loan in tokens that covers it, ascending, handed to every rank's
+ * stager. A layer stripe of group p holds n_blocks blocks of layer_bytes_per_block at base + L x layer_stride; a loan
+ * of T tokens lends its top floor(T / block_size) blocks (KVManager::lent_blocks), so a slot at [lo, lo + slot) under
+ * the stripe's top is covered from ceil((top - lo) / lbpb) x block_size tokens. 0 when the switch is off. */
+int Engine::kv_lend_bringup(std::string* why) {
+    const char* v = std::getenv(ds41p1::kKvLendEnv);
+    const int on = ds41p1::env_state(v);
+    if (on < 0) {
+        *why = fmt("%s=%s: 1 is on, 0 / unset / empty off", ds41p1::kKvLendEnv, v);
+        return RAD_E_INVAL;
+    }
+    if (on != 1) return RAD_OK;
+    if (lending_) {
+        *why = fmt("%s=1: the expert slab lends the KV pool already (a dynamic plan)", ds41p1::kKvLendEnv);
+        return RAD_E_INVAL;
+    }
+    int64_t margin = 2 * std::max<int64_t>(cfg_.max_tok, 1);
+    if (const char* m = std::getenv(ds41p1::kKvLendMarginEnv); m && *m) {
+        char* end = nullptr;
+        const long long x = std::strtoll(m, &end, 10);
+        if (!end || *end || x < 0 || x > (1LL << 30)) {
+            *why = fmt("%s=%s: a whole number of tokens", ds41p1::kKvLendMarginEnv, m);
+            return RAD_E_INVAL;
+        }
+        margin = x;
+    }
+    kv_lend_margin_ = std::max<int64_t>(margin, 1);
+    const int64_t S = ds41p1::kSlotBytes;
+    for (auto& rp : ranks_) {
+        Rank& r = *rp;
+        struct KS { char* at; int64_t need; };
+        std::vector<KS> ks;
+        for (const KVGroupPlan& p : r.kv.plans()) {
+            if (!r.kv.lendable(p.index) || !p.base || p.n_slots > 0) continue;
+            const int64_t lbpb = p.layer_bytes_per_block(), stripe = p.layer_stride();
+            if (lbpb <= 0 || p.block_size <= 0 || p.n_blocks * lbpb > stripe) continue;
+            for (int64_t L = 0; L < p.n_layers; ++L) {
+                char* const top = (char*)p.base + L * stripe + p.n_blocks * lbpb;
+                char* const bottom = top - p.n_blocks * lbpb;
+                char* hi = top;
+                for (;;) {
+                    if (hi - bottom < S) break;
+                    char* const lo = (char*)((uintptr_t)(hi - S) & ~(uintptr_t)4095);
+                    if (lo < bottom) break;
+                    const int64_t blocks = ((int64_t)(top - lo) + lbpb - 1) / lbpb;
+                    /* Never the whole group: the cache keeps at least one block below every slot. */
+                    if (blocks >= p.n_blocks) break;
+                    ks.push_back({ lo, blocks * p.block_size });
+                    hi = lo;
+                }
+            }
+        }
+        std::stable_sort(ks.begin(), ks.end(), [](const KS& a, const KS& b) { return a.need < b.need; });
+        std::vector<char*> at;
+        std::vector<int64_t> need;
+        for (const KS& k : ks) {
+            at.push_back(k.at);
+            need.push_back(k.need);
+        }
+        if (r.index == 0)
+            RAD_INFO("%s: rank 0's KV pool fits %zu slots of %s in its FULL groups' layer stripes, covered from %lld to "
+                     "%lld tokens of loan", ds41p1::kLogKvLend, at.size(), humanb(S).c_str(),
+                     (long long)(need.empty() ? 0 : need.front()), (long long)(need.empty() ? 0 : need.back()));
+        r.fstager.p1_kv_set(std::move(at), std::move(need),
+                            [this] { return kv_lend_tokens_.load(std::memory_order_acquire); });
+    }
+    return RAD_OK;
+}
+
+/* ..._KV_LEND's tick (Engine::loan_tick, every 100 ms under the scheduler's lock): the loan follows the cache's
+ * free tail less the margin. It shrinks at once, the ranks' target first; it grows in steps of a chunk, the cache's
+ * mark first. The followers' marks follow rank 0's. */
+void Engine::kv_lend_tick() {
+    const uint64_t now = rad_mono_ns();
+    if (now - loan_last_ns_ < 100000000ull) return;
+    loan_last_ns_ = now;
+    const auto lk = sched_.hold();
+    Rank& lead = *ranks_[0];
+    const int64_t cur = lead.kv.loan_tokens();
+    const int64_t spare = lead.kv.spare_tokens();
+    const int64_t target = std::max<int64_t>(spare - kv_lend_margin_, 0);
+    const int64_t chunk = std::max<int64_t>(cfg_.max_tok, 1);
+    if (target < cur) {
+        if (target < kv_lend_tokens_.load(std::memory_order_acquire)) kv_lend_tokens_.store(target, std::memory_order_release);
+        if (lead.kv.set_loan(target) < 0) {
+            RAD_ERR("%s: the cache refused to take its loan back to %lld tokens; lending stops", ds41p1::kKvLendEnv,
+                    (long long)target);
+            kv_lend_tokens_.store(0, std::memory_order_release);
+            (void)lead.kv.set_loan(0);
+            kv_lend_ = false;
+        }
+        ++kv_lend_shrinks_;
+    } else if (target >= cur + chunk) {
+        if (lead.kv.set_loan(target) < 0) return;   /* a held block reached the tail since: try again later */
+        kv_lend_tokens_.store(target, std::memory_order_release);
+        kv_lend_max_ = std::max(kv_lend_max_, target);
+        ++kv_lend_grows_;
+    } else {
+        return;
+    }
+    for (size_t i = 1; i < ranks_.size(); ++i) (void)ranks_[i]->kv.follow(lead.kv);
+}
+
+void Engine::kv_lend_report() {
+    if ((!kv_lend_ && kv_lend_grows_ == 0) || kv_lend_reported_) return;
+    kv_lend_reported_ = true;
+    RAD_INFO("%s: %llu grows and %llu shrinks at the tick, %llu reclaims by allocations, largest loan %lld tokens, %lld now",
+             ds41p1::kLogKvLend, (unsigned long long)kv_lend_grows_, (unsigned long long)kv_lend_shrinks_,
+             (unsigned long long)kv_lend_reclaims_, (long long)kv_lend_max_,
+             (long long)kv_lend_tokens_.load(std::memory_order_acquire));
 }
 
 }  /* namespace rad */

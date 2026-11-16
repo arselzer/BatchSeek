@@ -231,6 +231,14 @@
 # (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT=1)" once at startup (any other arm only without it) and at exit
 # (qes_gate) some rank's stats line counts arena residents kept through armed passes ("lent arena split: P passes took
 # the ring's slots and left the arena's (R arena residents through them)", R > 0): otherwise the switch never acted.
+# Kvl: the KV pool's free tail lent to expert slots (RADIANCE_EXPERIMENTAL_DS41_KV_LEND=1; ds41_p1.h kKvLendEnv; every other
+# arm states 0, and ..._KV_LEND_MARGIN empty: two chunks): the pool keeps its size; the blocks above the cache's held
+# ones less the margin are lent through the cache's in-place loan to whole slots carved from the top of its FULL
+# groups' layer stripes, which hold the next hottest file-tier units; an allocation short of blocks lowers the loan
+# first and every rank withdraws the uncovered residents at its next pass's begin. Residency only: replies must be
+# identical to the arm without it. Needs P1 and QeK. Measured only if the server logs "ds41 p1: lent KV: on
+# (RADIANCE_EXPERIMENTAL_DS41_KV_LEND=1)" once at startup (any other arm only without it) and at exit (kvl_gate) some
+# rank's stats line has a peak of KV residents above 0 ("lent KV: S slots, ... peak A available and R resident").
 # LkT: the KV pool auto-sized from the streams (an N part, required): --max-model-len = N x T x 5/4 rounded up to a
 # whole 16-token block a stream, T the measured peak KV tokens a stream (from a run with prefix_evictions 0:
 # (kv_tokens_used at the end + hit_cut_tokens) / N; NL-SQL N512: (180,208 + 51,256) / 512 = 452 -> Lk452 = L294912).
@@ -898,7 +906,8 @@ kld_finish() {   # name; the run is SERVER_PID
      ! extra_why=$(aw_gate "$OUT/$name.server.log" "${ARM_AW:-}") ||
      ! extra_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" exit) ||
      ! extra_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" exit) ||
-     ! extra_why=$(qes_gate "$OUT/$name.server.log" "${ARM_QES:-}" exit); then
+     ! extra_why=$(qes_gate "$OUT/$name.server.log" "${ARM_QES:-}" exit) ||
+     ! extra_why=$(kvl_gate "$OUT/$name.server.log" "${ARM_KVL:-}" exit); then
     log "arm $name: $extra_why; Kld not measured"; return 1
   fi
   # Qw / Aw (inexact by design): its run scored the engine against KLD_REF (--kld-ref); the engine's KL report is the
@@ -1211,6 +1220,20 @@ qes_gate() {   # log, requested switch, start/exit: rank 0's lent arena split li
   [[ "$stage" == exit ]] || return 0
   while read -r r; do [[ -n "$r" ]] && (( r > best )) && best=$r; done < <(sed -nE "s/.*ds41 p1 stats, rank [0-3]: .*; lent arena split: [0-9]+ passes took the ring's slots and left the arena's \(([0-9]+) arena residents through them\).*/\1/p" "$f")
   if (( best == 0 )); then echo "Qes, but no rank kept an arena resident through an armed pass (the switch never acted)"; return 1; fi
+  return 0
+}
+
+kvl_gate() {   # log, requested switch, start/exit: the lent KV line once (and KV residents at exit)
+  local f=$1 on=$2 stage=${3:-start} count r best=0
+  if [[ -z "$on" ]]; then
+    if grep -q 'ds41 p1: lent KV: on' "$f"; then echo 'no Kvl part, but the KV pool is lent'; return 1; fi
+    return 0
+  fi
+  count=$(grep -cE "ds41 p1: lent KV: on \(RADIANCE_EXPERIMENTAL_DS41_KV_LEND=1\)" "$f")
+  if [[ $count != 1 ]]; then echo "Kvl, but the server lacks one 'ds41 p1: lent KV: on (..._KV_LEND=1)' startup line"; return 1; fi
+  [[ "$stage" == exit ]] || return 0
+  while read -r r; do [[ -n "$r" ]] && (( r > best )) && best=$r; done < <(sed -nE 's/.*ds41 p1 stats, rank [0-3]: .*; lent KV: [0-9]+ slots, [0-9]+ available and [0-9]+ resident now, peak [0-9]+ available and ([0-9]+) resident.*/\1/p' "$f")
+  if (( best == 0 )); then echo "Kvl, but no rank held a KV resident (the switch never acted)"; return 1; fi
   return 0
 }
 
@@ -1630,6 +1653,7 @@ EOF2
      ! qsp_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" start) ||
      ! qsp_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" start) ||
      ! qsp_why=$(qes_gate "$OUT/$name.server.log" "${ARM_QES:-}" start) ||
+     ! qsp_why=$(kvl_gate "$OUT/$name.server.log" "${ARM_KVL:-}" start) ||
      ! qsp_why=$(ms_gate "$OUT/$name.server.log" "${ARM_MS:-}"); then
     log "arm $name: $qsp_why; not measured"; stop_server; return 1
   fi
@@ -1926,7 +1950,8 @@ EOF2
   if ! qsp_exit_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" exit) ||
      ! qsp_exit_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" exit) ||
      ! qsp_exit_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" exit) ||
-     ! qsp_exit_why=$(qes_gate "$OUT/$name.server.log" "${ARM_QES:-}" exit); then
+     ! qsp_exit_why=$(qes_gate "$OUT/$name.server.log" "${ARM_QES:-}" exit) ||
+     ! qsp_exit_why=$(kvl_gate "$OUT/$name.server.log" "${ARM_KVL:-}" exit); then
     log "arm $name: $qsp_exit_why; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
@@ -3764,7 +3789,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$(arm_full "$a")"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" sg="" pcn=""
-  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qyp="" qyk="" qsp="" qt="" qw="" dt="" aw="" qz="" qx="" qes="" lk="" ms="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr="" ee=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qyp="" qyk="" qsp="" qt="" qw="" dt="" aw="" qz="" qx="" qes="" kvl="" lk="" ms="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr="" ee=""
   ctp=""   # Ctp / CtpN: the prefill chain trace (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL)
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
@@ -3995,6 +4020,9 @@ for a in $ARMS; do
       Qz)      qz=1 ;;                                                  # the twin's tail filled once a layer (..._P1_TAIL_ONCE=1)
       Dt)      dt=1 ;;                                                  # gemm_nt_bf16f8's tiled form above 64 rows, exact (..._DENSE_TILED=1)
       Aw)      aw=1 ;;                                                  # attn_sparse_sink's WMMA form, inexact (..._ATTN_WMMA=1)
+      Kvl)                                                             # the KV pool's free tail lent to expert slots (..._KV_LEND=1)
+               if [[ -n "$kvl" ]]; then log "arm $a: two Kvl parts; the arm is skipped"; skip=1; fi
+               kvl=1 ;;
       Qes)                                                             # the lent arena's own take-back (..._P1_LEND_ARENA_SPLIT=1)
                if [[ -n "$qes" ]]; then log "arm $a: two Qes parts; the arm is skipped"; skip=1; fi
                qes=1 ;;
@@ -4634,6 +4662,9 @@ for a in $ARMS; do
   # Qes: the lent arena's own take-back, stated in every arm (0 off); with P1 and the lent arena (QeK).
   env+=(RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT=${qes:-0})
   [[ -n "$qes" && ( -z "$p1" || -z "$qe" ) ]] && { log "arm $a: Qes needs P1 and the lent arena (a QeK part); the arm is skipped"; skip=1; }
+  # Kvl: the KV pool lent to expert slots, stated in every arm (0 off, the margin empty); with P1 and the lent arena.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_KV_LEND=${kvl:-0} RADIANCE_EXPERIMENTAL_DS41_KV_LEND_MARGIN=)
+  [[ -n "$kvl" && ( -z "$p1" || -z "$qe" ) ]] && { log "arm $a: Kvl needs P1 and the lent arena (a QeK part); the arm is skipped"; skip=1; }
   # mS: the RAM budget's per-sequence growth, stated in every arm (empty: the engine's 32 MiB); with mA.
   env+=(RADIANCE_EXPERIMENTAL_DS41_RAM_PER_SEQ_MIB=${ms})
   [[ -n "$ms" && -z "$ma" ]] && { log "arm $a: mS$ms sets the RAM budget's per-sequence term, which needs mA; the arm is skipped"; skip=1; }
@@ -4868,7 +4899,7 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
   if [[ -n "$ARM_TIMEOUT" ]] && ! [[ $ARM_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]]; then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QYP=$qyp ARM_QYK=$qyk ARM_QSP=$qsp ARM_QT=$qt ARM_QW=$qw ARM_DT=$dt ARM_AW=$aw ARM_QZ=$qz ARM_QX=$qx ARM_QES=$qes ARM_MS=$ms ARM_LH=$lh ARM_EE=$ee
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QYP=$qyp ARM_QYK=$qyk ARM_QSP=$qsp ARM_QT=$qt ARM_QW=$qw ARM_DT=$dt ARM_AW=$aw ARM_QZ=$qz ARM_QX=$qx ARM_QES=$qes ARM_KVL=$kvl ARM_MS=$ms ARM_LH=$lh ARM_EE=$ee
   ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr ARM_SL=$sl ARM_CTX=$arm_ctx ARM_CR=$cr
   if [[ -n "$cr" ]]; then
     crk=${ARM_CONC:-${AB_CONCURRENCY:-1}}

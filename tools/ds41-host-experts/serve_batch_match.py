@@ -8,7 +8,7 @@ serve_batch_test.sh).
       --ctx-per-stream (--max-model-len / --max-num-seqs, which must divide), --port, --served-name,
       --radiance-home, --shared-head, --hybrid (..._P1_HYBRID: QyP's P, 0 or unset off; a held share, Qyf, is
       refused), --tiled / --tail-once / --swiglu-span / --fast-prefill / --fast-dense / --fast-attn (Qt / Qz / Qsp / Qw /
-      Dt / Aw: ..._P1_TILED, _P1_TAIL_ONCE, _P1_SWIGLU_SPAN, _P1_WMMA, _DENSE_TILED, _ATTN_WMMA, 0 or unset off), --early (QxK: ..._P1_EARLY, 0 or unset off), --arena-split (Qes: ..._P1_LEND_ARENA_SPLIT, 0 or unset off),
+      Dt / Aw: ..._P1_TILED, _P1_TAIL_ONCE, _P1_SWIGLU_SPAN, _P1_WMMA, _DENSE_TILED, _ATTN_WMMA, 0 or unset off), --early (QxK: ..._P1_EARLY, 0 or unset off), --arena-split (Qes: ..._P1_LEND_ARENA_SPLIT, 0 or unset off), --kv-lend (Kvl: ..._KV_LEND),
       --ram-per-seq-mib (mSN: ..._RAM_PER_SEQ_MIB, where set; an LkT pool is --ctx-per-stream, which serve-batch.sh
       --kv-auto T also gives), and --profile, --mirror, --reserve-mib, --max-seq-len (SlN) where the launch has them. Exit 1
       with the reason when a value is missing or does not fit.
@@ -31,6 +31,7 @@ KERNEL_COST = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST"   # Qyk: on 
 EARLY = "RADIANCE_EXPERIMENTAL_DS41_P1_EARLY"   # QxK: --early K
 ARENA_SPLIT = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT"   # Qes: --arena-split 1
 PER_SEQ = "RADIANCE_EXPERIMENTAL_DS41_RAM_PER_SEQ_MIB"   # mSN: --ram-per-seq-mib N
+KV_LEND = "RADIANCE_EXPERIMENTAL_DS41_KV_LEND"   # Kvl: --kv-lend 1
 P1_SWITCHES = (("--tiled", "RADIANCE_EXPERIMENTAL_DS41_P1_TILED"), ("--tail-once", "RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE"),
                ("--swiglu-span", "RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN"),
                ("--engram-early", "RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY"),    # Ee (the harness sets it only when on)
@@ -115,6 +116,7 @@ def params(words):
     out += ["--hybrid-prefill", hp]
     out += ["--early", env.get(EARLY) or "0"]
     out += ["--arena-split", env.get(ARENA_SPLIT) or "0"]
+    out += ["--kv-lend", env.get(KV_LEND) or "0"]
     if env.get(PER_SEQ):
         out += ["--ram-per-seq-mib", env[PER_SEQ]]
     if flags.get("--max-seq-len"):
