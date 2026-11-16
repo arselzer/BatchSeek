@@ -170,7 +170,9 @@ schema, instructions) in `system`, so the prefix cache processes it once. `batch
 
 **Long prompts.** Each request gets `--ctx-per-stream` tokens for prompt plus reply (default 1,152, enough for short
 SQL questions). For longer prompts or replies, raise it and lower `--streams` so that streams x ctx-per-stream stays
-at most about 2.4 million tokens (tested: `--streams 512 --ctx-per-stream 4608` for all 500 of BIRD's 2026 prompts at once). `--dry-run` shows the resulting settings.
+at most about 720,000 tokens: the pool takes VRAM from the experts kept on the GPUs, and a larger pool slows
+everything down (`--streams 512 --ctx-per-stream 1408` for all 500 of BIRD's 2026 prompts at once; prompts that share a
+schema share its KV through the prefix cache). The launcher warns above about 786,000. `--dry-run` shows the resulting settings.
 
 ## Calibration
 

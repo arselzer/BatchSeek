@@ -347,6 +347,15 @@ ENV=(
 # The KV pool: --max-model-len is the pool the streams share, streams x tokens a stream (prompt plus reply). The
 # measured arms: 256 x 1152 = 294912 and 128 x 1152 = 147456 for prompts of about 1K tokens and 128-token replies.
 POOL=$((STREAMS * CTX))
+# The pool is taken from the same VRAM as the experts kept on the GPUs. Measured on four 16 GB GPUs: 655,360 tokens
+# left 444 resident experts a card, 720,896 left 335-399, and 1,179,648 or more left 43, so every prompt step read
+# hundreds of experts from the drive (ab-20261116T210025Z: 213 s of prompt processing instead of 83 s). Size the
+# pool from the tokens the streams really hold at once (prompt plus reply), not from the longest possible request.
+if (( POOL > 786432 )); then
+  echo "serve-batch: warning: a KV pool of $POOL tokens (--streams $STREAMS x --ctx-per-stream $CTX) takes VRAM the" >&2
+  echo "  experts need; above about 786,432 tokens few experts stay on the GPUs and throughput drops sharply." >&2
+  echo "  Lower --ctx-per-stream (or --streams) unless the requests really need it." >&2
+fi
 ARGS=(
   --kernels libr4d,libref --model "$MODEL" --served-model-name "$NAME"
   --tp 4 --tp-wire exact --placement expert_tiered --weights-disk-tier
