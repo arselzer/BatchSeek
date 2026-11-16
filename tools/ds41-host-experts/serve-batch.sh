@@ -36,7 +36,7 @@
 #   - --fast-attn (Aw, ..._ATTN_WMMA): the sparse attention at every height on the matrix cores, ON by default. NOT
 #     exact: q.k and sum p k summed in another f32 order (the softmax's exp, max and normaliser the exact kernel's), so
 #     replies are not byte-identical to the exact engine's. --exact (or --fast-attn 0) turns it off (FASTDENSE-20261115.md).
-#   - --exact: both inexact modes off (--fast-prefill 0 --fast-attn 0): replies byte-identical whatever the batch.
+#   - --reproducible (alias --exact): both batch-dependent modes off (--fast-prefill 0 --fast-attn 0): replies byte-identical whatever the batch.
 #   - --hybrid-cal M (QycM, ..._P1_HYBRID_CAL): the hybrid split's CPU rate learnt from completions (1), one share for
 #     every rank with the choice reserved under one lock (2), or both (3); exact (selection only). OFF (0) until window
 #     H58 measures it (core/place/p1_hybrid.h "calibration").
@@ -87,7 +87,7 @@
 #                       [--ctx-per-stream 1152] [--profile FILE] [--mirror DIR] [--shared-head 32] [--served-name ds41]
 #                       [--radiance-home DIR] [--hybrid 60] [--max-seq-len N] [--tiled 0|1] [--tail-once 0|1]
 #                       [--swiglu-span 0|1] [--engram-early 0|1] [--hybrid-prefill 60] [--fast-prefill 0|1]
-#                       [--fast-dense 0|1] [--fast-attn 0|1] [--exact] [--early K] [--pack W] [--pack-once 0|1] [--hybrid-cal M]
+#                       [--fast-dense 0|1] [--fast-attn 0|1] [--reproducible] [--early K] [--pack W] [--pack-once 0|1] [--hybrid-cal M]
 #                       [--arena-split 0|1] [--kv-auto T] [--ram-per-seq-mib N] [--kv-lend 0|1] [--decode-min N]
 #                       [--capture FILE] [--auto-profile DIR] [--dry-run]
 #                       [-- more radiance flags, e.g. --expert-stats FILE to record a profile; outside the measured set]
@@ -123,7 +123,7 @@ while (( $# )); do
     --fast-prefill) FASTPF=${2:?}; FAST_SET=1; shift ;;
     --fast-dense) FASTDN=${2:?}; shift ;;
     --fast-attn) FASTAT=${2:?}; FAST_SET=1; shift ;;
-    --exact) FASTPF=0; FASTAT=0; FAST_SET=1 ;;
+    --reproducible|--exact) FASTPF=0; FASTAT=0; FAST_SET=1 ;;
     --early) EARLY=${2:?}; shift ;;
     --pack) PACK=${2:?}; shift ;;
     --pack-once) PACKONCE=${2:?}; shift ;;

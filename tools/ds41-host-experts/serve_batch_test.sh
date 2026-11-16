@@ -158,7 +158,7 @@ grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=0' <<< "$d0h" && [[ $d0h == *
 [[ $dh != *--max-seq-len* ]] && ok "no --max-seq-len by default" || bad "a --max-seq-len by default"
 
 dq=$("$SB" --model M --silu-table S --tiled 0 --tail-once 0 --swiglu-span 0 --dry-run)
-dx=$("$SB" --model M --silu-table S --exact --dry-run)
+dx=$("$SB" --model M --silu-table S --reproducible --dry-run)
 grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1' <<< "$dx" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=1' <<< "$dh" &&
   grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN=1' <<< "$dh" && ok "Qz, Qsp on by default; Qt on with --exact" || bad "the Qt/Qz/Qsp defaults"
 grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TILED=0' <<< "$dq" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=0' <<< "$dq" &&
