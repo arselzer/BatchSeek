@@ -115,7 +115,7 @@ The same BIRD 256 job with three placement profiles:
 | Built into the model file | 221 s |
 | Recorded from 64 public BIRD *training* questions (different databases) | **146 s** |
 
-The measured numbers used a community IQ4_NL conversion of the Engram tables. The release's official FP8 tables
+The measured numbers used the IQ4_NL Engram tables from [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)'s GGUF release. The release's official FP8 tables
 (`--engram-file`) ran at the same speed (170 s vs 172 s on 256 BIRD questions) with similar accuracy.
 
 ## Requirements

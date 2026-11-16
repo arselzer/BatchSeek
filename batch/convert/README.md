@@ -85,7 +85,7 @@ A stopped run can be restarted: checked downloads are remembered in `WORK/marks/
 The container keeps the release's native MXFP4 routed-expert codes and scales unchanged (30,720 expert weights,
 288.8 GB); nothing is dequantized or requantized. It differs from the release elsewhere:
 
-- The two Engram tables come from the community IQ4_NL GGUF instead of the official FP8 tables. The server can read
+- The two Engram tables come from [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)'s IQ4_NL GGUF instead of the official FP8 tables. The server can read
   the official FP8 tables instead (`--engram-file`, see the main README).
 - The other 1,119 neural tensors are BF16 or F32 casts of the official weights (FP8→BF16, BF16→BF16, BF16→F32,
   F32→F32; never narrowed from F32 to BF16).
