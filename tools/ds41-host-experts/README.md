@@ -66,9 +66,9 @@ scripts from `SB_TOOLS`, default the harness's directory) and afterwards sends t
   Raise it for longer prompts (KV is small: about 6.5 MiB a sequence a card plus 3.2 KB a token).
 - `--reserve-mib`: host RAM the budget keeps free (10,240 when not given; at least 1024).
 - `--profile`: the placement profile (`--expert-profile`). The measured arm used one blended from captures of the
-  same prompt families, which is not shipped; profiles are bound to the container they were recorded on. Without
-  one the server ranks experts by the container's own activation profile (not measured for batches). To make one,
-  serve representative prompts with `-- --expert-stats capture.json` and blend it with `profile_blend.py` (below).
+  same prompt families, which is not shipped. Without one the server ranks experts by the container's own activation
+  profile (not measured for batches). To make one for your prompts: `calibrate.sh` ("Calibrate for your prompts"
+  below); portable profiles work on any copy of the same container; `--auto-profile DIR` keeps one across runs.
 - `--mirror`: a second copy of the checkpoint's `model-*.safetensors` on another drive, read for part of the misses
   (the measured arm had one; optional).
 - `--shared-head` (32): the shared-head floor (`RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD`). 32 is the pending default;
@@ -1065,6 +1065,45 @@ counts are taken times its whole-number weight. Weigh families by what will be s
 capture happens to hold, and keep the sealed profile in the mix: the prompts a profile was recorded on gain more
 than new prompts of the same kind. A capture must be pure decode steps (no mixed steps, no draft passes) of the
 same container; `write` refuses anything else and checks its result against the engine's parser rules.
+
+### Calibrate for your prompts (`calibrate.sh`), portable profiles, `--auto-profile`
+
+Profiles are portable: a profile with `"container": ""` and `device`, `inode`, `mtime_ns`, `ctime_ns` all 0 is
+accepted by `--expert-profile` on any machine whose container has the same size, metadata size and metadata-header
+sha256 (a byte-identical rebuild per RECIPE.md); model, arch, TP, geometry and counts are checked as before. The
+server logs `expert profile: portable (header sha256 ...)` (or `expert profile: strict (container ...)` for a profile
+bound to this machine's path and stat, which is checked exactly as before). `profile_blend.py write --portable` writes
+one, `profile_rebind.py strip` turns a strict one portable, and `bind` (optional now) binds one to your file.
+
+One command records a profile on your own prompts and blends it with a shipped one:
+
+```
+tools/ds41-host-experts/calibrate.sh --model /models/ds41.rad --silu-table silu_table_gfx1201.bin \
+    my-prompts.jsonl my.profile.json [--base shipped.profile.json] [--weight auto|W] [--max-tokens 128]
+tools/ds41-host-experts/serve-batch.sh --model /models/ds41.rad --silu-table silu_table_gfx1201.bin --profile my.profile.json
+```
+
+`my-prompts.jsonl` is `batch_client.py`'s format (`{"prompt", "system", "id", "max_tokens"}` a line). The script starts
+`serve-batch.sh --capture` (the same exact engine, 8 streams, batch admission at 256 rows without the split, the
+routing counts recorded; the window harness's capture arm `...-L9216-Pf-N8-C8-Ba256-...-Xst`, checked by
+`serve_batch_test.sh`), sends the prompts 8 at a time, stops the server with SIGINT (which writes the final counts),
+and writes a portable profile (`profile_blend.py write --portable --container MODEL`). It prints the decode tokens
+captured and warns under 2,000: send more prompts or longer replies. `--base` blends a sealed or portable profile of
+the same container (checked before the server starts); `--weight auto` (default) takes the capture's counts as many
+times as gives it the base's token count, an even blend. The replies, server log and raw capture stay in
+`OUT.calibrate/`. `--dry-run` prints the launch and the commands; `calibrate_test.sh` runs it end to end on a stub.
+
+`serve-batch.sh --auto-profile DIR` (off by default) keeps a profile for you: a portable
+`DIR/<16 hex of the header sha256>.profile.json` for this container, when there is one and no `--profile` is given,
+is the run's `--expert-profile`; every run records its counts and, after a clean stop (Ctrl-C or SIGTERM to the
+script), blends them in (previous x1 + this run x1; the previous kept as `.prev.json`), printing what it used and
+wrote. Batched serving (`Ba2048`, `Bs`) runs mixed steps, a prefill chunk and decode rows in one step; the engine's
+counts are one histogram a layer a step, counted on the card, so a mixed step's decode rows cannot be told from its
+prefill rows (splitting them would mean copying the decode rows' expert ids off the card each routed layer: not
+done). The auto mode folds mixed steps in approximately (`profile_blend.py --mixed-share`, `AUTO_PROFILE_MIXED_SHARE`,
+default 0.5): a mixed step's histogram scaled to half its decode rows, i.e. those rows taken to route like the step's
+average row. Placement only, so replies stay the base engine's whatever the profile; `calibrate.sh`'s capture runs
+pure decode steps and needs no approximation.
 
 ## The aux expert worker (a fifth card)
 

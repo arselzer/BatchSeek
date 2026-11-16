@@ -1822,6 +1822,13 @@ int Engine::plan() {
             RAD_ERR("--expert-profile '%s' refused: %s", cfg_.expert_profile.c_str(), reason.c_str());
             return profile_status;
         }
+        if (decode_profile.portable)
+            RAD_INFO("expert profile: portable (header sha256 %s, %llu file bytes, %llu metadata bytes)",
+                     identity.metadata_sha256.c_str(), (unsigned long long)identity.file_bytes,
+                     (unsigned long long)identity.metadata_bytes);
+        else
+            RAD_INFO("expert profile: strict (container %s, header sha256 %s)",
+                     identity.container.c_str(), identity.metadata_sha256.c_str());
         RAD_INFO("expert profile: phase=decode, %llu tokens, %zu global rows (%llu nonzero); "
                  "source metadata %s; placement ranking only, no weight/precision change",
                  (unsigned long long)decode_profile.decode_tokens, decode_profile.rows.size(),

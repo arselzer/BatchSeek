@@ -214,6 +214,13 @@
 # attention on (inexact), rank R" once at startup (any other arm only without it). Inexact as Qw: its replies are
 # reported "differ from reference: k of n (inexact arm, Aw)", never the reference, its Kh hashes left out, and with
 # Kld it scores against the window's reference (--kld-ref).
+# BpW: pack lookahead (RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD=W, 1-256; every other arm states 0): when the next
+# waiting prompt cannot join an open batch (its chunk past the rows left, or not the one it takes alone), the next W
+# waiting prompts are asked in order for one that can, under the same join rules; one that starts with the tokens
+# before a snapshot another entry of the step writes is not taken ahead. Step composition only: replies must be
+# identical to the arm without it. Needs Ba. Measured only if the server logs "pack lookahead: on (..._PACK_LOOKAHEAD=W)"
+# (any other arm only without it); every Ba arm's shutdown line "pack lookahead: N steps held an open batch, R rows of
+# M room ..." gives the batches' fill either way.
 # QxK: early ring copies (RADIANCE_EXPERIMENTAL_DS41_P1_EARLY=K, 1-64; ds41_p1.h kEarlyEnv; every other arm states 0):
 # behind each card-path layer's waves, up to K (at most the ring's slots) RAM-cache units of the pass's next card-path
 # layer, the profile's likeliest first, are copied into the ring before its routing counts, so the DMA lane works
@@ -1503,6 +1510,7 @@ Tb|${ARM_TB:-}|two-batch overlap \(RADIANCE_EXPERIMENTAL_SCHED_TBO=1\): a decode
 Ba${ARM_BA:-}|${ARM_BA:-}|batch admission: on \(RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=${ARM_BA:-[0-9]+}\)
 BaPc|${ARM_BAPC:-}|batch admission: beside the prefix cache \(--prefix-resume exact\)
 Bs|${ARM_BS:-}|batch split: on \(RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1\)
+Bp${ARM_BP:-}|${ARM_BP:-}|pack lookahead: on \(RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD=${ARM_BP:-[0-9]+}\)
 Ax${ARM_AX:-}|${ARM_AX:-}|$ax_on
 Axv|${ARM_AXV:-}|$axv_on
 AxS|${ARM_AXS:-}|aux experts: sharing: policy ${ARM_AXS:-[a-z]+}
@@ -2070,7 +2078,7 @@ EOF2
   fi
   # Ba: the steps that admitted whole prompts together (the scheduler's shutdown line). A Ba arm that
   # sent requests together (CK, K > 1) and batched no step did not do what its name says: set aside.
-  grep -E 'batch admission: ([0-9]+ steps admitted|[0-9]+ of those steps|beside the prefix cache, [0-9]+|outside the covered case|prefill-only steps closed by)|batch split: [0-9]+ joins|shared heads: [0-9]+ keep points set back' \
+  grep -E 'batch admission: ([0-9]+ steps admitted|[0-9]+ of those steps|beside the prefix cache, [0-9]+|outside the covered case|prefill-only steps closed by)|batch split: [0-9]+ joins|pack lookahead: [0-9]+ steps|shared heads: [0-9]+ keep points set back' \
     "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # Ba: a shared step's entry outside the covered case (a chunk not the one its prompt takes alone) must not
   # happen; an arm that counts one is set aside (with Pc, the snapshots and hits it batched are on its line).
@@ -3718,7 +3726,7 @@ for a in $ARMS; do
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$(arm_full "$a")"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
-  mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" sg="" pcn=""
+  mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" bp="" sg="" pcn=""
   p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qyp="" qyk="" qsp="" qt="" qw="" dt="" aw="" qz="" qx="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr="" ee=""
   ctp=""   # Ctp / CtpN: the prefill chain trace (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL)
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
@@ -3887,6 +3895,10 @@ for a in $ARMS; do
                if [[ $ba =~ ^[0-9]+$ ]] && (( 10#$ba >= 32 && 10#$ba <= 4096 )); then ba=$((10#$ba))
                else log "arm $a: $p: a batch holds 32-256 rows, or up to the Lc chunk (at most 4096) with P1; the arm is skipped"; skip=1; fi ;;
       Bs)      bsp=1 ;;                                                # batched steps take keep-point and running chunks (BATCH_SPLIT)
+      Bp[0-9]*)                                                        # a batch asks W waiting prompts past a refused one (PACK_LOOKAHEAD=W)
+               if [[ -n "$bp" ]]; then log "arm $a: duplicate Bp part; the arm is skipped"; skip=1
+               elif [[ ${p#Bp} =~ ^[0-9]+$ ]] && (( 10#${p#Bp} >= 1 && 10#${p#Bp} <= 256 )); then bp=$((10#${p#Bp}))
+               else log "arm $a: $p: Bp takes 1-256 (waiting prompts); the arm is skipped"; skip=1; fi ;;
       Tb)      tb=1 ;;                                                 # two-batch overlap of concurrent decode steps
       N[0-9]*) ARGS+=(--max-num-seqs "${p#N}"); nseq=${p#N} ;;        # this arm's --max-num-seqs (MAX_SEQS for every arm)
       C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
@@ -4215,6 +4227,12 @@ for a in $ARMS; do
   fi
   env+=(RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=${bsp:-0})
   ARM_BS=$bsp
+  # BpW: RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD=W (an open batch asks the next W waiting prompts past one it
+  # refused; claude/ds41-packing). Acts only with Ba; stated by every arm (0 off) and checked both ways by arm()'s
+  # "pack lookahead: on" row.
+  [[ -z "$bp" || -n "$ba" ]] || { log "arm $a: Bp needs a Ba part (batch admission); the arm is skipped"; skip=1; }
+  env+=(RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD=${bp:-0})
+  ARM_BP=$bp
   # Ss: the read-back runs in an arm only if its name says so, whatever the window's environment.
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=0)
   # Pi8 / Pi4, PkN, Pw, NsN, Pv: each acts only with what it changes (a predictor; Pi; Ei and the

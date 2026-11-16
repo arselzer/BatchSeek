@@ -10,7 +10,10 @@
 #      Ba4096 beside Lc4096 (M4096, Pci4096) with P1 is launched cold and beside Pc-Pce-Pcg16, Ba4096 above
 #      Lc2048 and Ba4096 at Lc4096 without P1 are skipped; Bs (RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT) beside
 #      Ba2048-Pc is launched with the switch 1 (every other arm 0), Bs without Ba or without Pc is skipped, and
-#      arm()'s Bs row matches the scheduler's "batch split: on" line for a Bs arm only;
+#      arm()'s Bs row matches the scheduler's "batch split: on" line for a Bs arm only; BpW
+#      (RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD) beside Ba2048-Pc-Bs is launched with W (every other arm 0),
+#      Bp without Ba, Bp0, Bp257 and Bp twice are skipped, and arm()'s Bp row matches "pack lookahead: on" for
+#      its W only;
 #   2. the startup-line guard arm() applies (its Ba and BaPc rows of the switch table): a Ba arm's pattern
 #      matches the scheduler's line for its N only, and an arm without the part flags any such line;
 #   3. the shutdown gate: an arm whose scheduler counts a batched prompt outside the covered case is set aside;
@@ -57,12 +60,17 @@ HIGH=$R4K-$N8-Ba4112-Pci4096
 BS=$R-L1024-Pf-N32-C32-Pmr8-Ba2048-Pc-Pch-Bs
 BSNOBA=$R-$N8-Pc-Bs
 BSNOPC=$R-$N8-Ba-Bs
+BP=$BS-Bp16
+BPNOBA=$R-$N8-Pc-Bp16
+BP0=$BS-Bp0
+BPHIGH=$BS-Bp257
+BPTWICE=$BS-Bp16-Bp8
 TWICE=$R-$N8-Ba-Ba128
 SH=$R-L1024-Pf-N32-C32-Pmr8-Pc-Pch
 SH128=$R-L1024-Pf-N32-C32-Pmr8-Ba2048-Pc-Pch128
 SHNOPC=$R-$N8-Pch
 SHLOW=$R-$N8-Pc-Pch8
-ARMS="$BASE $BA $BA128 $KLDOK $NOPF $NOLC $ONE $PC $PCN $BIG $BIGNOP1 $BIGLC $BIG4K $BIG4KPC $BIG4KLC $BIG4KNOP1 $BS $BSNOBA $BSNOPC $KLD $LOW $HIGH $TWICE $SH $SH128 $SHNOPC $SHLOW"
+ARMS="$BASE $BA $BA128 $KLDOK $NOPF $NOLC $ONE $PC $PCN $BIG $BIGNOP1 $BIGLC $BIG4K $BIG4KPC $BIG4KLC $BIG4KNOP1 $BS $BSNOBA $BSNOPC $BP $BPNOBA $BP0 $BPHIGH $BPTWICE $KLD $LOW $HIGH $TWICE $SH $SH128 $SHNOPC $SHLOW"
 (
   set +u
   log() { echo "LOG: $*"; }
@@ -172,6 +180,34 @@ else
     IFS='|' read -r part on pat <<< "$r"
     n=$(grep -cE "$pat" <<< "$bsline")
     if [[ "$n" == "$want" && "$on" == "$ARM_BS" ]]; then ok "guard: $what"; else bad "guard: $what (pattern '$pat', on '$on', $n matches)"; fi
+  done
+fi
+# Bp: W beside Ba2048-Pc-Bs, 0 in every other arm; skipped without Ba, outside 1-256 and twice
+sec=$(section "$BP")
+if [[ -z "$sec" ]]; then bad "Bp not launched: $(grep -m3 "arm $BP" "$T/loop.txt")"
+else
+  has "Bp16" "$sec" RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD 16
+  has "Bp16" "$sec" RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT 2048
+  has "Bp16" "$sec" RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT 1
+fi
+for a in "$BASE" "$BA" "$BIG" "$BS"; do
+  sec=$(section "$a"); [[ -n "$sec" ]] && has "no Bp part" "$sec" RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD 0
+done
+skipped "$BPNOBA" "Bp needs a Ba part" "Bp without Ba"
+skipped "$BP0" "Bp takes 1-256" "Bp0"
+skipped "$BPHIGH" "Bp takes 1-256" "Bp257"
+skipped "$BPTWICE" "duplicate Bp part" "Bp twice"
+row=$(grep -E '^Bp\$\{ARM_BP' "$W")
+if [[ -z "$row" ]]; then bad "no Bp row in arm()'s switch table"
+else
+  bpline() { echo "I pack lookahead: on (RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD=$1) -- when the next waiting prompt ..."; }
+  for spec in "16|16|1|a Bp16 arm's pattern matches its line" "16|8|0|a Bp16 arm's pattern does not match W 8" \
+              "|16|1|an arm without Bp flags the line"; do
+    IFS='|' read -r ARM_BP n want what <<< "$spec"
+    eval "r=\"$row\""
+    IFS='|' read -r part on pat <<< "$r"
+    m=$(bpline "$n" | grep -cE "$pat")
+    if [[ "$m" == "$want" && "$on" == "$ARM_BP" ]]; then ok "guard: $what"; else bad "guard: $what (pattern '$pat', on '$on', $m matches)"; fi
   done
 fi
 

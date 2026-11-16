@@ -22,6 +22,8 @@ bad() { echo "FAIL $*"; fail=1; }
 ARM=all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-mA-Qd64-Qa0-Pc-Pch32-Pcs128-L294912-Pf-N256-C256-Ba2048-Bs-Qy60-Qyp60-Qyk-Qsp-Qt-Qz-Ee-Dt-Xqprof
 ARMQW=${ARM%-Dt-Xqprof}-Qw-Dt-Xqprof; ARMQW=${ARMQW/-Qsp-Qt-Qz-/-Qsp-Qz-}   # with the WMMA P1 twin (Qw, inexact) in place of Qt: --fast-prefill 1
 ARMDA=${ARM%-Xqprof}-Aw-Xqprof   # with the WMMA attention (Aw, inexact) too: --fast-attn 1
+# The calibration run (serve-batch.sh --capture): 8 streams, Ba256 without Bs, routing counts (Xst), no profile.
+ARMCAP=${ARM/-L294912-Pf-N256-C256-Ba2048-Bs-/-L9216-Pf-N8-C8-Ba256-}; ARMCAP=${ARMCAP%-Xqprof}-Xnp-Xst
 mkdir -p "$T/home/kernels" "$T/mirror" "$T/profiles"; echo "{}" > "$T/profiles/prof.json"
 echo "not a library" > "$T/home/kernels/libr4d.so"
 echo '{}' > "$T/prompts.json"
@@ -50,7 +52,7 @@ LW=$(sed -n '/^launch_words() {/,/^}/p' "$W")
   eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
   eval "$(sed -n '/^ARM_PRESET_B2=/p;/^ARM_PRESET_B4=/p;/^arm_full() {/,/^}/p' "$W")"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
-  ARMS="$ARM $ARMQW $ARMDA"
+  ARMS="$ARM $ARMQW $ARMDA $ARMCAP"
   s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)
   e=$(awk -v s="$s" 'NR > s && /^done$/ { print NR; exit }' "$W")
   eval "$(sed -n "${s},${e}p" "$W")"
@@ -64,6 +66,10 @@ awk -v a="ARM $ARMQW" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt
 grep -q "^ARM $ARMDA$" "$T/loop.txt" && ok "the harness launches the Dt-Aw arm" ||
   { bad "the harness did not launch the Dt-Aw arm: $(grep -m3 -E "arm $ARMDA" "$T/loop.txt")"; }
 awk -v a="ARM $ARMDA" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt" > "$T/harness-da.txt"
+
+grep -q "^ARM $ARMCAP$" "$T/loop.txt" && ok "the harness launches the capture arm" ||
+  { bad "the harness did not launch the capture arm: $(grep -m3 -E "arm $ARMCAP" "$T/loop.txt")"; }
+awk -v a="ARM $ARMCAP" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt" > "$T/harness-cap.txt"
 
 RADIANCE_BIN=BIN "$SB" --model MODEL --silu-table SILU --profile "$T/profiles/prof.json" --mirror "$T/mirror" --dry-run > "$T/sb.txt" ||
   bad "serve-batch.sh --dry-run failed"
@@ -88,6 +94,18 @@ if python3 -I "$M" params "$T/harness-da.txt" > "$T/params-da.txt" && mapfile -t
    RADIANCE_BIN=BIN "$SB" "${P[@]}" --dry-run > "$T/sb4.txt" && python3 -I "$M" compare "$T/harness-da.txt" "$T/sb4.txt" > "$T/cmp4.txt"; then
   ok "the Dt-Aw arm: params give --fast-dense 1 --fast-attn 1, and serve-batch.sh with them: $(cat "$T/cmp4.txt")"
 else bad "the Dt-Aw arm's params: $(tr '\n' ' ' < "$T/params-da.txt") $(tr '\n' ';' < "$T/cmp4.txt" 2>/dev/null)"; fi
+
+# --capture against the capture arm: the same launch but for the stats file's path (the harness's xstats-<arm>.json).
+if grep -q -- '^--expert-stats$' "$T/harness-cap.txt" &&
+   RADIANCE_BIN=BIN "$SB" --model MODEL --silu-table SILU --mirror "$T/mirror" --capture "$T/cap.json" --dry-run > "$T/sb5.txt" &&
+   python3 -I "$M" compare "$T/harness-cap.txt" "$T/sb5.txt" --port --radiance-home --served-model-name --expert-stats > "$T/cmp5.txt"; then
+  ok "--capture against the capture arm (Ba256, no Bs, N8, Xst): $(cat "$T/cmp5.txt") (the stats path, port, home and name aside)"
+else bad "--capture against the capture arm: $(tr '\n' ';' < "$T/cmp5.txt" 2>/dev/null)"; fi
+dc=$("$SB" --model M --silu-table S --capture C.json --streams 4 --dry-run)
+[[ $dc == *"--max-num-seqs 4 "* && $dc == *"--expert-stats C.json"* ]] && ok "--capture with --streams 4: N4" || bad "--capture --streams"
+echo '{}' > "$T/exists.json"; echo model > "$T/model.rad"; echo silu > "$T/silu.bin"
+de=$("$SB" --model "$T/model.rad" --silu-table "$T/silu.bin" --capture "$T/exists.json" 2>&1) &&
+  bad "an existing --capture file accepted" || { [[ $de == *exists* ]] && ok "an existing --capture file refused" || bad "--capture refusal: $de"; }
 
 # ---- 2. the parameters
 d128=$("$SB" --model M --silu-table S --streams 128 --dry-run)

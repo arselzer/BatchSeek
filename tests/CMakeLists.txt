@@ -577,6 +577,13 @@ set_tests_properties(serve_batch_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RA
 # batch_client.py (the batch preset's client) against a stub server on the loopback.
 add_test(NAME batch_client_test COMMAND python3 -I ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/batch_client_test.py)
 set_tests_properties(batch_client_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+# profile_blend.py (placement profiles: blends, portable output, --container sealing, mixed steps) on synthetic records.
+add_test(NAME profile_blend_test COMMAND python3 -I ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/profile_blend_test.py)
+set_tests_properties(profile_blend_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+# calibrate.sh and serve-batch.sh --auto-profile end to end against a stub server on the loopback. No card, no model.
+add_test(NAME calibrate_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/calibrate_test.sh)
+set_tests_properties(calibrate_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 # ab_window.sh's long-context prompt sets (receipts with max_context_tokens: the context gate and the request
 # timeout), the --hashes-ref step and the lsparse card check's wiring, all with every action stubbed.
 add_test(NAME ab_window_longctx_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_longctx_test.sh)
