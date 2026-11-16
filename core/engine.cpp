@@ -2220,6 +2220,10 @@ void Engine::post_stop_report() {
  * A request that cannot wait for a shrink takes the blocks at once through a callback into every
  * slab (KVManager::set_reclaim, installed in start()). */
 void Engine::loan_tick(bool idle) {
+    if (kv_lend_) {   /* ..._KV_LEND: the P1 lender's KV slots (engine_bringup.cpp kv_lend_tick) */
+        kv_lend_tick();
+        return;
+    }
     if (!lending_) return;
     const uint64_t now = rad_mono_ns();
     if (now - loan_last_ns_ < 100000000ull) return;    /* 100 ms */

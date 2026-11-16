@@ -24,6 +24,7 @@ ARMQW=${ARM%-Dt-Xqprof}-Qw-Dt-Xqprof; ARMQW=${ARMQW/-Qsp-Qt-Qz-/-Qsp-Qz-}   # wi
 ARMDA=${ARM%-Xqprof}-Aw-Xqprof   # with the WMMA attention (Aw, inexact) too: --fast-attn 1
 # The calibration run (serve-batch.sh --capture): 8 streams, Ba256 without Bs, routing counts (Xst), no profile.
 ARMCAP=${ARM/-L294912-Pf-N256-C256-Ba2048-Bs-/-L9216-Pf-N8-C8-Ba256-}; ARMCAP=${ARMCAP%-Xqprof}-Xnp-Xst
+ARMVL=${ARM%-Xqprof}-Qes-Kvl-mS16-Xqprof; ARMVL=${ARMVL/-L294912-/-Lk452-}   # VRAMLEND: --arena-split 1 --kv-lend 1 --ram-per-seq-mib 16, an Lk pool
 mkdir -p "$T/home/kernels" "$T/mirror" "$T/profiles"; echo "{}" > "$T/profiles/prof.json"
 echo "not a library" > "$T/home/kernels/libr4d.so"
 echo '{}' > "$T/prompts.json"
@@ -52,7 +53,7 @@ LW=$(sed -n '/^launch_words() {/,/^}/p' "$W")
   eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
   eval "$(sed -n '/^ARM_PRESET_B2=/p;/^ARM_PRESET_B4=/p;/^arm_full() {/,/^}/p' "$W")"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
-  ARMS="$ARM $ARMQW $ARMDA $ARMCAP"
+  ARMS="$ARM $ARMQW $ARMDA $ARMCAP $ARMVL"
   s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)
   e=$(awk -v s="$s" 'NR > s && /^done$/ { print NR; exit }' "$W")
   eval "$(sed -n "${s},${e}p" "$W")"
@@ -70,6 +71,19 @@ awk -v a="ARM $ARMDA" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt
 grep -q "^ARM $ARMCAP$" "$T/loop.txt" && ok "the harness launches the capture arm" ||
   { bad "the harness did not launch the capture arm: $(grep -m3 -E "arm $ARMCAP" "$T/loop.txt")"; }
 awk -v a="ARM $ARMCAP" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt" > "$T/harness-cap.txt"
+awk -v a="ARM $ARMVL" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt" > "$T/harness-vl.txt"
+if [[ -s "$T/harness-vl.txt" ]] && python3 -I "$HERE/serve_batch_match.py" params "$T/harness-vl.txt" > "$T/params-vl.txt" &&
+   mapfile -t P < "$T/params-vl.txt" &&
+   [[ " ${P[*]} " == *" --arena-split 1 "* && " ${P[*]} " == *" --kv-lend 1 "* && " ${P[*]} " == *" --ram-per-seq-mib 16 "* && " ${P[*]} " == *" --ctx-per-stream 576 "* ]] &&
+   RADIANCE_BIN=BIN "$SB" "${P[@]}" --dry-run > "$T/sb-vl.txt" && python3 -I "$HERE/serve_batch_match.py" compare "$T/harness-vl.txt" "$T/sb-vl.txt" > "$T/cmp-vl.txt"; then
+  ok "the Qes-Kvl-mS16-Lk452 arm: params give --arena-split 1 --kv-lend 1 --ram-per-seq-mib 16 --ctx-per-stream 576, and serve-batch.sh with them: $(cat "$T/cmp-vl.txt")"
+else bad "the VRAMLEND arm: $(grep -m2 "arm $ARMVL" "$T/loop.txt") $(tr '\n' ' ' < "$T/params-vl.txt" 2>/dev/null) $(tr '\n' ';' < "$T/cmp-vl.txt" 2>/dev/null)"; fi
+dv=$("$SB" --model M --silu-table S --dry-run)
+grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_KV_LEND=0' <<< "$dv" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT=0' <<< "$dv" &&
+  grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_RAM_PER_SEQ_MIB=' <<< "$dv" && [[ $dv == *"--max-model-len 294912 "* ]] &&
+  ok "--kv-lend, --arena-split off and no per-sequence term by default; the pool streams x 1152" || bad "the VRAMLEND defaults"
+"$SB" --model M --silu-table S --kv-lend 2 --dry-run > /dev/null 2>&1 && bad "--kv-lend 2 accepted" || ok "--kv-lend 2 refused"
+"$SB" --model M --silu-table S --kv-auto 8 --dry-run > /dev/null 2>&1 && bad "--kv-auto 8 accepted" || ok "--kv-auto under 16 refused"
 
 RADIANCE_BIN=BIN "$SB" --model MODEL --silu-table SILU --profile "$T/profiles/prof.json" --mirror "$T/mirror" --dry-run > "$T/sb.txt" ||
   bad "serve-batch.sh --dry-run failed"

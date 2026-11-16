@@ -766,11 +766,16 @@ bool FileStager::begin_pass(const RadBatch* b) {
      * back as well (its buffers reach the arena's top), its ops behind any reload copy still queued. */
     p1_lend_took_ = false;
     if (p1_on() && p1_->lending()) {
-        p1_lend_took_ = p1_arms || (p1_arena_full_ && p1_arena_full_());
+        /* ..._P1_LEND_ARENA_SPLIT: the lender takes the arena's slots back only at the full plan (its third
+         * argument; without the split it takes every slot with p1_lend_took_, as before). */
+        const bool full = p1_arena_full_ && p1_arena_full_();
+        p1_lend_took_ = p1_arms || full;
         /* ..._P1_LEND_AUDIT: a resident withdrawn at this pass's begin is read back behind the end of the
          * pass before, the residents' last reader. */
         if (p1_tun_.lend_audit) p1_->lend_audit_behind(p1_lend_rec_ ? p1_lend_ev_ : nullptr);
-        (void)p1_->lender().begin_pass(p1_lend_took_, p1_now_ms());
+        /* ..._KV_LEND: the KV pool's slots follow the cache's loan before anything of this pass is issued. */
+        if (!p1_kv_need_.empty()) p1_kv_sync();
+        (void)p1_->lender().begin_pass(p1_lend_took_, p1_now_ms(), full);
         /* The lent slots' heat (..._P1_LEND_HEAT): the policy's turn, here only (residency changes before
          * the weight tables are brought up to date), with the heat counted through the pass before this
          * one; then this pass's rows age it, if it is one that counts. */
@@ -4869,6 +4874,12 @@ int FileStager::end_pass(RadStream s) {
             if (r < 0 && p1_rc >= 0) p1_rc = r;
         }
         p1_lend_took_ = false;
+        /* ..._KV_LEND: every pass's end, behind which a slot the loan covers again reloads (p1_kv_sync). */
+        if (p1_kv_ev_ && !p1_kv_need_.empty()) {
+            const int r = s ? rad_event_record(p1_kv_ev_, s) : RAD_E_STATE;
+            p1_kv_rec_ = r >= 0;
+            if (r < 0 && p1_rc >= 0) p1_rc = r;
+        }
     }
     if (p1_armed_) {
         p1_armed_ = false;
@@ -5076,6 +5087,9 @@ int FileStager::p1_init(const Program& prog) {
         return refuse(fmt("%s=%d calibrates the hybrid split, and neither %s nor %s is on", ds41p1::kHybridCalEnv,
                           t.hybrid_cal, ds41p1::kHybridEnv, ds41p1::kHybridPrefillEnv));
     }
+    if (t.lend_arena_split && t.lend_arena <= 0)
+        return refuse(fmt("%s=1 gives the lent arena's slots a take-back of their own, and none is lent (%s)",
+                          ds41p1::kLendArenaSplitEnv, ds41p1::kLendArenaEnv));
     if (t.lend_audit && t.lend <= 0 && t.lend_arena <= 0 && t.lend_slab <= 0)
         return refuse(fmt("%s=1 reads lent slots back, and none is lent (%s, %s or %s)", ds41p1::kLendAuditEnv,
                           ds41p1::kLendEnv, ds41p1::kLendArenaEnv, ds41p1::kLendSlabEnv));
@@ -5387,9 +5401,27 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
                        t.lend_arena, cand.size(), std::max(k, 0));
         return RAD_E_INVAL;
     }
-    /* The lent slots' units in the lender's order: the ring's, the arena's, the slab's. */
-    const int nk = std::max(k, 0), nra = nk + std::max(ka, 0), ns = (int)slab_units.size(), n = nra + ns;
-    std::vector<int32_t> lent(cand.begin(), cand.begin() + nra);
+    /* The KV pool's lent slots (p1_kv_set): the next hottest units after the arena's, as many as are left and the
+     * lender holds (the slots come ordered by their covering loan, so the hottest go where the loan reaches first). */
+    const int nra0 = std::max(k, 0) + std::max(ka, 0);
+    const int nkv = p1_kv_at_.empty() ? 0
+        : std::max(0, std::min({ (int)p1_kv_at_.size(), (int)cand.size() - nra0, 2 * ds41p1::kMaxLend - nra0 }));
+    if (!p1_kv_at_.empty() && nkv <= 0) {
+        if (why) *why = fmt("%s=1: no file-tier unit left for the KV pool's %zu slots, or the lender is full", ds41p1::kKvLendEnv,
+                            p1_kv_at_.size());
+        return RAD_E_INVAL;
+    }
+    p1_kv_at_.resize((size_t)nkv);
+    p1_kv_need_.resize((size_t)nkv);
+    if (nkv > 0 && !p1_kv_ev_ && rad_event_create_local(&p1_kv_ev_) < 0) {
+        p1_kv_ev_ = nullptr;
+        if (why) *why = "could not create the KV pool's lent slots' event";
+        return RAD_E_DEVICE;
+    }
+    p1_kv_rec_ = false;
+    /* The lent slots' units in the lender's order: the ring's, the arena's, the KV pool's, the slab's. */
+    const int nk = std::max(k, 0), nra = nk + std::max(ka, 0), ns = (int)slab_units.size(), n = nra + nkv + ns;
+    std::vector<int32_t> lent(cand.begin(), cand.begin() + nra + nkv);
     lent.insert(lent.end(), slab_units.begin(), slab_units.end());
     std::vector<p1::CardExpertPath::LendUnit> units((size_t)n);
     for (int i = 0; i < n; ++i) {
@@ -5434,7 +5466,7 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
                 prior_rows_lendable += heat->heat(u);
             }
     }
-    RAD_TRY(p1_->lend_init(units, slots, at, slab_at, t.grace_ms, t.lend_audit, why));
+    RAD_TRY(p1_->lend_init(units, slots, at, slab_at, t.grace_ms, t.lend_audit, why, p1_kv_at_));
     /* The rest after a long prefill (..._P1_LEND_REST_MS; by default with the heat or the slab only). */
     p1_->lend_set_rest(t.lend_rest_ms);
     if (plan_->rank == 0 && t.lend_rest_ms > 0)
@@ -5509,6 +5541,13 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
                  ds41p1::kLogLendArena, ka, ds41p1::kLendArenaEnv, t.lend_arena, arena.size(),
                  (long long)p1_arena_rows_, ka, share, (long long)p1_arena_rows_, t.grace_ms, ds41p1::kGraceEnv);
     }
+    if (plan_->rank == 0 && !at.empty() && t.lend_arena_split)
+        RAD_INFO("%s: on (%s=1): the %d arena slots are taken back only by a step at the full plan (above %lld "
+                 "tokens), the only step whose buffers reach them; a card-path pass below it (an armed decode pass "
+                 "among them) takes the ring's %d slots alone and leaves the arena's residents published, as the "
+                 "slab's; the arena's slots return %d ms after the last full step, and in a pass that takes the ring "
+                 "an arena slot's reload begins only from the RAM cache; counts in the shutdown stats line",
+                 ds41p1::kLogLendArenaSplit, ds41p1::kLendArenaSplitEnv, ka, (long long)p1_arena_rows_, nk, t.grace_ms);
     if (plan_->rank == 0 && p1_heat_) {
         /* What the heat starts from: the prior's rows and where its shares came from, or none. */
         const std::string prior =
@@ -5591,6 +5630,52 @@ void FileStager::p1_heat_policy() {
     const bool fence_ready = p1_lend_ev_ && p1_lend_rec_ && p1_lend_rec_pass_ + 1 == p1_lend_pass_;
     (void)p1::heat_turn(p1_->lender(), *p1_heat_, p1_lend_took_, bank_track_, fence_ready, p1_heat_cand_, p1_lent_,
                         owner);
+}
+
+/* ..._KV_LEND, at a pass's begin on the issuing thread, before the lender's begin_pass and the pass's first op:
+ * the cache's target loan (the scheduler lowered it before it handed out any block above it, and this pass is the
+ * first that can write such a block) withdraws every slot it no longer covers, a queued copy fenced on the compute
+ * stream; then, only behind the end of the pass before (the last that could have read or written a block the loan
+ * covers again), the DMA lane waits on that end and the slots the target covers become available. */
+void FileStager::p1_kv_sync() {
+    p1::CardExpertPath& path = *p1_;
+    const int first = path.lend_kv_first(), nkv = path.lend_kv_slots();
+    if (first < 0 || nkv <= 0 || !p1_kv_target_) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    p1::RingLender& l = path.lender();
+    p1::CardExpertPath::Counts& c = path.counts_mut();
+    const int64_t target = std::max<int64_t>(p1_kv_target_(), 0);
+    c.kv_target_max = std::max<uint64_t>(c.kv_target_max, (uint64_t)target);
+    bool grow = false, shrank = false;
+    for (int i = 0; i < nkv && (size_t)i < p1_kv_need_.size(); ++i) {
+        const int k = first + i;
+        const bool covered = p1_kv_need_[(size_t)i] <= target;
+        if (!covered && l.avail(k)) {
+            (void)l.set_avail(k, false);
+            ++c.kv_withdrawn;
+            shrank = true;
+        } else if (covered && !l.avail(k)) {
+            grow = true;
+        }
+    }
+    if (shrank) ++c.kv_reclaims;
+    if (grow && p1_kv_rec_ && p1_kv_ev_ && mover_->mover_wait(p1_kv_ev_) >= 0)
+        for (int i = 0; i < nkv && (size_t)i < p1_kv_need_.size(); ++i) {
+            const int k = first + i;
+            if (p1_kv_need_[(size_t)i] <= target && !l.avail(k)) {
+                (void)l.set_avail(k, true);
+                ++c.kv_given;
+            }
+        }
+    int avail = 0;
+    for (int i = 0; i < nkv; ++i) avail += l.avail(first + i);
+    c.kv_avail_peak = std::max<uint64_t>(c.kv_avail_peak, (uint64_t)avail);
+    int res = 0;
+    for (int i = 0; i < nkv; ++i) res += l.resident(first + i);
+    c.kv_res_peak = std::max<uint64_t>(c.kv_res_peak, (uint64_t)res);
+    c.kv_res_sum += (uint64_t)res;
+    ++c.kv_passes;
+    c.kv_sync_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 
 /* The lent arena: the engine bound the arena's smallest level (steps of up to `rows` tokens) and hands

@@ -100,6 +100,13 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         return false;
     }
     r.lend_audit = as == 1;
+    const char* split = get(ds41p1::kLendArenaSplitEnv);
+    const int sps = ds41p1::env_state(split);
+    if (sps < 0) {
+        if (why) *why = std::string(ds41p1::kLendArenaSplitEnv) + "=" + split + ": 1 is on, 0 / unset / empty off";
+        return false;
+    }
+    r.lend_arena_split = sps == 1;
     const char* ha = get(ds41p1::kHybridAdaptEnv);
     const int hs = ha && *ha ? ds41p1::env_state(ha) : 1;
     if (hs < 0) {
@@ -660,12 +667,98 @@ int RingLender::init(LendHost* host, int n, int64_t grace_ms, int keep) {
     last_p1_ = 0;
     rest_ = now_ = 0;
     p1_now_ = held_ = false;
-    lent_ = true;
+    for (int g = 0; g < 3; ++g) {
+        lent_g_[g] = g < 2;
+        any_g_[g] = took_g_[g] = false;
+        last_g_[g] = 0;
+    }
+    arena_ = -1;
+    has_kv_ = false;
     any_p1_ = false;
     audit_ = false;
     stopped_ = false;
     st_ = Stats{};
     return 0;
+}
+
+int RingLender::set_arena(int first) {
+    /* Before the first pass only: every slot that is not kept still lent out as init left it. */
+    if (!host_ || arena_ >= 0 || first < 0 || first >= n() - keep_ || any_p1_ || !lent_g_[0] || st_.returns)
+        return -1;
+    arena_ = first;
+    for (int k = first; k < n() - keep_; ++k)
+        if (slot_[(size_t)k].grp != 2) slot_[(size_t)k].grp = 1;
+    lent_g_[1] = true;
+    any_g_[1] = took_g_[1] = false;
+    last_g_[1] = 0;
+    return 0;
+}
+
+int RingLender::set_avail(int k, bool on) {
+    if (!host_ || k < 0 || k >= n() || slot_[(size_t)k].keep) return -1;
+    Slot& s = slot_[(size_t)k];
+    if (on) {
+        if (s.avail) return 0;
+        s.avail = true;
+        /* Back to wanting its unit once its group is back too; a pass's pump begins the load. */
+        if (!lent_g_[s.grp] && (s.st == St::Idle || s.st == St::Failed)) s.st = St::Want;
+        return 0;
+    }
+    if (!s.avail) return 0;
+    s.avail = false;
+    int withdrawn = 0;
+    switch (s.st) {
+    case St::Resident: {
+        const bool bad = audit_ && !audit_ok(k, false);
+        host_->publish(k, false);
+        ++st_.withdrawn;
+        withdrawn = 1;
+        if (bad) lose(k);
+        else s.st = St::Idle;
+        break;
+    }
+    case St::Lost:
+        break;
+    case St::Landed:
+        host_->drop(k);
+        ++st_.cancelled;
+        s.st = St::Idle;
+        break;
+    case St::Copying:
+        host_->fence(k);   /* the owner's writes into the slot wait for the copy */
+        s.cancel = true;
+        break;
+    case St::Reading:
+        s.cancel = true;
+        break;
+    default:
+        s.st = St::Idle;
+        break;
+    }
+    poll();
+    return withdrawn;
+}
+
+int RingLender::set_kv(int first, int count) {
+    if (!host_ || has_kv_ || first < 0 || count < 1 || first + count > n() - keep_ || any_p1_ || st_.returns) return -1;
+    for (int k = first; k < first + count; ++k) {
+        Slot& s = slot_[(size_t)k];
+        s.grp = 2;
+        s.avail = false;   /* nothing is lent until the owner says so */
+        s.st = St::Idle;
+    }
+    has_kv_ = true;
+    return 0;
+}
+
+void RingLender::give_back(int g) {
+    lent_g_[g] = false;
+    ++st_.returns;
+    /* A kept slot's failed load is retried at the return that leaves no group lent out (without the split: every
+     * return, as before). */
+    const bool kept_too = !lent();
+    for (Slot& s : slot_)
+        if ((s.keep ? kept_too : s.grp == g && s.avail) && (s.st == St::Idle || s.st == St::Failed)) s.st = St::Want;
 }
 
 bool RingLender::audit_ok(int k, bool publish) {
@@ -784,19 +877,24 @@ void RingLender::hold(bool on) {
 
 /* Loads for the slots that want one, as far as the host has buffers; in the rest only those the RAM
  * cache gives. */
-void RingLender::pump() {
+void RingLender::pump(Pump which) {
     const bool rest = resting();
     hold(rest);
+    const bool spared = which == Pump::Spared;
+    const bool ram = rest || spared;
     bool waited = false;
     for (int k = 0; k < n(); ++k) {
         Slot& s = slot_[(size_t)k];
-        if (s.st != St::Want) continue;
-        const int r = rest ? host_->load_ram(k) : host_->load(k);
+        if (s.st != St::Want || !s.avail) continue;
+        if (spared && (s.keep || took_g_[s.grp] || lent_g_[s.grp])) continue;
+        if (which == Pump::Back && (s.keep || lent_g_[s.grp])) continue;
+        const int r = ram ? host_->load_ram(k) : host_->load(k);
         if (r == 0) {
             waited = waited || rest;
             continue;
         }
         if (r > 0 && rest) ++st_.rest_ram;
+        if (r > 0 && spared) ++st_.arena_p1_loads;
         if (r < 0) {
             s.st = St::Failed;
             ++st_.failed;
@@ -808,17 +906,24 @@ void RingLender::pump() {
     if (waited) ++st_.rested;
 }
 
-int RingLender::begin_pass(bool p1, int64_t now_ms) {
+int RingLender::begin_pass(bool p1, int64_t now_ms, bool arena) {
     if (!host_) return 0;
     now_ = now_ms;
-    if (p1) {
+    /* The groups this pass takes back. Without the split every slot that is not kept is the ring's, and p1 takes
+     * them; with it the arena's go only with `arena` (a step at the full plan, which takes the ring's as well). */
+    const int ng = arena_ >= 0 ? 2 : 1;
+    const bool take[2] = { p1 || (ng == 2 && arena), ng == 2 && arena };
+    took_g_[0] = take[0];
+    took_g_[1] = take[1];
+    if (take[0] || take[1]) {
         /* The rest: from here on, no drive read of the lender's begins until it is over. */
         p1_now_ = true;
         hold(true);
         int withdrawn = 0;
         for (int k = 0; k < n(); ++k) {
             Slot& s = slot_[(size_t)k];
-            if (s.keep) continue;   /* the slab's: no pass writes there, its resident stays */
+            if (s.keep) continue;              /* the slab's: no pass writes there, its resident stays */
+            if (!take[s.grp]) continue;        /* the arena's, in a pass below the full plan: nothing writes there */
             switch (s.st) {
             case St::Resident: {
                 /* The audit: read back before the pass that takes the slot issues anything. */
@@ -848,29 +953,50 @@ int RingLender::begin_pass(bool p1, int64_t now_ms) {
                 break;
             }
         }
-        if (!lent_) ++st_.lends;
+        bool newly = false;
+        for (int g = 0; g < ng; ++g) {
+            if (!take[g]) continue;
+            newly = newly || !lent_g_[g];
+            lent_g_[g] = true;
+            any_g_[g] = true;
+            last_g_[g] = now_ms;
+        }
+        if (newly) ++st_.lends;
         st_.withdrawn += (uint64_t)withdrawn;
-        lent_ = true;
         any_p1_ = true;
         last_p1_ = now_ms;
+        if (ng == 2 && !take[1]) {
+            /* The split: the ring's slots taken, the arena's left as they are. Their group returns after its own
+             * grace (from the last full step), and a slot of it that wants its unit begins a load from the RAM
+             * cache only: the card path has the drive to itself. Landed loads are copied and passed copies
+             * published as in any other pass; nothing of this pass writes the arena's top. */
+            ++st_.arena_spared;
+            for (int k = 0; k < n(); ++k) st_.arena_spared_res += arena_slot(k) && slot_[(size_t)k].st == St::Resident;
+            if (lent_g_[1]) {
+                if (any_g_[1] && now_ms - last_g_[1] < grace_) ++st_.held_back;
+                else give_back(1);
+            }
+        }
         poll();   /* overtaken loads and copies that have ended give their buffers back */
+        /* The groups this pass left (the split's arena, the KV pool's slots): RAM-cache loads only. Nothing without
+         * the split and the KV slots, as before. */
+        if (has_kv_ || (ng == 2 && !take[1])) pump(Pump::Spared);
         return withdrawn ? 1 : 0;
     }
     p1_now_ = false;
     hold(resting());
-    if (lent_) {
-        if (any_p1_ && now_ms - last_p1_ < grace_) {
-            ++st_.held_back;
-            poll();
-            return 0;
-        }
-        lent_ = false;
-        ++st_.returns;
-        for (Slot& s : slot_)
-            if (s.st == St::Idle || s.st == St::Failed) s.st = St::Want;
+    bool held_back = false;
+    for (int g = 0; g < ng; ++g) {
+        if (!lent_g_[g]) continue;
+        if (any_g_[g] && now_ms - last_g_[g] < grace_) held_back = true;
+        else give_back(g);
     }
+    if (held_back) ++st_.held_back;
     poll();
-    pump();
+    /* Without the split: no load while the grace runs (as before). With it, the group back loads; the kept slots
+     * wait until neither is lent out. */
+    if (!lent()) pump();
+    else if (has_kv_ || (ng == 2 && (!lent_g_[0] || !lent_g_[1]))) pump(Pump::Back);
     return 0;
 }
 
@@ -879,6 +1005,16 @@ void RingLender::end_p1(int64_t now_ms) {
     last_p1_ = now_ms;
     now_ = now_ms;
     p1_now_ = false;
+    /* The grace runs from here for the groups the pass took (without the split: the ring's, always). */
+    const int ng = arena_ >= 0 ? 2 : 1;
+    const bool none = !took_g_[0] && !took_g_[1];
+    for (int g = 0; g < ng; ++g) {
+        if (ng == 1 || none || took_g_[g]) {
+            any_g_[g] = true;
+            last_g_[g] = now_ms;
+        }
+        took_g_[g] = false;
+    }
 }
 
 int RingLender::prime() {
@@ -893,7 +1029,7 @@ int RingLender::prime() {
 
 /* ---- the lent slots' heat ---------------------------------------------------------------------------------- */
 bool RingLender::settled() const {
-    if (!host_ || lent_) return false;
+    if (!host_ || lent()) return false;
     for (const Slot& s : slot_)
         if (s.st != St::Resident || s.cancel) return false;
     return true;
@@ -905,7 +1041,7 @@ int RingLender::retarget(const int* ks, int n) {
         decline(Decline::Audit);
         return 0;
     }
-    if (lent_) {
+    if (lent()) {
         decline(Decline::Lent);
         return 0;
     }
@@ -1595,12 +1731,17 @@ int CardExpertPath::end_pass(RadStream s, RadEvent end) {
 /* ---- the lent ring's host ---------------------------------------------------------------------------- */
 int CardExpertPath::lend_init(const std::vector<LendUnit>& units, const std::vector<int>& ring_slots,
                               const std::vector<char*>& arena_slots, const std::vector<char*>& slab_slots,
-                              int64_t grace_ms, bool audit, std::string* why) {
+                              int64_t grace_ms, bool audit, std::string* why, const std::vector<char*>& kv_slots) {
     auto no = [&](const std::string& w) { if (why) *why = w; return RAD_E_INVAL; };
     if (!on_ || lending()) return no("the card path is not on, or lends already");
-    const int n = (int)units.size(), nr = (int)ring_slots.size(), na = (int)arena_slots.size();
-    const int ns = (int)slab_slots.size();
-    if (n < 1 || nr > ds41p1::kMaxLend || na > ds41p1::kMaxLend || ns > ds41p1::kMaxLendSlab || nr + na + ns != n)
+    const int n = (int)units.size(), nr = (int)ring_slots.size(), na0 = (int)arena_slots.size();
+    const int ns = (int)slab_slots.size(), nkv = (int)kv_slots.size();
+    /* The KV pool's slots follow the arena's: below, `na` counts both (every non-ring, non-slab slot). */
+    const int na = na0 + nkv;
+    std::vector<char*> arena_all(arena_slots);
+    arena_all.insert(arena_all.end(), kv_slots.begin(), kv_slots.end());
+    if (n < 1 || nr > ds41p1::kMaxLend || na0 > ds41p1::kMaxLend || nr + na > 2 * ds41p1::kMaxLend ||
+        ns > ds41p1::kMaxLendSlab || nr + na + ns != n)
         return no("a lent ring of " + std::to_string(nr) + " slots, " + std::to_string(na) + " arena slots and " +
                   std::to_string(ns) + " slab slots for " + std::to_string(n) + " units");
     std::vector<uint8_t> used((size_t)st_.n_slots(), 0);
@@ -1613,7 +1754,7 @@ int CardExpertPath::lend_init(const std::vector<LendUnit>& units, const std::vec
         } else {
             /* An arena or slab slot: aligned, and clear of the ring and of every other lent slot. */
             const bool slab = k >= nr + na;
-            char* const a = slab ? slab_slots[(size_t)(k - nr - na)] : arena_slots[(size_t)(k - nr)];
+            char* const a = slab ? slab_slots[(size_t)(k - nr - na)] : arena_all[(size_t)(k - nr)];
             const char* const ring_end = ring_ + (int64_t)st_.n_slots() * ds41p1::kSlotBytes;
             bool clear = a && ((uintptr_t)a & 4095) == 0 && (a + ds41p1::kSlotBytes <= ring_ || a >= ring_end);
             for (int j = nr; clear && j < k; ++j)
@@ -1649,6 +1790,17 @@ int CardExpertPath::lend_init(const std::vector<LendUnit>& units, const std::vec
         lbuf_free_.push_back(b);
     }
     if (lend_.init(this, n, grace_ms, ns) < 0) return no("the lent ring's state");
+    /* The arena split (ds41p1::kLendArenaSplitEnv): the arena's slots, after the ring's, taken back only by a step
+     * at the full plan. Without arena slots it has nothing to act on (refused by the caller). */
+    if (t_.lend_arena_split && na0 > 0 && lend_.set_arena(nr) < 0) return no("the lent arena's split");
+    /* The KV pool's lent slots (ds41p1 kKvLendEnv): a group of their own, unavailable until the cache lends. */
+    lkv_first_ = -1;
+    lkv_n_ = 0;
+    if (nkv > 0) {
+        if (lend_.set_kv(nr + na0, nkv) < 0) return no("the KV pool's lent slots");
+        lkv_first_ = nr + na0;
+        lkv_n_ = nkv;
+    }
     /* The read-back audit: a pinned slot of host memory the card's copies are read into, and its event. */
     if (audit) {
         laud_buf_ = (uint8_t*)rad_dev_alloc(ds41p1::kSlotBytes, RAD_MEM_HOST_PINNED);
@@ -2078,6 +2230,23 @@ void CardExpertPath::retarget(int k) {
         }
 }
 
+std::vector<KvSlot> kv_stripe_slots(char* base, int64_t n_blocks, int64_t lbpb, int64_t block_size) {
+    std::vector<KvSlot> out;
+    if (!base || n_blocks <= 0 || lbpb <= 0 || block_size <= 0) return out;
+    const int64_t S = ds41p1::kSlotBytes;
+    char* const top = base + n_blocks * lbpb;
+    char* hi = top;
+    while (hi - base >= S) {
+        char* const lo = (char*)((uintptr_t)(hi - S) & ~(uintptr_t)4095);
+        if (lo < base) break;
+        const int64_t blocks = ((int64_t)(top - lo) + lbpb - 1) / lbpb;
+        if (blocks >= n_blocks) break;   /* the cache keeps at least one block below every slot */
+        out.push_back({ lo, blocks * block_size });
+        hi = lo;
+    }
+    return out;
+}
+
 std::vector<char*> arena_slots(char* lo, int64_t bytes, int max) {
     std::vector<char*> out;
     if (!lo || bytes <= 0 || max <= 0) return out;
@@ -2339,6 +2508,29 @@ std::string CardExpertPath::stats_line(int rank) const {
                       c_.lend_ram_packed ? (double)c_.lend_ram_packed_ns * 1e-6 / (double)c_.lend_ram_packed : 0.0,
                       c_.lend_drive, l.rested, l.rest_ram);
         line += buf;
+        if (lend_.arena_first() >= 0) {
+            std::snprintf(buf, sizeof buf,
+                          "; lent arena split: %" PRIu64 " passes took the ring's slots and left the arena's (%" PRIu64
+                          " arena residents through them), %" PRIu64 " arena loads begun in them from the RAM cache, the arena %s now",
+                          l.arena_spared, l.arena_spared_res, l.arena_p1_loads, lend_.arena_lent() ? "lent out" : "resident");
+            line += buf;
+        }
+        if (lkv_n_ > 0) {
+            int avail = 0, res = 0;
+            for (int i = 0; i < lkv_n_; ++i) {
+                avail += lend_.avail(lkv_first_ + i);
+                res += lend_.resident(lkv_first_ + i);
+            }
+            std::snprintf(buf, sizeof buf,
+                          "; lent KV: %d slots, %d available and %d resident now, peak %" PRIu64 " available and %" PRIu64
+                          " resident (%.1f resident a pass), %" PRIu64 " made available, %" PRIu64 " withdrawn in %" PRIu64
+                          " reclaims, largest loan %" PRIu64 " tokens, %.3f ms a pass in the sync",
+                          lkv_n_, avail, res, c_.kv_avail_peak, c_.kv_res_peak,
+                          c_.kv_passes ? (double)c_.kv_res_sum / (double)c_.kv_passes : 0.0, c_.kv_given, c_.kv_withdrawn,
+                          c_.kv_reclaims, c_.kv_target_max,
+                          c_.kv_passes ? (double)c_.kv_sync_ns * 1e-6 / (double)c_.kv_passes : 0.0);
+            line += buf;
+        }
         if (lend_.kept() > 0) {
             std::snprintf(buf, sizeof buf, "; lent slab: %d slots, %d residents now (%d at bring-up)", lend_.kept(),
                           slab_in, lprimed_);

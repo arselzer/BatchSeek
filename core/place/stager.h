@@ -589,6 +589,18 @@ public:
     void track_draft_bank_residents() { bank_track_ = true; }
     uint64_t draft_bank_selected_units() const { return bank_selected_; }
     int  p1_lend_arena(char* lo, int64_t bytes, int64_t rows, std::function<bool()> full, std::string* why);
+    /* The KV pool's lent slots (ds41p1::kKvLendEnv, card_expert_stager.h RingLender::set_kv): before
+     * p1_lend_arena, the engine hands over whole slots carved from the top of the KV pool's FULL groups, each with
+     * the loan in tokens that covers it (ascending), and `target`, the loan the cache grants now (an atomic the
+     * scheduler moves). p1_lend_init gives them the next hottest units after the arena's. At each pass's begin
+     * (p1_kv_sync, before the lender's) a slot the target no longer covers is withdrawn and its queued copy fenced
+     * before the pass's first op; one it covers again becomes available behind the end of the pass before. */
+    void p1_kv_set(std::vector<char*> slots, std::vector<int64_t> need, std::function<int64_t()> target) {
+        p1_kv_at_ = std::move(slots);
+        p1_kv_need_ = std::move(need);
+        p1_kv_target_ = std::move(target);
+    }
+    int  p1_kv_lent_slots() const { return p1_ && p1_->lend_kv_slots() > 0 ? p1_->lend_kv_slots() : 0; }
     //Must run before Ctx::shutdown and before Mover/bank/buffer owners disappear.
     int shutdown_head_cache();
 
@@ -783,6 +795,14 @@ private:
     /* The lent ring (card_expert_stager.h, RingLender; ..._P1_LEND): behind the last pass that read a
      * ring resident, recorded at its end; an armed pass's first ring copy waits on it. */
     RadEvent p1_lend_ev_ = nullptr;
+    /* The KV pool's lent slots (p1_kv_set): their addresses and covering loans, the cache's target, the event
+     * recorded at every pass's end (a slot the loan covers again reloads behind it) and whether it was. */
+    std::vector<char*>   p1_kv_at_;
+    std::vector<int64_t> p1_kv_need_;
+    std::function<int64_t()> p1_kv_target_;
+    RadEvent p1_kv_ev_ = nullptr;
+    bool     p1_kv_rec_ = false;
+    void     p1_kv_sync();
     bool     p1_lend_rec_ = false;
     /* ..._P1_LEND_AUDIT (card_expert_stager.h, the read-back audit): on for this rank's lent slots; and, at
      * shutdown with this rank's device current and no pass in flight, every lent resident read back once
