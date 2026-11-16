@@ -494,7 +494,7 @@ def render(a):
             for bx in [(c.X(d0) - 6 - mw, ym - 7, mw, 14), (c.X(d0) - 6 - mw, ym + 1, mw, 14), (c.x0 + 4, ym - 17, mw, 14), (c.x0 + 4, ym + 3, mw, 14),
                        (c.x1 - 4 - mw, ym + 3, mw, 14)]:
                 if all(bx[0] + bx[2] < o[0] or o[0] + o[2] < bx[0] or bx[1] + bx[3] < o[1] or o[1] + o[3] < bx[1]
-                       for o in boxes) and bx[1] + bx[3] < top + PH:
+                       for o in boxes) and bx[1] + bx[3] < top + PH and bx[0] >= 0:
                     break
             b.append(text(bx[0], bx[1] + 11, ml, SMALL, "ink2", weight="600", extra=HALO))
             if meas and c is cols[0]:   # measured: all requests generating, none finished (KV-cache growth)
