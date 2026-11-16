@@ -23,9 +23,9 @@ def throughput():
     pts = [p for p in data["throughput"]["points"] if (p["kind"] == "chat" and p["streams"] == 1) or p["kind"] == "batch"]
     H, L, R, T, B = 360, 46, 24, 50, 50
     xmax = 512
-    def X(n): return L + (math.log2(n) / math.log2(xmax)) * (W - 2 * PAD - L - R)
+    def X(n): return L + (n / xmax) * (W - 2 * PAD - L - R)   # linear: the gain shows where it happens
     vmax = max(p["tok_s"] for p in pts if p["tok_s"] is not None)
-    ymax, step = vmax * 1.15, nice_step(vmax * 1.15, 3)
+    ymax, step = vmax * 1.15, 100
     def Y(v): return H - B - v / ymax * (H - T - B)
     b = [text(0, 20, "Decode throughput, all streams together", TITLE, "ink", weight="600"),
          text(0, 39, "output tokens per second, four RX 9070 XT", LABEL, "ink2")]
@@ -34,9 +34,9 @@ def throughput():
         b.append(hline(L, W - 2 * PAD - R, Y(v), "axis" if v == 0 else "grid"))
         b.append(text(L - 7, Y(v) + 4, f"{v:,.0f}", SMALL, "muted", "end"))
         v += step
-    for n in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512):
+    for n in (1, 64, 128, 256, 384, 512):
         b.append(text(X(n), H - B + 18, str(n), SMALL, "muted", "middle"))
-    b.append(text((L + W - 2 * PAD - R) / 2, H - 12, "concurrent streams (log scale)", SMALL, "ink2", "middle"))
+    b.append(text((L + W - 2 * PAD - R) / 2, H - 12, "requests at once", SMALL, "ink2", "middle"))
     s = sorted((p for p in pts if p["tok_s"] is not None), key=lambda p: p["streams"])
     b.append(line([(X(p["streams"]), Y(p["tok_s"])) for p in s], "s1", 2))
     for p in s:
@@ -51,7 +51,7 @@ def throughput():
             lab = f"{p['tok_s']:.0f}" + (" *" if p.get("pending") else "")
             x, y = X(p["streams"]), Y(p["tok_s"])
             if p["streams"] == 1:
-                b.append(text(x + 2, y - 11, lab, LABEL, "ink", "start", "600", HALO))
+                b.append(text(x + 8, y + 16, lab, LABEL, "ink", "start", "600", HALO))
             else:
                 b.append(text(x - 9, y - 9, lab, LABEL, "ink", "end", "600", HALO))
     if any(p.get("pending") and p["tok_s"] is not None for p in pts):
