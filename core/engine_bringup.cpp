@@ -5108,6 +5108,13 @@ int Engine::kv_lend_bringup(std::string* why) {
         *why = fmt("%s=1: the expert slab lends the KV pool already (a dynamic plan)", ds41p1::kKvLendEnv);
         return RAD_E_INVAL;
     }
+    /* The host KV tier copies into freshly handed-out blocks from the scheduler's thread (Engine::flush_copies),
+     * ahead of the pass whose begin withdraws the slot there: not beside it. */
+    for (auto& r : ranks_)
+        if (r->tierx.enabled()) {
+            *why = fmt("%s=1: the host KV tier writes handed-out blocks before the pass's begin", ds41p1::kKvLendEnv);
+            return RAD_E_INVAL;
+        }
     int64_t margin = 2 * std::max<int64_t>(cfg_.max_tok, 1);
     if (const char* m = std::getenv(ds41p1::kKvLendMarginEnv); m && *m) {
         char* end = nullptr;
@@ -5128,21 +5135,9 @@ int Engine::kv_lend_bringup(std::string* why) {
             if (!r.kv.lendable(p.index) || !p.base || p.n_slots > 0) continue;
             const int64_t lbpb = p.layer_bytes_per_block(), stripe = p.layer_stride();
             if (lbpb <= 0 || p.block_size <= 0 || p.n_blocks * lbpb > stripe) continue;
-            for (int64_t L = 0; L < p.n_layers; ++L) {
-                char* const top = (char*)p.base + L * stripe + p.n_blocks * lbpb;
-                char* const bottom = top - p.n_blocks * lbpb;
-                char* hi = top;
-                for (;;) {
-                    if (hi - bottom < S) break;
-                    char* const lo = (char*)((uintptr_t)(hi - S) & ~(uintptr_t)4095);
-                    if (lo < bottom) break;
-                    const int64_t blocks = ((int64_t)(top - lo) + lbpb - 1) / lbpb;
-                    /* Never the whole group: the cache keeps at least one block below every slot. */
-                    if (blocks >= p.n_blocks) break;
-                    ks.push_back({ lo, blocks * p.block_size });
-                    hi = lo;
-                }
-            }
+            for (int64_t L = 0; L < p.n_layers; ++L)
+                for (const p1::KvSlot& x : p1::kv_stripe_slots((char*)p.base + L * stripe, p.n_blocks, lbpb, p.block_size))
+                    ks.push_back({ x.at, x.need });
         }
         std::stable_sort(ks.begin(), ks.end(), [](const KS& a, const KS& b) { return a.need < b.need; });
         std::vector<char*> at;

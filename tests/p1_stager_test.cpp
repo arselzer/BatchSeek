@@ -5588,4 +5588,37 @@ TEST(p1_lend_kv_slots_follow_the_cache_mark_through_every_pass_kind) {
     CHECK(kv_res_armed > 300);
 }
 
+/* The KV pool's slots in a layer stripe (kv_stripe_slots): inside the stripe, aligned, disjoint, each covered by its
+ * loan and not by one block less, never the whole stripe; the counts for the H57 pool's groups. */
+TEST(p1_kv_stripe_slots_are_covered_exactly_by_their_loan) {
+
+    struct G { int64_t n_blocks, lbpb, bs; int want; };
+    /* The N512 L360448 pool (server log): compressed_r1 1 KiB a token, compressed_r2 1 KiB a 2-token block a layer,
+     * index_r1 256 B a token, index_r2 256 B a 2-token block a layer; and odd shapes. */
+    const G gs[] = { { 360437, 1024, 1, 19 }, { 180218, 1024, 2, 9 }, { 360437, 256, 1, 4 }, { 180218, 256, 2, 2 },
+                     { 10, 4096, 1, 0 }, { 5000, 4100, 3, 1 }, { 1, 1 << 30, 16, 0 } };
+    for (const G& g : gs) {
+        char* const base = (char*)(uintptr_t)0x7f0000001000ull;   /* addresses only: never dereferenced */
+        const std::vector<KvSlot> v = kv_stripe_slots(base, g.n_blocks, g.lbpb, g.bs);
+        if (g.want >= 0) CHECK_EQ((int)v.size(), g.want);
+        char* const top = base + g.n_blocks * g.lbpb;
+        char* prev_lo = top;
+        int64_t prev_need = 0;
+        for (const KvSlot& x : v) {
+            CHECK(((uintptr_t)x.at & 4095) == 0);
+            CHECK(x.at >= base && x.at + ds41p1::kSlotBytes <= prev_lo);
+            CHECK(x.need > prev_need && x.need % g.bs == 0);
+            const int64_t blocks = x.need / g.bs;
+            CHECK(blocks < g.n_blocks);
+            CHECK(blocks * g.lbpb >= top - x.at);                 /* the loan covers every byte of the slot */
+            CHECK((blocks - 1) * g.lbpb < top - x.at);            /* and one block less does not */
+            prev_lo = x.at;
+            prev_need = x.need;
+        }
+    }
+    CHECK(kv_stripe_slots(nullptr, 100, 1 << 20, 1).empty());
+    CHECK(kv_stripe_slots((char*)(uintptr_t)0x1000, 0, 1 << 20, 1).empty());
+
+}
+
 RAD_TEST_MAIN()

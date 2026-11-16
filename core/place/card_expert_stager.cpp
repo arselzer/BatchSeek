@@ -2180,6 +2180,23 @@ void CardExpertPath::retarget(int k) {
         }
 }
 
+std::vector<KvSlot> kv_stripe_slots(char* base, int64_t n_blocks, int64_t lbpb, int64_t block_size) {
+    std::vector<KvSlot> out;
+    if (!base || n_blocks <= 0 || lbpb <= 0 || block_size <= 0) return out;
+    const int64_t S = ds41p1::kSlotBytes;
+    char* const top = base + n_blocks * lbpb;
+    char* hi = top;
+    while (hi - base >= S) {
+        char* const lo = (char*)((uintptr_t)(hi - S) & ~(uintptr_t)4095);
+        if (lo < base) break;
+        const int64_t blocks = ((int64_t)(top - lo) + lbpb - 1) / lbpb;
+        if (blocks >= n_blocks) break;   /* the cache keeps at least one block below every slot */
+        out.push_back({ lo, blocks * block_size });
+        hi = lo;
+    }
+    return out;
+}
+
 std::vector<char*> arena_slots(char* lo, int64_t bytes, int max) {
     std::vector<char*> out;
     if (!lo || bytes <= 0 || max <= 0) return out;

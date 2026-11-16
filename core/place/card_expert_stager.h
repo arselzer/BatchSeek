@@ -1058,5 +1058,12 @@ private:
  * The deepest slot lies highest, so a smaller count leaves the bytes nearest the buffers unused. */
 std::vector<char*> arena_slots(char* lo, int64_t bytes, int max);
 
+/* The KV pool's lent slots in one layer stripe of a FULL group (..._KV_LEND): `base` the stripe's first byte, n_blocks
+ * blocks of lbpb bytes each holding block_size tokens; a loan of T tokens lends the top floor(T / block_size) blocks
+ * (KVManager::lent_blocks). Whole ds41p1::kSlotBytes slots from the top down, each on a 4 KiB boundary, with the
+ * smallest loan that covers every byte of it; never one that would need the whole stripe. */
+struct KvSlot { char* at = nullptr; int64_t need = 0; };
+std::vector<KvSlot> kv_stripe_slots(char* base, int64_t n_blocks, int64_t lbpb, int64_t block_size);
+
 }  /* namespace p1 */
 }  /* namespace rad */
