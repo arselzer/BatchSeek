@@ -40,6 +40,21 @@
 #     measures it (OVERLAP-20261115.md).
 #   - --pack W (BpW, RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD): a batch whose next waiting prompt does not fit asks the next W
 #     waiting prompts for one that does; exact (step composition only). OFF (0) until window H56 measures it.
+#   - --capture FILE: a calibration run (calibrate.sh), not the measured arm: the routing counts written to FILE
+#     (--expert-stats; at shutdown on SIGINT, and every 30 s), 8 streams unless --streams is given, and batch
+#     admission at 256 rows without the batch split (Ba, no Bs), as the window harness's capture arms ran
+#     (...-L9216-Pf-N8-C8-Ba-...-Xst): a step then holds prefill rows or decode rows, so its decode counts are a
+#     placement profile's (profile_blend.py). Same exact engine otherwise; replies are the base engine's.
+#   - --auto-profile DIR (off by default): a placement profile kept for you across runs. At start, a portable profile
+#     DIR/<first 16 hex of the container's metadata sha256>.profile.json, if there is one for this container (and no
+#     --profile), is used as --expert-profile; every run records its routing counts (--expert-stats into DIR) and,
+#     after the server exits on SIGINT/SIGTERM, blends them into that file (the previous profile x1 + this run x1,
+#     the previous kept as .prev.json; profile_blend.py write --portable). Batched serving runs mixed steps (prefill
+#     and decode rows in one step, which one histogram cannot split): their counts are folded in at
+#     AUTO_PROFILE_MIXED_SHARE (0.5) of their decode rows, approximate (profile_blend.py --mixed-share). Placement
+#     only: replies are unchanged. The server then runs as this script's child, not as its pid: stop it with Ctrl-C
+#     or SIGTERM to this script (both reach the server as SIGINT; a job started with & from a script ignores SIGINT,
+#     so send SIGTERM there); it gets SIGINT if this script dies, where setpriv --pdeathsig is available.
 #   - --served-model-name ds41 (a name only; --served-name sets another) and --radiance-home only when given
 #     (RADIANCE_HOME otherwise).
 #
@@ -47,7 +62,8 @@
 #                       [--ctx-per-stream 1152] [--profile FILE] [--mirror DIR] [--shared-head 32] [--served-name ds41]
 #                       [--radiance-home DIR] [--hybrid 60] [--max-seq-len N] [--tiled 0|1] [--tail-once 0|1]
 #                       [--swiglu-span 0|1] [--engram-early 0|1] [--hybrid-prefill 60] [--fast-prefill 0|1]
-#                       [--fast-dense 0|1] [--fast-attn 0|1] [--early K] [--pack W] [--dry-run]
+#                       [--fast-dense 0|1] [--fast-attn 0|1] [--early K] [--pack W] [--capture FILE]
+#                       [--auto-profile DIR] [--dry-run]
 #                       [-- more radiance flags, e.g. --expert-stats FILE to record a profile; outside the measured set]
 #   RADIANCE_BIN (default: radiance on PATH, else build/bin/radiance), RADIANCE_HOME as for any radiance run.
 # --dry-run prints the environment and the command and starts nothing. Otherwise the script becomes the server (exec:
@@ -55,12 +71,14 @@
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
-EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=0 FASTDN=1 FASTAT=0 EARLY=0 PACK=0
+EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=0 FASTDN=1 FASTAT=0 EARLY=0 PACK=0 CAPTURE="" STREAMS_SET=0 AUTO=""
 while (( $# )); do
   case $1 in
     --model) MODEL=${2:?}; shift ;;
     --silu-table) SILU=${2:?}; shift ;;
-    --streams) STREAMS=${2:?}; shift ;;
+    --streams) STREAMS=${2:?}; STREAMS_SET=1; shift ;;
+    --capture) CAPTURE=${2:?}; shift ;;
+    --auto-profile) AUTO=${2:?}; shift ;;
     --port) PORT=${2:?}; shift ;;
     --reserve-mib) RESERVE=${2:?}; shift ;;
     --ctx-per-stream) CTX=${2:?}; shift ;;
@@ -88,6 +106,13 @@ while (( $# )); do
   esac
   shift
 done
+[[ -n "$CAPTURE" && -n "$AUTO" ]] && die "--capture and --auto-profile both record the counts; give one"
+# A calibration run: few streams and batch admission without the split (see --capture above).
+BA=2048 BSPLIT=1
+if [[ -n "$CAPTURE" ]]; then
+  (( STREAMS_SET )) || STREAMS=8
+  BA=256 BSPLIT=0
+fi
 num() { [[ $2 =~ ^[0-9]+$ ]] && (( 10#$2 >= $3 )) || die "$1 takes a whole number of at least $3, not '$2'"; }
 [[ -n "$MODEL" ]] || die "--model MODEL.rad is required"
 [[ -n "$SILU" ]] || die "--silu-table FILE is required: the card's silu table (ds41_mxfp4_device_check LIBR4D.so swiglu FILE)"
@@ -108,6 +133,7 @@ if (( ! DRY )); then
   [[ -s "$SILU" ]] || die "no silu table at $SILU"
   [[ -z "$PROFILE" || -f "$PROFILE" ]] || die "no profile at $PROFILE"
   [[ -z "$MIRROR" || -d "$MIRROR" ]] || die "no mirror directory at $MIRROR"
+  [[ -z "$CAPTURE" || ! -e "$CAPTURE" ]] || die "--capture $CAPTURE exists (the server would overwrite it)"
 fi
 BIN=${RADIANCE_BIN:-$(command -v radiance || echo build/bin/radiance)}
 
@@ -150,8 +176,8 @@ ENV=(
   RADIANCE_EXPERIMENTAL_DS41_N128=0
   RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=0
   RADIANCE_EXPERIMENTAL_SCHED_TBO=0
-  RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=2048
-  RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1
+  RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=$BA       # Ba2048 (--capture: Ba, 256 rows)
+  RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=$BSPLIT   # Bs (--capture: off)
   RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD=$((10#$PACK))   # BpW: pack lookahead, exact (--pack W; 0 off until H56 measures it)
   RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE=int8
   RADIANCE_EXPERIMENTAL_DS41_PREFETCH_RESCORE=12
@@ -277,8 +303,39 @@ ARGS=(
   --host 127.0.0.1 --port "$PORT"
 )
 [[ -n "$HOME_DIR" ]] && ARGS=(--radiance-home "$HOME_DIR" "${ARGS[@]}")
+# --auto-profile: this container's kept profile (when there is one and no --profile), and this run's capture.
+HERE=$(cd "$(dirname "$0")" && pwd)
+AUTOFILE="" AUTOCAP="" AUTOUSED=""
+if [[ -n "$AUTO" ]]; then
+  if [[ -f "$MODEL" ]]; then
+    SHA=$(python3 -I "$HERE/profile_blend.py" ident "$MODEL") || die "--auto-profile: cannot read $MODEL's metadata"
+  else
+    (( DRY )) || die "no model container at $MODEL"; SHA=SHA256OFTHECONTAINERMETADATA
+  fi
+  AUTOFILE=$AUTO/${SHA:0:16}.profile.json
+  AUTOCAP=$AUTO/.capture-${SHA:0:16}-$(date -u +%Y%m%dT%H%M%SZ)-$$.json
+  if (( ! DRY )); then
+    mkdir -p "$AUTO" || die "--auto-profile: cannot make $AUTO"
+    if [[ -n "$PROFILE" ]]; then
+      echo "serve-batch.sh: auto-profile: --profile $PROFILE given; $AUTOFILE not used (this run still recorded into it)" >&2
+    elif [[ -f "$AUTOFILE" ]]; then
+      if why=$(python3 -I "$HERE/profile_blend.py" match "$MODEL" "$AUTOFILE" 2>&1); then
+        PROFILE=$AUTOFILE AUTOUSED=1
+        echo "serve-batch.sh: auto-profile: using $AUTOFILE ($(python3 -I "$HERE/profile_blend.py" show "$AUTOFILE" | head -1 | sed 's/^[^:]*: //'))" >&2
+      else
+        echo "serve-batch.sh: auto-profile: $AUTOFILE not used: ${why##*: }" >&2
+      fi
+    else
+      echo "serve-batch.sh: auto-profile: no profile for this container in $AUTO yet; this run records one" >&2
+    fi
+  else
+    [[ -z "$PROFILE" ]] && echo "# auto-profile: --expert-profile $AUTOFILE when it exists and matches"
+  fi
+  ARGS+=(--expert-stats "$AUTOCAP")
+fi
 [[ -n "$PROFILE" ]] && ARGS+=(--expert-profile "$PROFILE")
 [[ -n "$SEQLEN" ]] && ARGS+=(--max-seq-len $((10#$SEQLEN)))
+[[ -n "$CAPTURE" ]] && ARGS+=(--expert-stats "$CAPTURE")
 [[ -n "$MIRROR" ]] && ARGS+=(--expert-plane-mirror "$MIRROR" --expert-plane-mirror-decode-share 0.13)
 ARGS+=("${EXTRA[@]}")
 
@@ -301,4 +358,31 @@ if (( GUARD > 0 )); then
       sleep 1
     done ) < /dev/null &
 fi
-exec env "${ENV[@]}" "$BIN" "${ARGS[@]}"
+if [[ -z "$AUTO" ]]; then
+  exec env "${ENV[@]}" "$BIN" "${ARGS[@]}"
+fi
+# --auto-profile: the server is a child (signals forwarded, SIGINT if this script dies), then the blend.
+PD=(); setpriv --help 2>/dev/null | grep -q -- --pdeathsig && PD=(setpriv --pdeathsig INT --)
+"${PD[@]}" env "${ENV[@]}" "$BIN" "${ARGS[@]}" &
+SPID=$!
+trap 'kill -INT $SPID 2>/dev/null' INT
+trap 'kill -INT $SPID 2>/dev/null' TERM   # the server's clean stop either way (a script's & job ignores SIGINT)
+while :; do wait "$SPID"; rc=$?; kill -0 "$SPID" 2>/dev/null || break; done
+trap - INT TERM
+say() { echo "serve-batch.sh: auto-profile: $*" >&2; }
+if [[ ! -s "$AUTOCAP" ]] || ! python3 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("final") is True else 1)' "$AUTOCAP" 2>/dev/null; then
+  say "no final capture (the server did not stop cleanly, exit $rc); $AUTOFILE unchanged"
+  exit $rc
+fi
+TMP=$AUTO/.new-$$.profile.json; rm -f "$TMP"
+PARTS=("1:$AUTOCAP"); [[ -f "$AUTOFILE" ]] && PARTS=("1:$AUTOFILE" "1:$AUTOCAP")
+if msg=$(python3 -I "$HERE/profile_blend.py" write --portable --container "$MODEL" \
+           --mixed-share "${AUTO_PROFILE_MIXED_SHARE:-0.5}" "$TMP" "${PARTS[@]}" 2>&1); then
+  [[ -f "$AUTOFILE" ]] && mv -f "$AUTOFILE" "${AUTOFILE%.profile.json}.prev.json"
+  mv -f "$TMP" "$AUTOFILE" && rm -f "$AUTOCAP"
+  say "wrote $AUTOFILE ($(tr '\n' ' ' <<< "$msg" | sed 's/ *$//'))${AUTOUSED:+; this run used the previous one}"
+else
+  rm -f "$TMP"
+  say "this run's counts not blended, capture kept at $AUTOCAP: $(tail -1 <<< "$msg")"
+fi
+exit $rc
