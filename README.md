@@ -114,6 +114,8 @@ vs 0.692 with IQ4_NL).
 
 The model (`model.rad`) and the release's FP8 Engram shards (`engram-fp8/`) are on Hugging Face:
 [aselzer/DeepSeek-V4.1-Flash-1017-radiance](https://huggingface.co/aselzer/DeepSeek-V4.1-Flash-1017-radiance).
+Or rebuild `model.rad` yourself from DeepSeek's release with `convert/convert.sh` (CPU only, about 870 GB of disk
+and 650 GB of downloads; see [convert/README.md](convert/README.md)).
 
 ```sh
 export RADIANCE_HOME=/path/to/radiance-ramcache/build/radiance_home
