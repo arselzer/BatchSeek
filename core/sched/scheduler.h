@@ -613,6 +613,14 @@ public:
      * prompt's chunk boundaries and snapshot positions are the unbatched run's; only which prompts
      * share a step changes (batch_split_init). */
     static constexpr const char* kBatchSplitEnv = "RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT";
+    /* RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN=<N> (decode_min_; 0 / unset / empty: off, the scheduler
+     * exactly as before): beside prefill alone, a step whose running set holds at least N sequences
+     * ready to decode carries their decode rows only, and no prefill chunk nor admission waits ahead
+     * of it; below N the step is planned as before (decode_min_init). The shutdown line counts the
+     * steps it chose and the mean decode batch. */
+    static constexpr const char* kDecodeMinEnv = "RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN";
+    int64_t decode_min() const { return decode_min_; }
+    void    decode_min_report() const;
     bool    batch_admit_split() const { return batch_split_; }
     /* RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD=<W> (pack_w_; 0 or unset: off, as before), beside batch
      * admission: when the next waiting prompt cannot join an open batch (its chunk past the rows left, or
@@ -1049,6 +1057,9 @@ private:
     int64_t pack_w_ = 0;                   /* RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD (kPackLookaheadEnv) */
     int64_t batch_p1_rows_ = 0;
     int     batch_admit_init(const Config& cfg);
+    /* RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN (kDecodeMinEnv): N once init took it, else 0. */
+    int64_t decode_min_ = 0;
+    int     decode_min_init(const Config& cfg);
     /* RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD (kSharedHeadEnv): the floor once init took it, else 0. */
     int64_t sh_floor_ = 0;
     int     shared_head_init(const Config& cfg);

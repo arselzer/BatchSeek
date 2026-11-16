@@ -75,6 +75,9 @@
 #     when not given). Measured growth after serve() at 512 streams is <= 4.5 GiB in all (<= 8.8 MiB a sequence),
 #     so 16 holds it twice over and gives the expert RAM cache 8 GiB more than 32 (VRAMLEND-20261116.md). Unset by
 #     default.
+#   - --decode-min N (DmN, RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN=N): with N or more streams ready to decode, a step
+#     carries their decode rows ahead of waiting prompts (continuous serving keeps large decode batches instead of
+#     prefilling every new prompt first); exact (step order only). OFF (0) until window H61 measures it.
 #   - --served-model-name ds41 (a name only; --served-name sets another) and --radiance-home only when given
 #     (RADIANCE_HOME otherwise).
 #
@@ -83,7 +86,7 @@
 #                       [--radiance-home DIR] [--hybrid 60] [--max-seq-len N] [--tiled 0|1] [--tail-once 0|1]
 #                       [--swiglu-span 0|1] [--engram-early 0|1] [--hybrid-prefill 60] [--fast-prefill 0|1]
 #                       [--fast-dense 0|1] [--fast-attn 0|1] [--early K] [--pack W] [--pack-once 0|1] [--hybrid-cal M]
-#                       [--arena-split 0|1] [--kv-auto T] [--ram-per-seq-mib N] [--kv-lend 0|1]
+#                       [--arena-split 0|1] [--kv-auto T] [--ram-per-seq-mib N] [--kv-lend 0|1] [--decode-min N]
 #                       [--capture FILE] [--auto-profile DIR] [--dry-run]
 #                       [-- more radiance flags, e.g. --expert-stats FILE to record a profile; outside the measured set]
 #   RADIANCE_BIN (default: radiance on PATH, else build/bin/radiance), RADIANCE_HOME as for any radiance run.
@@ -92,7 +95,7 @@
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
-EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=0 FASTDN=1 FASTAT=0 EARLY=0 PACK=0 PACKONCE=0 HYBCAL=0 ASPLIT=0 KVAUTO=0 PERSEQ="" KVLEND=0 CAPTURE="" STREAMS_SET=0 AUTO=""
+EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=0 FASTDN=1 FASTAT=0 EARLY=0 PACK=0 PACKONCE=0 HYBCAL=0 ASPLIT=0 KVAUTO=0 PERSEQ="" KVLEND=0 DECMIN=0 CAPTURE="" STREAMS_SET=0 AUTO=""
 while (( $# )); do
   case $1 in
     --model) MODEL=${2:?}; shift ;;
@@ -126,6 +129,7 @@ while (( $# )); do
     --kv-lend) KVLEND=${2:?}; shift ;;
     --kv-auto) KVAUTO=${2:?}; shift ;;
     --ram-per-seq-mib) PERSEQ=${2:?}; shift ;;
+    --decode-min) DECMIN=${2:?}; shift ;;
     --dry-run) DRY=1 ;;
     --) shift; EXTRA=("$@"); break ;;
     -h|--help) sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -154,6 +158,7 @@ num --hybrid-cal "$HYBCAL" 0; (( 10#$HYBCAL <= 3 )) || die "--hybrid-cal takes 0
 (( 10#$HYBCAL == 0 || 10#$HYBRID > 0 || 10#$HYBPF > 0 )) || die "--hybrid-cal $HYBCAL calibrates the hybrid split: it needs --hybrid or --hybrid-prefill above 0"
 num --kv-auto "$KVAUTO" 0; (( 10#$KVAUTO == 0 || (10#$KVAUTO >= 16 && 10#$KVAUTO <= 1048576) )) || die "--kv-auto takes 0 (off) or 16-1048576 tokens a stream, not '$KVAUTO'"
 [[ -z "$PERSEQ" ]] || { num --ram-per-seq-mib "$PERSEQ" 0; (( 10#$PERSEQ <= 1048576 )) || die "--ram-per-seq-mib takes 0-1048576, not '$PERSEQ'"; }
+num --decode-min "$DECMIN" 0; (( 10#$DECMIN <= 1048576 )) || die "--decode-min takes 0 (off) or 1-1048576 streams, not '$DECMIN'"
 for v in "--kv-lend $KVLEND" "--arena-split $ASPLIT" "--tiled $TILED" "--tail-once $TAILONCE" "--swiglu-span $SPAN" "--engram-early $ENGEARLY" "--fast-prefill $FASTPF" "--fast-dense $FASTDN" "--fast-attn $FASTAT" "--pack-once $PACKONCE"; do
   [[ ${v#* } == [01] ]] || die "${v% *} takes 0 or 1, not '${v#* }'"
 done
@@ -213,6 +218,7 @@ ENV=(
   RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=$BA       # Ba2048 (--capture: Ba, 256 rows)
   RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=$BSPLIT   # Bs (--capture: off)
   RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD=$((10#$PACK))   # BpW: pack lookahead, exact (--pack W; 0 off until H56 measures it)
+  RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN=$((10#$DECMIN))   # DmN: decode first at N ready streams, exact (--decode-min N)
   RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE=int8
   RADIANCE_EXPERIMENTAL_DS41_PREFETCH_RESCORE=12
   RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE_CHECK=0

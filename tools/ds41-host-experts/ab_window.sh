@@ -1629,6 +1629,7 @@ Ba${ARM_BA:-}|${ARM_BA:-}|batch admission: on \(RADIANCE_EXPERIMENTAL_SCHED_BATC
 BaPc|${ARM_BAPC:-}|batch admission: beside the prefix cache \(--prefix-resume exact\)
 Bs|${ARM_BS:-}|batch split: on \(RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1\)
 Bp${ARM_BP:-}|${ARM_BP:-}|pack lookahead: on \(RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD=${ARM_BP:-[0-9]+}\)
+Dm${ARM_DMIN:-}|${ARM_DMIN:-}|decode min: on \(RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN=${ARM_DMIN:-[0-9]+}\)
 Ax${ARM_AX:-}|${ARM_AX:-}|$ax_on
 Axv|${ARM_AXV:-}|$axv_on
 AxS|${ARM_AXS:-}|aux experts: sharing: policy ${ARM_AXS:-[a-z]+}
@@ -2206,7 +2207,7 @@ EOF2
   fi
   # Ba: the steps that admitted whole prompts together (the scheduler's shutdown line). A Ba arm that
   # sent requests together (CK, K > 1) and batched no step did not do what its name says: set aside.
-  grep -E 'batch admission: ([0-9]+ steps admitted|[0-9]+ of those steps|beside the prefix cache, [0-9]+|outside the covered case|prefill-only steps closed by)|batch split: [0-9]+ joins|pack lookahead: [0-9]+ steps|shared heads: [0-9]+ keep points set back' \
+  grep -E 'batch admission: ([0-9]+ steps admitted|[0-9]+ of those steps|beside the prefix cache, [0-9]+|outside the covered case|prefill-only steps closed by)|batch split: [0-9]+ joins|pack lookahead: [0-9]+ steps|shared heads: [0-9]+ keep points set back|decode min: [0-9]+ decode steps taken' \
     "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # Ba: a shared step's entry outside the covered case (a chunk not the one its prompt takes alone) must not
   # happen; an arm that counts one is set aside (with Pc, the snapshots and hits it batched are on its line).
@@ -3855,6 +3856,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$(arm_full "$a")"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" bp="" sg="" pcn=""
+  dmin=""  # DmN: decode first at N ready rows (RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN; Dm alone is the drafter's codebooks)
   p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qyp="" qyk="" qsp="" qt="" qw="" dt="" aw="" qz="" qx="" qo="" qyc="" qes="" kvl="" lk="" ms="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr="" ee=""
   ctp=""   # Ctp / CtpN: the prefill chain trace (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL)
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
@@ -4031,6 +4033,10 @@ for a in $ARMS; do
                if [[ -n "$bp" ]]; then log "arm $a: duplicate Bp part; the arm is skipped"; skip=1
                elif [[ ${p#Bp} =~ ^[0-9]+$ ]] && (( 10#${p#Bp} >= 1 && 10#${p#Bp} <= 256 )); then bp=$((10#${p#Bp}))
                else log "arm $a: $p: Bp takes 1-256 (waiting prompts); the arm is skipped"; skip=1; fi ;;
+      Dm[0-9]*)                                                        # decode first at N or more ready rows (SCHED_DECODE_MIN=N)
+               if [[ -n "$dmin" ]]; then log "arm $a: two DmN parts; the arm is skipped"; skip=1
+               elif [[ ${p#Dm} =~ ^[0-9]+$ ]] && (( 10#${p#Dm} <= 1048576 )); then dmin=$((10#${p#Dm}))
+               else log "arm $a: $p: DmN takes 0-1048576 (ready sequences); the arm is skipped"; skip=1; fi ;;
       Tb)      tb=1 ;;                                                 # two-batch overlap of concurrent decode steps
       N[0-9]*) ARGS+=(--max-num-seqs "${p#N}"); nseq=${p#N} ;;        # this arm's --max-num-seqs (MAX_SEQS for every arm)
       C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
@@ -4391,6 +4397,16 @@ for a in $ARMS; do
   [[ -z "$bp" || -n "$ba" ]] || { log "arm $a: Bp needs a Ba part (batch admission); the arm is skipped"; skip=1; }
   env+=(RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD=${bp:-0})
   ARM_BP=$bp
+  # DmN: RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN=N (claude/ds41-decodemin): a step with N or more sequences ready to
+  # decode carries their decode rows only, ahead of ready prefill work; scheduling only, replies identical to the
+  # arm without it. Needs Pf (the scheduler refuses it otherwise). Stated by every arm (0 off, as Dm0) and checked
+  # both ways by arm()'s "decode min: on" row; the shutdown line (steps it took, mean decode batch) is logged.
+  (( 10#${dmin:-0} == 0 )) && dmin=""
+  if [[ -n "$dmin" && " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1 "* ]]; then
+    log "arm $a: Dm$dmin needs Pf (prefill alone); the arm is skipped"; skip=1
+  fi
+  env+=(RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN=${dmin:-0})
+  ARM_DMIN=$dmin
   # Ss: the read-back runs in an arm only if its name says so, whatever the window's environment.
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=0)
   # Pi8 / Pi4, PkN, Pw, NsN, Pv: each acts only with what it changes (a predictor; Pi; Ei and the

@@ -25,6 +25,7 @@ ARMDA=${ARM%-Xqprof}-Aw-Xqprof   # with the WMMA attention (Aw, inexact) too: --
 # The calibration run (serve-batch.sh --capture): 8 streams, Ba256 without Bs, routing counts (Xst), no profile.
 ARMCAP=${ARM/-L294912-Pf-N256-C256-Ba2048-Bs-/-L9216-Pf-N8-C8-Ba256-}; ARMCAP=${ARMCAP%-Xqprof}-Xnp-Xst
 ARMVL=${ARM%-Xqprof}-Qes-Kvl-mS16-Xqprof; ARMVL=${ARMVL/-L294912-/-Lk452-}   # VRAMLEND: --arena-split 1 --kv-lend 1 --ram-per-seq-mib 16, an Lk pool
+ARMDM=${ARM%-Xqprof}-Dm384-Xqprof   # decode first at 384 ready streams (DmN, exact): --decode-min 384
 mkdir -p "$T/home/kernels" "$T/mirror" "$T/profiles"; echo "{}" > "$T/profiles/prof.json"
 echo "not a library" > "$T/home/kernels/libr4d.so"
 echo '{}' > "$T/prompts.json"
@@ -53,7 +54,7 @@ LW=$(sed -n '/^launch_words() {/,/^}/p' "$W")
   eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
   eval "$(sed -n '/^ARM_PRESET_B2=/p;/^ARM_PRESET_B4=/p;/^arm_full() {/,/^}/p' "$W")"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
-  ARMS="$ARM $ARMQW $ARMDA $ARMCAP $ARMVL"
+  ARMS="$ARM $ARMQW $ARMDA $ARMCAP $ARMVL $ARMDM"
   s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)
   e=$(awk -v s="$s" 'NR > s && /^done$/ { print NR; exit }' "$W")
   eval "$(sed -n "${s},${e}p" "$W")"
@@ -67,6 +68,9 @@ awk -v a="ARM $ARMQW" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt
 grep -q "^ARM $ARMDA$" "$T/loop.txt" && ok "the harness launches the Dt-Aw arm" ||
   { bad "the harness did not launch the Dt-Aw arm: $(grep -m3 -E "arm $ARMDA" "$T/loop.txt")"; }
 awk -v a="ARM $ARMDA" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt" > "$T/harness-da.txt"
+grep -q "^ARM $ARMDM$" "$T/loop.txt" && ok "the harness launches the Dm384 arm" ||
+  { bad "the harness did not launch the Dm384 arm: $(grep -m3 -E "arm $ARMDM" "$T/loop.txt")"; }
+awk -v a="ARM $ARMDM" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt" > "$T/harness-dm.txt"
 
 grep -q "^ARM $ARMCAP$" "$T/loop.txt" && ok "the harness launches the capture arm" ||
   { bad "the harness did not launch the capture arm: $(grep -m3 -E "arm $ARMCAP" "$T/loop.txt")"; }
@@ -108,6 +112,13 @@ if python3 -I "$M" params "$T/harness-da.txt" > "$T/params-da.txt" && mapfile -t
    RADIANCE_BIN=BIN "$SB" "${P[@]}" --dry-run > "$T/sb4.txt" && python3 -I "$M" compare "$T/harness-da.txt" "$T/sb4.txt" > "$T/cmp4.txt"; then
   ok "the Dt-Aw arm: params give --fast-dense 1 --fast-attn 1, and serve-batch.sh with them: $(cat "$T/cmp4.txt")"
 else bad "the Dt-Aw arm's params: $(tr '\n' ' ' < "$T/params-da.txt") $(tr '\n' ';' < "$T/cmp4.txt" 2>/dev/null)"; fi
+if python3 -I "$M" params "$T/harness-dm.txt" > "$T/params-dm.txt" && mapfile -t P < "$T/params-dm.txt" &&
+   [[ " ${P[*]} " == *" --decode-min 384 "* ]] &&
+   RADIANCE_BIN=BIN "$SB" "${P[@]}" --dry-run > "$T/sb5.txt" && python3 -I "$M" compare "$T/harness-dm.txt" "$T/sb5.txt" > "$T/cmp5.txt"; then
+  ok "the Dm384 arm: params give --decode-min 384, and serve-batch.sh with them: $(cat "$T/cmp5.txt")"
+else bad "the Dm384 arm's params: $(tr '\n' ' ' < "$T/params-dm.txt") $(tr '\n' ';' < "$T/cmp5.txt" 2>/dev/null)"; fi
+[[ " $(tr '\n' ' ' < "$T/params.txt") " == *" --decode-min 0 "* ]] && ok "the arm without Dm: params give --decode-min 0" ||
+  bad "the arm without Dm: $(tr '\n' ' ' < "$T/params.txt")"
 
 # --capture against the capture arm: the same launch but for the stats file's path (the harness's xstats-<arm>.json).
 if grep -q -- '^--expert-stats$' "$T/harness-cap.txt" &&
@@ -166,7 +177,13 @@ grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED=1' <<< "$dda" && grep -qx '
   grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=0' <<< "$dda" && ok "--fast-dense 1 --fast-attn 1: Dt and Aw, Qw as it was" ||
   bad "--fast-dense 1 / --fast-attn 1"
 
+grep -qx 'env RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN=0' <<< "$dh" && ok "--decode-min off by default (DmN: ..._DECODE_MIN=0)" ||
+  bad "the --decode-min default"
+ddm=$("$SB" --model M --silu-table S --decode-min 384 --dry-run)
+grep -qx 'env RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN=384' <<< "$ddm" && ok "--decode-min 384: Dm384" || bad "--decode-min 384"
+
 # ---- 3. refusals
+"$SB" --model M --silu-table S --decode-min x --dry-run > /dev/null 2>&1 && bad "--decode-min x accepted" || ok "--decode-min x refused"
 "$SB" --model M --silu-table S --fast-dense 2 --dry-run > /dev/null 2>&1 && bad "--fast-dense 2 accepted" || ok "--fast-dense 2 refused"
 "$SB" --model M --silu-table S --fast-attn x --dry-run > /dev/null 2>&1 && bad "--fast-attn x accepted" || ok "--fast-attn x refused"
 "$SB" --model M --silu-table S --fast-prefill 2 --dry-run > /dev/null 2>&1 && bad "--fast-prefill 2 accepted" || ok "--fast-prefill 2 refused"
