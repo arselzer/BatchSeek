@@ -78,7 +78,7 @@ run past the 30-second limit count as wrong for everyone, as in BIRD's evaluator
 | Who runs the model | Execution accuracy | Cost for 500 questions |
 |---|---:|---:|
 | **This box** (default mode, public profile) | **61.6%** | **€0.014** at €0.30/kWh |
-| DeepSeek API | 59.8% | €0.031 off-peak, €0.062 peak |
+| DeepSeek API | 59.8% | €0.031 |
 | DeepInfra (FP8) | 60.2% | €0.015 |
 | Wafer (MXFP4) | 60.2% | €0.021 |
 | *Other models* | | |

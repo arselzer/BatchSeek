@@ -9,7 +9,7 @@ from chart_style import W, TITLE, LABEL, SMALL, doc, text
 
 out = sys.argv[1]
 KWH = 0.0480                      # measured: 721 W x 240 s (GPU boards + CPU package), H54 default mode, BIRD 500
-API = [("DeepSeek API, peak", 0.062), ("DeepSeek API, off-peak", 0.031), ("Wafer", 0.021), ("DeepInfra", 0.015)]
+API = [("DeepSeek API", 0.031), ("Wafer", 0.021), ("DeepInfra", 0.015)]
 P0, PMAX = 0.30, 0.50
 PAD, L, R = 8, 186, 70
 x1 = W - 2 * PAD - R
@@ -40,7 +40,7 @@ for i, (name, v) in enumerate(rows):
              f"fill='var(--{'s1' if local else 'neutral'})'/>")
     b.append(text(X(v) + 6, y + bh / 2 + 5, f"€{v:.3f}", LABEL, "ink", "start", "600" if local else "normal")
              .replace("<text ", "<text class='lv' " if local else "<text ", 1))
-b.append(text(0, H - 12, "Electricity only: 0.048 kWh measured (GPUs and CPU), no hardware. API prices as billed on "
+b.append(text(0, H - 12, "Electricity only: 0.048 kWh measured (GPUs and CPU), no hardware. API costs as billed on "
               "16 Nov 2026.", SMALL, "muted"))
 b.append("<script><![CDATA[(function(){var KWH=%s,PMAX=%s,SX0=%s,SX1=%s,L=%s,X1=%s,VMAX=%s;" % (KWH, PMAX, sx0, sx1, L, x1, VMAX) + """
 var s=document.currentScript.closest('svg'),q=function(c){return s.querySelector('.'+c)},drag=false;
