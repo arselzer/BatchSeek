@@ -34,13 +34,13 @@ def X(f): return L + f * (x1 - L)
 def Y(v): return H - B - v * (H - T - B)
 
 b = [text(0, 20, "A few experts do most of the work", TITLE, "ink", weight="600"),
-     text(0, 39, "share of expert uses covered by each layer's busiest experts, BIRD profile", LABEL, "ink2")]
+     text(0, 39, "share of expert uses covered by each layer's busiest experts, 64 BIRD training questions", LABEL, "ink2")]
 k, _ = key([("decode", "s1", "line"), ("prefill", "s2", "line")], 0, 60)
 b.append(k)
 # the part the cards keep resident
 b.append(f"<rect x='{X(0):.1f}' y='{Y(1):.1f}' width='{X(vram) - X(0):.1f}' height='{Y(0) - Y(1):.1f}' "
          f"fill='var(--s1)' fill-opacity='0.07'/>")
-b.append(text(X(vram) + 6, Y(0.08), f"\u2190 kept on the cards ({vram:.0%})", SMALL, "ink2", "start", extra=HALO))
+b.append(text(X(vram) + 6, Y(0.08), f"\u2190 room on the cards (≈{vram:.0%})", SMALL, "ink2", "start", extra=HALO))
 b.append(text(X(vram) + 6, Y(0.08) + 14, "the rest: RAM cache, then SSD", SMALL, "muted", "start", extra=HALO))
 for v in (0, 0.25, 0.5, 0.75, 1.0):
     b.append(hline(L, x1, Y(v), "axis" if v == 0 else "grid"))
