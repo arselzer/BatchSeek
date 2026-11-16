@@ -112,12 +112,12 @@ API prices as charged through OpenRouter on 16 November 2026, at $1.12 per euro.
 accuracy differences are within noise. The other models ran with thinking off at their default sampling (they don't
 accept temperature 0), with prompts written for DeepSeek.
 
-The model file comes with a generic usage profile, taken from the quantization's calibration text. The same 256
-BIRD questions with it and with a recorded profile:
+The model file carries no profile: without one, the experts start in no particular order and the RAM cache fills
+while the job runs. The same 256 BIRD questions without a profile and with a recorded one:
 
 | Expert usage profile | Job time |
 |---|---:|
-| Generic, from the model file | 221 s |
+| None | 221 s |
 | Recorded from 64 public BIRD *training* questions (different databases) | **146 s** |
 
 The measured numbers used the IQ4_NL Engram tables from [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)'s GGUF release. The release's official FP8 tables
