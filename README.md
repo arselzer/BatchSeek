@@ -16,7 +16,8 @@ This repository builds on an engine written by other people:
 - **This repository** is a fork of radiance with changes for large batches (below), plus the batch tools in `batch/`:
   launcher, batch client, calibration, placement profiles, BIRD tools and model conversion.
 
-Thanks also to DeepSeek for the open weights and to the BIRD team for their benchmark and databases.
+Thanks also to DeepSeek for the open weights, to [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)
+for the IQ4_NL Engram tables in the converted model, and to the BIRD team for their benchmark and databases.
 
 Unofficial; not affiliated with DeepSeek, BIRD or radiance.
 
