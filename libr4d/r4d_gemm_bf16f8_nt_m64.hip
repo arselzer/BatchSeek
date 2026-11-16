@@ -30,7 +30,10 @@
 #include "r4d_gemm_m64_shared.h"
 #include "r4d_bf16f8_layout.h"
 #include "r4d_bf16f8_frag.h"
+#include "r4d_common.h"
+#include "r4d_bf16_gemm_rows.h"
 #include <hip/hip_bf16.h>
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 
@@ -211,6 +214,221 @@ static void gemm_bf16f8_m64_launch(long a, long w, long c, int M, int K, int N, 
 #undef LAUNCH
 }
 
+// ============================================================== the tiled form (prefill heights)
+//
+// RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED=1 (r4d_ds41_tall.h): above 64 rows, gemm_bf16_nt_tiled's
+// block shape over the stored form. Eight waves stage a BM x 64 activation tile (bf16, as that
+// kernel) and the BN/16 x 2 weight packets of the same 64 K (the E4M3 codes as stored, 1 KiB a
+// 16-row tile) through LDS, the next K tile prefetched into registers with its exponent bytes.
+// Each wave computes a (BM/2) x (BN/4) patch: TM A fragments from LDS (fragP, the bf16 tiled
+// kernel's) and TN B fragments, each a lane's 16 packet bytes expanded by r4d_bf16f8_frag with its
+// block's 2^(s-127), the very instructions of the m64 kernel.
+//
+// Contract: byte-identical to gemm_bf16f8_nt_m64 (hence to gemm_bf16_nt_m64 and _tiled). The same
+// A fragments (fragP's slots are fragU's), the same B bits (the same expansion of the same bytes),
+// `mma(A, B, acc)` in one chain from zero a slice over its k steps in ascending order, and the
+// slices summed from 0.f in ascending order (tot), SK from the same law; the store is the same
+// conversion. Rows past M or N re-read the last valid row (tile) and are never stored.
+#define BF8T_BK 64
+#define BF8T_PITCH (BF8T_BK + 8)   // the bf16 tiled kernel's A pitch (144 bytes)
+
+template <int TM, int TN, bool SPLIT>
+__global__ __launch_bounds__(256) void r4d_gemm_bf16f8_nt_tiled_kernel(
+    const unsigned short* __restrict__ A, const unsigned char* __restrict__ Wb,
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int spk, int LDA, int LDC,
+    long long soff, int ldws) {
+  constexpr int WM = 2, WN = 4;
+  constexpr int BM = WM * TM * 16, BN = WN * TN * 16, NTL = BN / 16;
+  constexpr int CPR = BF8T_BK / 8;                 // 16-byte A chunks a staged row
+  constexpr int AL = BM * CPR / 256;
+  constexpr int WL = NTL * 64 / 256;                // 16-byte weight chunks a thread (64 a tile)
+  static_assert(AL >= 1 && WL >= 1 && BM * CPR % 256 == 0 && NTL * 64 % 256 == 0,
+                "a tile is whole 16-byte chunks for every thread");
+  __shared__ __attribute__((aligned(16))) unsigned short sA[BM * BF8T_PITCH];
+  __shared__ __attribute__((aligned(16))) unsigned char sW[NTL * 1024];
+
+  const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+  const int wm = wave / WN, wn = wave % WN;
+  // gemm_bf16_nt_tiled's block order: groups of 8 activation bands, M fastest within a group.
+  constexpr unsigned kGroupM = 8;
+  const unsigned per = kGroupM * gridDim.x, lin = blockIdx.y * gridDim.x + blockIdx.x;
+  const unsigned first = lin / per * kGroupM, r = lin % per;
+  const unsigned gm = min(gridDim.y - first, kGroupM);
+  const int m0 = (int)(first + r % gm) * BM, n0 = (int)(r / gm) * BN;
+  const int ntiles = N >> 4, kblocks = K >> 5;
+
+  unsigned aoff[AL];
+  unsigned short* adst[AL];
+#pragma unroll
+  for (int i = 0; i < AL; ++i) {
+    const int c = tid + 256 * i, rr = c / CPR, e = (c % CPR) * 8;
+    const int gr = m0 + rr < M ? m0 + rr : M - 1;
+    aoff[i] = (unsigned)gr * (unsigned)LDA + (unsigned)e;
+    adst[i] = sA + rr * BF8T_PITCH + e;
+  }
+  // Weight chunk c = tid + 256 i: tile c / 64 of the block (clamped to the last tile of N), 16
+  // bytes (c % 64) of its two packets; a K tile is two packets further.
+  unsigned woff[WL];
+  unsigned char* wdst[WL];
+#pragma unroll
+  for (int i = 0; i < WL; ++i) {
+    const int c = tid + 256 * i, tt = c >> 6, q = c & 63;
+    const int t = min(n0 / 16 + tt, ntiles - 1);
+    woff[i] = (unsigned)t * (unsigned)kblocks * 512u + (unsigned)q * 16u;
+    wdst[i] = sW + tt * 1024 + q * 16;
+  }
+  // The exponent rows of this wave's tiles (wave-uniform), each tile clamped as its packets are.
+  const unsigned char* srow[TN];
+#pragma unroll
+  for (int j = 0; j < TN; ++j) {
+    const int t = min(n0 / 16 + wn * TN + j, ntiles - 1);
+    srow[j] = Wb + soff + (size_t)(t >> 1) * (size_t)ldws;
+  }
+
+  const unsigned short* fa = sA + (wm * TM * 16 + (lane & 15)) * BF8T_PITCH + 4 * (lane >> 4);
+  const unsigned char* fw = sW + (wn * TN) * 1024 + lane * 16;
+
+  v8f acc[TM][TN], tot[SPLIT ? TM : 1][SPLIT ? TN : 1];
+#pragma unroll
+  for (int i = 0; i < TM; ++i)
+#pragma unroll
+    for (int j = 0; j < TN; ++j) acc[i][j] = (v8f)(0.f);
+  if constexpr (SPLIT) {
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+      for (int j = 0; j < TN; ++j) tot[i][j] = (v8f)(0.f);
+  }
+
+  r4d_u32x4 ra[AL], rw[WL];
+  unsigned sx[TN];                                  // the K tile's two exponent bytes a tile
+#pragma unroll
+  for (int i = 0; i < AL; ++i) ra[i] = *(const r4d_u32x4*)(A + aoff[i]);
+#pragma unroll
+  for (int i = 0; i < WL; ++i) rw[i] = *(const r4d_u32x4*)(Wb + woff[i]);
+#pragma unroll
+  for (int j = 0; j < TN; ++j) sx[j] = (unsigned)*(const unsigned short*)(srow[j]);
+
+  const int nk = K / BF8T_BK;
+  int left = spk;
+  for (int kt = 0; kt < nk; ++kt) {
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < AL; ++i) *(r4d_u32x4*)adst[i] = ra[i];
+#pragma unroll
+    for (int i = 0; i < WL; ++i) *(r4d_u32x4*)wdst[i] = rw[i];
+    float f[TN][2];
+#pragma unroll
+    for (int j = 0; j < TN; ++j) {
+      const unsigned v = (unsigned)__builtin_amdgcn_readfirstlane((int)sx[j]);
+      f[j][0] = r4d_bf16f8_pow2(v & 0xFFu);
+      f[j][1] = r4d_bf16f8_pow2((v >> 8) & 0xFFu);
+    }
+    __syncthreads();
+    if (kt + 1 < nk) {
+      const unsigned k1 = (unsigned)(kt + 1) * BF8T_BK;
+#pragma unroll
+      for (int i = 0; i < AL; ++i) ra[i] = *(const r4d_u32x4*)(A + aoff[i] + k1);
+#pragma unroll
+      for (int i = 0; i < WL; ++i) rw[i] = *(const r4d_u32x4*)(Wb + woff[i] + (unsigned)(kt + 1) * 1024u);
+#pragma unroll
+      for (int j = 0; j < TN; ++j) sx[j] = (unsigned)*(const unsigned short*)(srow[j] + 2 * (kt + 1));
+    }
+#pragma unroll
+    for (int b = 0; b < 2; ++b) {
+      r4d_u32x4 q[TN];
+#pragma unroll
+      for (int j = 0; j < TN; ++j) q[j] = *(const r4d_u32x4*)(fw + j * 1024 + b * 512);
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int s = 2 * b + h;
+        v8bf af[TM], bf[TN];
+#pragma unroll
+        for (int i = 0; i < TM; ++i) af[i] = fragP(fa + i * 16 * BF8T_PITCH + s * 16);
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+          bf[j] = h ? r4d_bf16f8_frag(q[j].z, q[j].w, f[j][b]) : r4d_bf16f8_frag(q[j].x, q[j].y, f[j][b]);
+#pragma unroll
+        for (int i = 0; i < TM; ++i)
+#pragma unroll
+          for (int j = 0; j < TN; ++j) acc[i][j] = mma(af[i], bf[j], acc[i][j]);
+        if constexpr (SPLIT) {
+          if (--left == 0) {
+            left = spk;
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+              for (int j = 0; j < TN; ++j) {
+                tot[i][j] += acc[i][j];
+                acc[i][j] = (v8f)(0.f);
+              }
+          }
+        }
+      }
+    }
+  }
+
+  // The skinny kernel's store: lane l holds column (l & 15) of a tile and rows 8 (l >> 4) + e.
+#pragma unroll
+  for (int i = 0; i < TM; ++i)
+#pragma unroll
+    for (int j = 0; j < TN; ++j) {
+      const int n = n0 + (wn * TN + j) * 16 + (lane & 15);
+      const int mb = m0 + (wm * TM + i) * 16 + 8 * (lane >> 4);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        float v = 0.f;
+        if constexpr (SPLIT) v = tot[i][j][e];
+        else v += acc[i][j][e];
+        const int m = mb + e;
+        if (n < N && m < M) C[(size_t)m * LDC + n] = (__hip_bfloat16)v;
+      }
+    }
+}
+
+int r4d_gemm_bf16_nt_tiled_arm(int M, int N);   // r4d_gemm_bf16_nt_tiled.hip: 1 = 128 x 128, 2 = 64 x 64
+
+// Whether the tiled form takes a call: K a multiple of 64, N of 16 and at least 128, 16-byte
+// activation rows, 32-bit offsets for the weight bytes and every launch's activation rows.
+static bool bf16f8_tiled_fits(long long M, long long N, long long K, long long lda) {
+  return M >= 1 && N >= 128 && N % 16 == 0 && K >= BF8T_BK && K % BF8T_BK == 0 && lda % 8 == 0 &&
+         N * K < (1ll << 32) && r4d_bf16_gemm_chunk_rows(M, N, K, 64, 64) > 0;
+}
+
+static int gemm_bf16f8_tiled_launch(long a, long w, long c, int M, int K, int N, int SK, long stream,
+                                    long long lda, long long ldc, long long wn, long long wk) {
+  if (SK < 1 || K % (SK * 16)) return -1;
+  const int tile = r4d_gemm_bf16_nt_tiled_arm(M, N);
+  const int bt = tile == 1 ? 128 : 64;
+  const int chunk = r4d_bf16_gemm_chunk_rows(M, N, K, bt, bt);
+  if (!chunk) return -1;
+  if ((long long)std::min<long long>(chunk, M) * lda >= (1ll << 32)) return -1;
+  const int spk = K / SK / 16;
+  const long long soff = r4d_bf16f8_scale_off(wn, wk);
+  const int ldws = (int)r4d_bf16f8_ldws(wk);
+  auto Wp = (const unsigned char*)w;
+  hipStream_t st = (hipStream_t)stream;
+  const bool split = SK > 1;
+#define LAUNCH(TM, TN, S)                                                                          \
+  hipLaunchKernelGGL((r4d_gemm_bf16f8_nt_tiled_kernel<TM, TN, S>), grid, dim3(256), 0, st, Ap, Wp,  \
+                     Cp, mm, K, N, spk, (int)lda, (int)ldc, soff, ldws)
+  for (long long m0 = 0; m0 < M; m0 += chunk) {
+    const int mm = (int)std::min<long long>(chunk, M - m0);
+    dim3 grid((N + bt - 1) / bt, (mm + bt - 1) / bt);
+    auto Ap = (const unsigned short*)a + m0 * lda;
+    auto Cp = (__hip_bfloat16*)c + m0 * ldc;
+    if (tile == 1) {
+      if (split) LAUNCH(4, 2, true); else LAUNCH(4, 2, false);
+    } else {
+      if (split) LAUNCH(2, 1, true); else LAUNCH(2, 1, false);
+    }
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) return (int)e;
+  }
+#undef LAUNCH
+  return 0;
+}
+
 // ============================================================== the plugin ABI entry point
 //
 // gemm_bf16_nt_m64's own checks and its own split call, so SK is the bf16 row's for every shape.
@@ -231,6 +449,22 @@ extern "C" int r4d_rad_gemm_bf16f8_m64(const RadArgs* a, RadStream s) {
     Cfg c;
     rc = cfg_for(a, g.K, g.M, 16, BR_FLAT, &c, (g.N + 15) / 16);   /* gemm_bf16_nt_m64's call */
     if (rc != RAD_OK) return rc;
+    /* The form: `form` 1 the m64 kernel, 2 the tiled one at any height (the device check's
+     * comparisons; refused where it cannot run), 0 (the engine's) the tiled one above 64 rows
+     * under RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED where it fits, never for the chained launch.
+     * Both give the same bits (the tiled form's contract above). */
+    const long long form = r4d_geti_or(a, "form", 0);
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0;
+    const bool fits = !chain && bf16f8_tiled_fits(g.M, g.N, g.K, g.lda);
+    if (form == 2 && !fits) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (form == 2 || (form == 0 && fits && g.M > 64 && r4d_ds41_dense_tiled())) {
+        int e = 0;
+        R4D_TRY("gemm_bf16f8_nt_tiled",
+            e = gemm_bf16f8_tiled_launch(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y), (int)g.M, (int)g.K,
+                                         (int)g.N, c.sk, (long)(uintptr_t)s, g.lda, g.ldc,
+                                         (long long)g.b->shape[0], (long long)g.b->shape[1]));
+        return e == 0 ? RAD_OK : R4D_NO(e < 0 ? RAD_E_SHAPE : RAD_E_DEVICE);
+    }
     R4D_TRY("gemm_bf16f8_nt_m64",
         gemm_bf16f8_m64_launch(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y), (int)g.M, (int)g.K,
                                (int)g.N, c.wv, c.sk, c.mb, (long)(uintptr_t)s,

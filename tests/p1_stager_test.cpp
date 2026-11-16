@@ -576,6 +576,30 @@ TEST(p1_tiled_and_tail_once_switches_are_default_off_and_accept_only_zero_or_one
     }
 }
 
+/* The WMMA twin (ds41p1::kWmmaEnv, inexact by design): default off, 0 / 1 / empty only, independent of the tiled
+ * switch. */
+TEST(p1_wmma_switch_is_default_off_and_accepts_only_zero_or_one) {
+    std::string value;
+    bool set = false;
+    auto get = [&](const char* k) -> const char* { return set && !std::strcmp(k, ds41p1::kWmmaEnv) ? value.c_str() : nullptr; };
+    Tunables t;
+    std::string why;
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK(!t.wmma);
+    set = true;
+    for (const char* v : { "", "0", "1" }) {
+        value = v;
+        REQUIRE(parse_tunables(get, &t, &why));
+        CHECK_EQ(t.wmma, value == "1");
+        CHECK(!t.tiled);
+    }
+    for (const char* v : { "2", "01", "yes", "-1", "1 " }) {
+        value = v;
+        CHECK(!parse_tunables(get, &t, &why));
+        CHECK(why.find(ds41p1::kWmmaEnv) != std::string::npos);
+    }
+}
+
 TEST(p1_swiglu_span_launch_guard_keeps_unknown_stateful_and_scratch_rows_full) {
     RadKernelInfo row{};
     row.name = "swiglu_clamped_bf16"; row.op = "swiglu_clamped"; row.domain = RAD_DOMAIN_DEVICE;

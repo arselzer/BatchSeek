@@ -70,6 +70,15 @@
  *                                                      lines for both forms, the stager's two-expert waves and
  *                                                      the tiled grid. Last line "p1tiled: PASS ..." or
  *                                                      "p1tiled: FAIL ...".
+ *   ds41_mxfp4_device_check LIBR4D.so p1wmma [MMAX] [ROUTES]
+ *                                                      the WMMA P1 twin (RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=1, set
+ *                                                      here beside P1, LCP and the tiled switch; inexact by design):
+ *                                                      against the exact twin, the bf16 ulp histogram, max abs/rel
+ *                                                      error, every 2+ ulp output within the f32 reordering bound,
+ *                                                      f32 outputs against host f64 sums, determinism across runs and
+ *                                                      grids, batch invariance of one token's rows at M 1..MMAX,
+ *                                                      T3/T4 and waves, and "p1 time:" lines. Last line "p1wmma:
+ *                                                      PASS ..." or "p1wmma: FAIL ...".
  *   ds41_mxfp4_device_check LIBR4D.so lsparse [C] [W:r...] the sparse ops at long context (LCP=C, 2048 by
  *                                                      default, set here): index_score, index_candidates,
  *                                                      index_topk (with and without keep) and attn_sparse_sink
@@ -150,6 +159,12 @@ static_assert(ds41p1::kTwinMaxRows == kR4dDs41P1MaxRows, "the twin's bound");
 static_assert(ds41p1::kMarkPacked == kR4dDs41MarkPacked && ds41p1::kMarkSkip == kR4dDs41MarkSkip, "the marks");
 static_assert(p1_same_str(ds41p1::kTiledEnv, kR4dDs41P1TiledEnv), "the tiled switch's name");
 static_assert(p1_same_str(ds41p1::kTiledMark, kR4dDs41P1TiledMark), "the tiled row's mark");
+static_assert(p1_same_str(ds41p1::kWmmaEnv, kR4dDs41P1WmmaEnv), "the WMMA switch's name");
+static_assert(p1_same_str(ds41p1::kWmmaMark, kR4dDs41P1WmmaMark), "the WMMA row's mark");
+static_assert(p1_same_str(ds41p1::kDenseTiledEnv, kR4dDs41DenseTiledEnv), "the dense tiled switch's name");
+static_assert(p1_same_str(ds41p1::kDenseTiledMark, kR4dDs41DenseTiledMark), "the dense tiled row's mark");
+static_assert(p1_same_str(ds41p1::kAttnWmmaEnv, kR4dDs41AttnWmmaEnv), "the attention switch's name");
+static_assert(p1_same_str(ds41p1::kAttnWmmaMark, kR4dDs41AttnWmmaMark), "the attention row's mark");
 
 #define HC(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::fprintf(stderr, "%s: %s\n", #x, hipGetErrorString(e_)); std::exit(2); } } while (0)
 
@@ -194,6 +209,9 @@ struct Lib {
     /* For `p1tiled`: the twin in a forced form (0 its own kernel, 1 the register-tiled one) and the served form. */
     int (*moe_p1_form)(const RadArgs*, RadStream, int, int) = nullptr;
     int (*p1_tiled_on)(void) = nullptr;
+    /* For `p1wmma`: the served form and the WMMA twin's f32 export. */
+    int (*p1_wmma_on)(void) = nullptr;
+    int (*moe_p1_wmma_f32)(const RadArgs*, RadStream, float*, int) = nullptr;
     int (*count)(void) = nullptr;
     const RadKernelInfo* (*at)(int) = nullptr;
     explicit Lib(const char* path) {
@@ -227,6 +245,8 @@ struct Lib {
         moe_p1_opts = (int (*)(const RadArgs*, RadStream, int, int, int, int))dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_opts");
         moe_p1_form = (int (*)(const RadArgs*, RadStream, int, int))dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_form");
         p1_tiled_on = (int (*)(void))dlsym(h, "r4d_ds41_p1_tiled_on");
+        p1_wmma_on = (int (*)(void))dlsym(h, "r4d_ds41_p1_wmma_on");
+        moe_p1_wmma_f32 = (int (*)(const RadArgs*, RadStream, float*, int))dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_wmma_f32");
         count = (int (*)(void))dlsym(h, "rad_kernel_count");
         at = (const RadKernelInfo* (*)(int))dlsym(h, "rad_kernel_at");
         if (!moe) { std::fprintf(stderr, "%s lacks r4d_rad_moe_gemm_mxfp4_gemv\n", path); std::exit(2); }
@@ -3363,6 +3383,487 @@ int p1_check(const Lib& L, int mmax, const char* routes_path, bool tiled = false
     return rc;
 }
 
+/* ================================================================== `p1wmma`: the WMMA P1 twin (inexact by design)
+ *
+ * RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=1 (set here, beside P1, LCP=2048 and the tiled switch, as a Qw arm has them):
+ * the row must name the WMMA twin, which serves the twin's calls. It is NOT held to the decode band's bits; instead,
+ * against the exact twin (the register-tiled form forced, the decode band's bits by the `p1tiled` check) at ds41's
+ * shapes and M 17 .. MMAX, real and synthetic routings, block, packed and skipped entries:
+ *   - bf16 outputs: the ulp histogram (0, 1, 2, 3-4, 5+), max |diff| and max |diff| / |exact|; an output more than
+ *     one ulp away must be within 2^-15 sum|w x| (+ an ulp) of the exact one (cancellation: an f32 reordering of a
+ *     sum moves it by at most that), NaN / infinity where the exact twin has them;
+ *   - f32 outputs (the checker export, before the bf16 rounding) of sampled finite rows within 2^-16 sum|w x| of the
+ *     f64 sum of the exact products (host);
+ *   - determinism: a second served run and form 2 on grids 7 and 4096 give the same bytes;
+ *   - T3 / T4: skipped rows untouched, the tail zeros; the stager's waves equal to one launch (p1_waves, byte for byte:
+ *     each output is its own row's, whatever the wave);
+ *   - batch invariance: one token's gate_up and down rows the same bits in passes of 1, 7, 64, 1896 and MMAX tokens;
+ *   - "p1 time:" lines: gate_up + down a pass, the WMMA twin against the exact twin's tiled and own kernels.
+ * Last line "p1wmma: PASS: ..." or "p1wmma: FAIL: ...". */
+typedef int (*P1Wf32)(const RadArgs*, RadStream, float*, int);
+struct P1wStats {
+    unsigned long long outputs = 0, hist[5] = { 0, 0, 0, 0, 0 }, more_bad = 0, cls_bad = 0, f32_n = 0, f32_bad = 0;
+    double max_abs = 0, max_rel = 0, f32_max_rel = 0;
+    size_t det = 0, invar = 0;
+    unsigned long long range = 0;   /* NaN/inf class differences on rows with an activation above 2^120 */
+    /* class differences where the exact path's own f32 weights or products overflow: the WMMA twin agreeing with the
+     * f64 sum of the exact products (ok), or not (bad, counted as a bad value too) */
+    unsigned long long ovf_ok = 0, ovf_bad = 0;
+};
+long p1w_ulp(uint16_t a, uint16_t b) {
+    auto ord = [](uint16_t v) { return (v & 0x8000u) ? -(long)(v & 0x7fffu) : (long)v; };
+    return std::labs(ord(a) - ord(b));
+}
+bool p1w_fin(uint16_t v) { return (v & 0x7f80u) != 0x7f80u; }
+/* Weight row n of a block_mxfp4 weight against activation row x: the f64 sum of the exact products and of their
+ * magnitudes. */
+void p1w_host_dot(const uint8_t* blk, int K, int n, const uint16_t* x, double* S, double* Aa, bool* ovf = nullptr,
+                  bool* both = nullptr) {
+    static const float kv[16] = { 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12 };
+    const int UK = K / 32;
+    double s = 0, a = 0, pos = 0, neg = 0;
+    for (int u = 0; u < UK; ++u) {
+        const uint8_t* b = blk + ((size_t)n * UK + u) * 17;
+        const uint32_t e = b[0];
+        const uint32_t bits = e < 2u ? (0x00200000u << e) : ((e - 1u) << 23);
+        float d;
+        std::memcpy(&d, &bits, 4);
+        for (int v = 0; v < 32; ++v) {
+            const int nib = v < 16 ? (b[1 + v] & 15) : (b[1 + v - 16] >> 4);
+            const float w = kv[nib] * d;
+            {
+                const double q = (double)w * (double)bf16_to_f32(x[(size_t)u * 32 + v]);
+                if (q > 0) pos += q;
+                if (q < 0) neg -= q;
+            }
+            const double p = (double)w * (double)bf16_to_f32(x[(size_t)u * 32 + v]);
+            /* The exact path's f32 weight or rounded f32 product past the f32 range. */
+            if (ovf && (std::isinf(w) || (std::isfinite(p) && std::fabs(p) > (double)3.4028234663852886e38))) *ovf = true;
+            s += p;
+            a += std::fabs(p);
+        }
+    }
+    *S = s;
+    *Aa = a;
+    /* Positive and negative mass each past the f32 range: an f32 sum of these terms reaches +inf, -inf or NaN by
+     * its order alone. */
+    if (both) *both = pos > (double)3.4028234663852886e38 && neg > (double)3.4028234663852886e38;
+}
+int p1w_f32(P1Ctx& c, P1Wf32 f, void* x, int AR, int K, void* tab, int N, void* so, void* of, int T, void* y, float* y32,
+            bool sorted_order) {
+    RadTensor t[5] = { tensor(x, RAD_BF16, { AR, K }), tensor(tab, RAD_U8, { kNe, N, K / 32 * 17 }),
+                       tensor(so, RAD_I32, { T }), tensor(of, RAD_I32, { kNe + 1 }), tensor(y, RAD_BF16, { T, N }) };
+    t[1].stride[0] = 0;
+    RadParam p[6] = { ps("type", "mxfp4"), pi("N", N), pi("K", K), pi("n_expert", kNe), pi("top_k", kTop),
+                      ps("a_order", sorted_order ? "sorted" : "token") };
+    RadArgs a{};
+    a.t = t; a.n_t = 5; a.p = p; a.n_p = 6;
+    return f ? f(&a, (RadStream)c.s, y32, 0) : RAD_E_UNSUPPORTED;
+}
+
+void p1w_rows(P1Ctx& c, P1Wf32 f32x, const P1Routing& r, int M, std::mt19937_64& rng, P1wStats& st) {
+    ++c.cases;
+    const P1Pass full = p1_pass(r, 0, M);
+    const int T = M * kTop;
+    std::vector<uint16_t> x((size_t)M * kEmbd), act((size_t)T * kFf);
+    for (int t = 0; t < M; ++t) {
+        const auto row = make_x(kEmbd, rng, t % 11 == 4);
+        std::copy(row.begin(), row.end(), x.begin() + (size_t)t * kEmbd);
+    }
+    {
+        std::normal_distribution<float> nd(0.f, 0.3f);
+        for (auto& v : act) v = f32_to_bf16(nd(rng));
+        static const uint16_t sp[] = { 0x7fc0, 0xff80, 0x7f80, 0x0001, 0x8001 };
+        for (int i = 0; i < 64; ++i) act[(size_t)(rng() % act.size())] = sp[rng() % 5];
+    }
+    std::vector<int> forms(kNe);
+    for (int e = 0; e < kNe; ++e) {
+        const uint64_t q = rng() % 20;
+        forms[(size_t)e] = q < 4 ? 2 : q < 10 ? 1 : 0;
+    }
+    std::vector<int> expert_of((size_t)std::max(1, full.local));
+    for (int e = 0; e < kNe; ++e)
+        for (int i = full.off[(size_t)e]; i < full.off[(size_t)e + 1]; ++i) expert_of[(size_t)i] = e;
+    Dev d_so(full.sorted.size() * 4), d_of((kNe + 1) * 4), d_x(x.size() * 2);
+    d_so.put(full.sorted.data());
+    d_of.put(full.off.data());
+    d_x.put(x.data());
+    char label[96];
+    std::snprintf(label, sizeof label, "M=%d %s rank %d", M, r.name.c_str(), r.rank);
+    for (int proj = 0; proj < 2; ++proj) {
+        const bool g = proj == 0;
+        P1Bank& b = g ? c.gu : c.dn;
+        const int N = b.N, K = b.K;
+        std::vector<void*> tab = p1_table(b, forms, c.noread);
+        Dev d_tab(kNe * sizeof(void*));
+        d_tab.put(tab.data());
+        std::vector<uint16_t> in;
+        std::unique_ptr<Dev> d_in;
+        if (!g) {
+            in.assign((size_t)T * K, 0);
+            for (int i = 0; i < full.local; ++i)
+                std::memcpy(&in[(size_t)i * K], &act[(size_t)full.sorted[(size_t)i] * K], (size_t)K * 2);
+            d_in.reset(new Dev(in.size() * 2));
+            d_in->put(in.data());
+        }
+        void* xin = g ? d_x.p : d_in->p;
+        const int AR = g ? M : T;
+        Dev d_y((size_t)T * N * 2), d_e((size_t)T * N * 2);
+        HC(hipMemset(d_y.p, 0xAA, d_y.n));
+        HC(hipMemset(d_e.p, 0xAA, d_e.n));
+        int rc = p1_launch(c, c.p1, nullptr, xin, AR, K, d_tab.p, N, d_so.p, d_of.p, T, d_y.p, !g);
+        rc |= p1_form(c, 1, 0, xin, AR, K, d_tab.p, N, d_so.p, d_of.p, T, d_e.p, !g);
+        HC(hipStreamSynchronize(c.s));
+        if (rc != RAD_OK) {
+            std::printf("FAIL %s %s: a launch was refused\n", label, g ? "gate_up" : "down");
+            ++c.bad;
+            return;
+        }
+        std::vector<uint16_t> y((size_t)T * N), ye((size_t)T * N);
+        d_y.get(y.data());
+        d_e.get(ye.data());
+        size_t untouched = 0, tail = 0;
+        unsigned long long more_bad = 0, cls_bad = 0, hist[5] = { 0, 0, 0, 0, 0 };
+        for (int i = 0; i < full.local; ++i) {
+            const int e = expert_of[(size_t)i];
+            const uint16_t *pw = &y[(size_t)i * N], *pe = &ye[(size_t)i * N];
+            if (forms[(size_t)e] == 2) {
+                for (int q = 0; q < N; ++q) untouched += pw[q] != 0xAAAAu;
+                continue;
+            }
+            const uint16_t* xr = g ? &x[(size_t)(full.sorted[(size_t)i] / kTop) * kEmbd] : &in[(size_t)i * K];
+            bool huge = false;   /* an activation above 2^120: kv x can pass f32 before d (the kernel's range note) */
+            for (int k = 0; k < K; ++k) huge |= p1w_fin(xr[k]) && std::fabs(bf16_to_f32(xr[k])) > 0x1p120f;
+            for (int q = 0; q < N; ++q) {
+                ++st.outputs;
+                if (pw[q] == pe[q] || (p1_nan(pw[q]) && p1_nan(pe[q]))) { ++hist[0]; continue; }
+                if (!p1w_fin(pw[q]) || !p1w_fin(pe[q])) {
+                    if (huge) { ++st.range; continue; }
+                    /* The exact path's own f32 weights or products overflow (an e8m0 of 2^126-scale weights: the
+                     * release's scales are 117..126, work/fastpf/real-e8m0-scan.txt): its NaN is then an artefact of
+                     * f32 range, and the WMMA twin is held to the f64 sum of the exact products instead -- the same
+                     * infinity, or NaN where that sum is NaN; where both signs' mass passes f32 (an f32 sum then
+                     * reaches +inf, -inf or NaN by its order alone, the exact twin's included) any non-finite value.
+                     * Counted apart; a mismatch there is a bad value. */
+                    {
+                        double S0, A0;
+                        bool ovf = false, both = false;
+                        p1w_host_dot(b.host[(size_t)e].data(), K, q, xr, &S0, &A0, &ovf, &both);
+                        if (ovf) {
+                            const float fw = bf16_to_f32(pw[q]);
+                            /* Both signs' mass past f32: every class is an order's (the exact twin's too). */
+                            const bool agree = both ? !std::isfinite(fw)
+                                             : std::isnan(S0) ? std::isnan(fw)
+                                             : std::isinf(S0) ? (std::isinf(fw) && (fw > 0) == (S0 > 0))
+                                             : std::isfinite(fw) && std::fabs((double)fw - S0) <= std::ldexp(A0, -15) +
+                                                   std::ldexp(1.0, std::ilogb(std::max(std::fabs(S0), 1e-30)) - 7);
+                            if (agree) { ++st.ovf_ok; continue; }
+                            ++st.ovf_bad;
+                        }
+                    }
+                    /* Name it: both sides, the f64 sum and sum |w x|, the weight row's largest block scale and the
+                     * activation row's largest magnitude. */
+                    if (cls_bad < 6) {
+                        double S, Aa;
+                        p1w_host_dot(b.host[(size_t)e].data(), K, q, xr, &S, &Aa);
+                        int emax = 0, emin = 255;
+                        const uint8_t* wr = b.host[(size_t)e].data() + (size_t)q * (K / 32) * 17;
+                        for (int u = 0; u < K / 32; ++u) { emax = std::max(emax, (int)wr[u * 17]); emin = std::min(emin, (int)wr[u * 17]); }
+                        float xm = 0;
+                        for (int k = 0; k < K; ++k) if (p1w_fin(xr[k])) xm = std::max(xm, std::fabs(bf16_to_f32(xr[k])));
+                        std::printf("  %s %s: slot %d col %d (expert %d, %s): exact %04x (%g) wmma %04x (%g); f64 sum %.6g, "
+                                    "sum |wx| %.6g; the weight row's e8m0 %d..%d; the activation row's max |x| %g\n",
+                                    label, g ? "gate_up" : "down", i, q, e, forms[(size_t)e] ? "packed" : "block", pe[q],
+                                    bf16_to_f32(pe[q]), pw[q], bf16_to_f32(pw[q]), S, Aa, emin, emax, xm);
+                    }
+                    ++cls_bad;
+                    continue;
+                }
+                const long d = p1w_ulp(pw[q], pe[q]);
+                ++hist[d <= 1 ? 1 : d == 2 ? 2 : d <= 4 ? 3 : 4];
+                const double fw = bf16_to_f32(pw[q]), fe = bf16_to_f32(pe[q]), gap = std::fabs(fw - fe);
+                st.max_abs = std::max(st.max_abs, gap);
+                if (fe != 0) st.max_rel = std::max(st.max_rel, gap / std::fabs(fe));
+                if (d > 1) {
+                    double S, Aa;
+                    p1w_host_dot(b.host[(size_t)e].data(), K, q, xr, &S, &Aa);
+                    const double u = std::ldexp(1.0, std::ilogb(std::max(std::fabs(fw), std::fabs(fe))) - 7);
+                    if (gap > std::ldexp(Aa, -15) + u) {
+                        if (more_bad < 4)
+                            std::printf("  %s %s: slot %d col %d: exact %04x wmma %04x (%ld ulp), sum %.9g of |%.9g|\n",
+                                        label, g ? "gate_up" : "down", i, q, pe[q], pw[q], d, S, Aa);
+                        ++more_bad;
+                    }
+                }
+            }
+        }
+        for (size_t i = (size_t)full.local * N; i < y.size(); ++i) tail += y[i] != 0;
+        /* f32: every output of up to 3 sampled finite rows, against the host's f64 sum. */
+        unsigned long long f32_n = 0, f32_bad = 0;
+        if (f32x && full.local) {
+            Dev d_32((size_t)T * N * 4), d_y3((size_t)T * N * 2);
+            HC(hipMemset(d_32.p, 0, d_32.n));
+            HC(hipMemset(d_y3.p, 0xAA, d_y3.n));   /* skipped rows keep 0xAAAA, as in the served call's output */
+            if (p1w_f32(c, f32x, xin, AR, K, d_tab.p, N, d_so.p, d_of.p, T, d_y3.p, (float*)d_32.p, !g) != RAD_OK) {
+                std::printf("FAIL %s: the f32 export refused the call\n", label);
+                ++c.bad;
+            } else {
+                HC(hipStreamSynchronize(c.s));
+                std::vector<float> y32((size_t)T * N);
+                std::vector<uint16_t> y3((size_t)T * N);
+                d_32.get(y32.data());
+                d_y3.get(y3.data());
+                st.det += count_diff(y.data(), y3.data(), y.size());
+                for (int tries = 0, done = 0; tries < 40 && done < 3; ++tries) {
+                    const int i = (int)(rng() % (uint64_t)full.local), e = expert_of[(size_t)i];
+                    if (forms[(size_t)e] == 2) continue;
+                    const uint16_t* xr = g ? &x[(size_t)(full.sorted[(size_t)i] / kTop) * kEmbd] : &in[(size_t)i * K];
+                    bool fin = true;
+                    for (int k = 0; k < K; ++k)
+                        fin &= p1w_fin(xr[k]) && std::fabs(bf16_to_f32(xr[k])) <= 0x1p120f;
+                    if (!fin) continue;
+                    ++done;
+                    for (int q = 0; q < N; ++q) {
+                        double S, Aa;
+                        p1w_host_dot(b.host[(size_t)e].data(), K, q, xr, &S, &Aa);
+                        if (!std::isfinite(S)) continue;
+                        const double err = std::fabs((double)y32[(size_t)i * N + q] - S);
+                        ++f32_n;
+                        if (err > std::ldexp(Aa, -16) + 1e-37) ++f32_bad;
+                        if (Aa > 0) st.f32_max_rel = std::max(st.f32_max_rel, err / Aa);
+                    }
+                }
+            }
+        }
+        /* Determinism: a second served run and form 2 on other grids. */
+        size_t det = 0;
+        for (int grid : { -1, 7, 4096 }) {
+            HC(hipMemset(d_e.p, 0xAA, d_e.n));
+            const int r2 = grid < 0 ? p1_launch(c, c.p1, nullptr, xin, AR, K, d_tab.p, N, d_so.p, d_of.p, T, d_e.p, !g)
+                                    : p1_form(c, 2, grid, xin, AR, K, d_tab.p, N, d_so.p, d_of.p, T, d_e.p, !g);
+            HC(hipStreamSynchronize(c.s));
+            if (r2 != RAD_OK) { ++det; continue; }
+            std::vector<uint16_t> y2((size_t)T * N);
+            d_e.get(y2.data());
+            det += count_diff(y.data(), y2.data(), y.size());
+        }
+        st.det += det;
+        for (int k = 0; k < 5; ++k) st.hist[k] += hist[k];
+        st.more_bad += more_bad;
+        st.cls_bad += cls_bad;
+        st.f32_n += f32_n;
+        st.f32_bad += f32_bad;
+        c.rows += (size_t)full.local;
+        std::printf("p1wmma rows %-16s %-7s local %5d: ulp 0 %llu, 1 %llu, 2 %llu, 3-4 %llu, 5+ %llu (%llu beyond the "
+                    "reordering bound), %llu NaN/inf class differences; f32 %llu checked, %llu bad; %zu skipped values "
+                    "written, %zu tail values not zero, %zu differ across runs and grids\n", label, g ? "gate_up" : "down",
+                    full.local, hist[0], hist[1], hist[2], hist[3], hist[4], more_bad, cls_bad, f32_n, f32_bad, untouched,
+                    tail, det);
+        std::fflush(stdout);
+        c.bad += more_bad + cls_bad + f32_bad + untouched + tail + det;
+    }
+}
+
+/* One token's rows in passes of `Ms` tokens (the rest random): the same bits in each. */
+void p1w_invariance(P1Ctx& c, const std::vector<int>& Ms, P1wStats& st) {
+    ++c.cases;
+    const int me[kTop] = { 3, 150, 50, 300, 95, 200 };   /* 3, 50, 95 local to rank 0 */
+    std::mt19937_64 r0(77);
+    const std::vector<uint16_t> x0 = make_x(kEmbd, r0, false);
+    std::vector<uint16_t> a0((size_t)kTop * kFf);
+    {
+        std::normal_distribution<float> nd(0.f, 0.3f);
+        for (auto& v : a0) v = f32_to_bf16(nd(r0));
+    }
+    std::vector<int> forms(kNe);
+    for (int e = 0; e < kNe; ++e) forms[(size_t)e] = e % 3 == 1 ? 1 : 0;
+    std::vector<void*> tg = p1_table(c.gu, forms, c.noread), td = p1_table(c.dn, forms, c.noread);
+    Dev d_tg(kNe * sizeof(void*)), d_td(kNe * sizeof(void*));
+    d_tg.put(tg.data());
+    d_td.put(td.data());
+    std::vector<uint16_t> refg, refd;
+    for (int M : Ms) {
+        std::mt19937_64 rng(1000 + (uint64_t)M);
+        P1Routing r = p1_routing("uniform", M, 0, 0, rng);
+        for (int k = 0; k < kTop; ++k) r.p[(size_t)k] = me[k];
+        const P1Pass p = p1_pass(r, 0, M);
+        const int T = M * kTop;
+        std::vector<uint16_t> x((size_t)M * kEmbd), din((size_t)T * kFf);
+        std::normal_distribution<float> nd(0.f, 0.3f);
+        for (auto& v : x) v = f32_to_bf16(nd(rng));
+        for (auto& v : din) v = f32_to_bf16(nd(rng));
+        std::copy(x0.begin(), x0.end(), x.begin());
+        std::vector<int> mine;
+        for (int k = 0; k < kTop; ++k)
+            for (int i = 0; i < p.local; ++i)
+                if (p.sorted[(size_t)i] == k) {
+                    mine.push_back(i);
+                    std::memcpy(&din[(size_t)i * kFf], &a0[(size_t)k * kFf], (size_t)kFf * 2);
+                }
+        Dev d_so((size_t)T * 4), d_of((kNe + 1) * 4), d_x(x.size() * 2), d_a(din.size() * 2);
+        Dev G((size_t)T * 2 * kFf * 2), D((size_t)T * kEmbd * 2);
+        d_so.put(p.sorted.data());
+        d_of.put(p.off.data());
+        d_x.put(x.data());
+        d_a.put(din.data());
+        int rc = p1_launch(c, c.p1, nullptr, d_x.p, M, kEmbd, d_tg.p, 2 * kFf, d_so.p, d_of.p, T, G.p, false);
+        rc |= p1_launch(c, c.p1, nullptr, d_a.p, T, kFf, d_td.p, kEmbd, d_so.p, d_of.p, T, D.p, true);
+        HC(hipStreamSynchronize(c.s));
+        if (rc != RAD_OK || mine.size() != 3) {
+            std::printf("FAIL p1wmma invariance M %d: %s\n", M, rc != RAD_OK ? "a launch was refused" : "token 0 is not 3 local slots");
+            ++c.bad;
+            return;
+        }
+        std::vector<uint16_t> hg((size_t)T * 2 * kFf), hd((size_t)T * kEmbd), g, d;
+        G.get(hg.data());
+        D.get(hd.data());
+        for (int i : mine) {
+            g.insert(g.end(), hg.begin() + (ptrdiff_t)i * 2 * kFf, hg.begin() + (ptrdiff_t)(i + 1) * 2 * kFf);
+            d.insert(d.end(), hd.begin() + (ptrdiff_t)i * kEmbd, hd.begin() + (ptrdiff_t)(i + 1) * kEmbd);
+        }
+        if (refg.empty()) { refg = g; refd = d; }
+        const size_t dd = count_diff(g.data(), refg.data(), g.size()) + count_diff(d.data(), refd.data(), d.size());
+        st.invar += dd;
+        std::printf("p1wmma invariance: M %4d (%5d local slots): token 0's 3 gate_up and 3 down rows: %zu values differ "
+                    "from M %d's\n", M, p.local, dd, Ms[0]);
+        std::fflush(stdout);
+    }
+    c.bad += st.invar;
+}
+
+int p1w_check(const Lib& L, int mmax, const char* routes_path) {
+    P1Ctx c;
+    c.L = &L;
+    const char* const mode = ds41p1::kWmmaCheckMode;
+    int rc = 0;
+    {
+        const RadKernelInfo* twin = nullptr;
+        for (int i = 0; L.count && i < L.count(); ++i) {
+            const RadKernelInfo* k = L.at(i);
+            if (k && k->name && !std::strcmp(k->name, ds41p1::kTwinRow)) twin = k;
+        }
+        const bool names = twin && twin->computes && std::strstr(twin->computes, ds41p1::kWmmaMark);
+        const int on = L.p1_wmma_on ? L.p1_wmma_on() : 0;
+        const bool ok = twin && L.moe_p1 && twin->launch == L.moe_p1 && names && on == 1 && L.moe_p1_form &&
+                        L.moe_p1_wmma_f32;
+        std::printf("%s: row table: %s %s; served form: %s (the row %s it, r4d_ds41_p1_wmma_on %d%s)\n",
+                    ok ? "PASS" : "FAIL", ds41p1::kTwinRow, twin ? "present" : "missing", ds41p1::kWmmaMark,
+                    names ? "names" : "does not name", on,
+                    L.moe_p1_wmma_f32 && L.moe_p1_form ? "" : ", no _form or _wmma_f32 export");
+        if (!ok) {
+            std::printf("%s: FAIL: the plugin does not serve the WMMA twin\n", mode);
+            return 1;
+        }
+    }
+    c.p1 = L.moe_p1;
+    c.opts = L.moe_p1_opts;
+    HC(hipStreamCreate(&c.s));
+    c.noread = (const void*)(uintptr_t)0x1000;
+    if (routes_path) {
+        FILE* f = std::fopen(routes_path, "rb");
+        int32_t h[3];
+        if (f && std::fread(h, 4, 3, f) == 3 && h[2] == kTop && h[0] > 0 && h[1] > 0) {
+            g_p1_layers = h[0];
+            g_p1_rows = h[1];
+            g_p1_routes.resize((size_t)h[0] * h[1] * kTop);
+            if (std::fread(g_p1_routes.data(), 2, g_p1_routes.size(), f) != g_p1_routes.size()) g_p1_routes.clear();
+        }
+        if (f) std::fclose(f);
+        if (g_p1_routes.empty()) std::printf("note: cannot read the routes %s; synthetic routings only\n", routes_path);
+    }
+    const bool real = !g_p1_routes.empty();
+    const auto t0 = std::chrono::steady_clock::now();
+    std::mt19937_64 rng(1717);
+    p1_bank(&c.gu, 2 * kFf, kEmbd, rng);
+    p1_bank(&c.dn, kEmbd, kFf, rng);
+    std::printf("p1wmma: 96 experts of gate_up [%d, %d] and down [%d, %d] in VRAM, block_mxfp4 and packed (%d and %d raw "
+                "rounds)\n", 2 * kFf, kEmbd, kEmbd, kFf, c.gu.raw_rounds, c.dn.raw_rounds);
+    std::fflush(stdout);
+    P1wStats st;
+    P1Wf32 f32x = L.moe_p1_wmma_f32;
+    std::vector<int> Ms = { 17, 33, 48, 64, 100, 256, 1024, 2048, 3072 };
+    if (mmax > 3072) Ms.push_back(mmax);
+    for (int M : Ms) {
+        if (M > mmax) continue;
+        if (real) {
+            p1w_rows(c, f32x, p1_routing("real", M, 0, 3 + M % 30, rng), M, rng, st);
+            p1w_rows(c, f32x, p1_routing("real", M, 2, 25, rng), M, rng, st);
+        }
+        p1w_rows(c, f32x, p1_routing("skewed", M, 1, 0, rng), M, rng, st);
+        if (M <= 256) {
+            p1w_rows(c, f32x, p1_routing("uniform", M, 3, 0, rng), M, rng, st);
+            p1w_rows(c, f32x, p1_routing("hot", M, 0, 0, rng), M, rng, st);
+        }
+    }
+    std::vector<int> inv = { 1, 7, 64, 1896 };
+    if (mmax > 1896) inv.push_back(mmax);
+    p1w_invariance(c, inv, st);
+    for (int M : { 64, 256, 2048 }) {
+        if (M > mmax) continue;
+        p1_waves(c, real ? p1_routing("real", M, 0, 12, rng) : p1_routing("skewed", M, 0, 0, rng), M, rng);
+    }
+    const unsigned long long fin = st.hist[0] + st.hist[1] + st.hist[2] + st.hist[3] + st.hist[4];
+    std::printf("%s: %d cases, %zu (token, slot) rows, %llu outputs against the exact twin: ulp 0 %llu (%.4f%%), 1 %llu, "
+                "2 %llu, 3-4 %llu, 5+ %llu; max |diff| %.3g, max |diff|/|exact| %.3g; %llu beyond the reordering bound, "
+                "%llu NaN/inf class differences (%llu more on rows with |x| > 2^120, the range note; %llu more where the exact "
+                "path's own f32 weights or products overflow, the WMMA twin there equal to the f64 sum's class, %llu not); "
+                "f32 %llu checked, "
+                "%llu beyond 2^-16 sum|wx|, max |err|/sum|wx| %.3g; %zu differ across runs/grids; batch invariance %zu differ; %zu bad values, %.0f s\n", mode, c.cases,
+                c.rows, st.outputs, st.hist[0], fin ? 100.0 * st.hist[0] / fin : 0.0, st.hist[1], st.hist[2],
+                st.hist[3], st.hist[4], st.max_abs, st.max_rel, st.more_bad, st.cls_bad, st.range, st.ovf_ok, st.ovf_bad, st.f32_n, st.f32_bad,
+                st.f32_max_rel, st.det, st.invar, c.bad,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    std::fflush(stdout);
+    /* Timing: gate_up + down a pass, the served WMMA twin, the tiled form and the twin's own kernel. */
+    std::printf("p1 time: gate_up + down a pass (hipEvent, median of 5), us a local expert-row\n");
+    for (int M : { 256, 1024, 2048, 4096 }) {
+        if (M > mmax) continue;
+        const P1Routing r = real ? p1_routing("real", M, 0, 12, rng) : p1_routing("skewed", M, 0, 0, rng);
+        const P1Pass p = p1_pass(r, 0, M);
+        const int T = M * kTop;
+        Dev d_so((size_t)T * 4), d_of((kNe + 1) * 4), d_x((size_t)M * kEmbd * 2), d_a((size_t)T * kFf * 2);
+        Dev gy((size_t)T * 2 * kFf * 2), dy((size_t)T * kEmbd * 2), tg(kNe * sizeof(void*)), td(kNe * sizeof(void*));
+        d_so.put(p.sorted.data());
+        d_of.put(p.off.data());
+        HC(hipMemset(d_x.p, 0x3c, d_x.n));
+        HC(hipMemset(d_a.p, 0x3c, d_a.n));
+        for (int fm = 0; fm < 2; ++fm) {   /* every entry block_mxfp4, then every entry packed */
+            std::vector<int> forms(kNe, fm);
+            std::vector<void*> a = p1_table(c.gu, forms, c.noread), b = p1_table(c.dn, forms, c.noread);
+            tg.put(a.data());
+            td.put(b.data());
+            for (int form : { 2, 1, 0 }) {
+                if (form == 0 && M > 1024) continue;   /* the twin's own kernel costs seconds a call up there */
+                const double gt = p1_time(c, [&] { return p1_form(c, form, 0, d_x.p, M, kEmbd, tg.p, 2 * kFf, d_so.p,
+                                                                  d_of.p, T, gy.p, false); }, 5);
+                const double dt = p1_time(c, [&] { return p1_form(c, form, 0, d_a.p, T, kFf, td.p, kEmbd, d_so.p,
+                                                                  d_of.p, T, dy.p, true); }, 5);
+                std::printf("p1 time: M %4d %-8s rank 0 %-12s %-6s local %5d live %2d busiest %4d: gate_up %9.1f down "
+                            "%9.1f us = %7.2f us an expert-row\n", M, r.name.c_str(),
+                            form == 2 ? "P1 WMMA" : form == 1 ? "P1 tiled" : "P1 twin", fm ? "packed" : "block", p.local,
+                            p.live, p.busiest, gt, dt, p.local ? (gt + dt) / p.local : 0.0);
+                std::fflush(stdout);
+            }
+        }
+    }
+    (void)hipStreamDestroy(c.s);
+    rc |= c.bad ? 1 : 0;
+    if (rc)
+        std::printf("%s: FAIL: %zu bad values in %d cases (beyond the reordering bound, NaN/inf classes, f32, T3/T4, "
+                    "determinism, batch invariance or waves; see FAIL and the counts above)\n", mode, c.bad, c.cases);
+    else
+        std::printf("%s: PASS: %s on %s at M 17..%d: %llu outputs within f32 reordering of the exact twin (%.4f%% "
+                    "bit-equal, max %llu at 2+ ulp, all within the bound), f32 within 2^-16 sum|wx| (max %.3g), the "
+                    "same bytes across runs and grids, one token's rows the same bits at M %d..%d, skipped rows "
+                    "untouched, tail zeros, waves equal to one launch (%d cases); exempt from the exact twin's NaN/inf "
+                    "class, held to the f64 sum instead: %llu outputs whose exact f32 weights or products overflow "
+                    "(test-only e8m0 edges; the release's are 117..126), %llu on rows with |x| > 2^120\n", mode,
+                    ds41p1::kTwinRow, ds41p1::kWmmaMark, Ms.back() <= mmax ? Ms.back() : mmax, st.outputs,
+                    fin ? 100.0 * st.hist[0] / fin : 0.0, st.hist[2] + st.hist[3] + st.hist[4], st.f32_max_rel,
+                    inv.front(), inv.back(), c.cases, st.ovf_ok, st.range);
+    return rc;
+}
+
 /* ================================================================== `aux` / `auxrt`: the aux expert worker
  *
  * The worker (core/place/aux_expert_worker.h; work/aux/SPEC.md §14.1) relaunches a rank's decode chain for the
@@ -4267,8 +4768,340 @@ int aux_swap(const Lib& lib, int rounds) {
     return 1;
 }
 
+/* ================================================================== attnwm (the fast sparse attention)
+ *
+ * RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA's form (r4d_ds41_sparse.hip, ds41_attn_fast_kernel; inexact by design: only the
+ * q.k and sum p k sums' order and the p k products' roundings move) against the exact kernels (`form` 1, what LCP
+ * serves at every height), both through attn_sparse_sink's own entry, over sparse_fix's chunks (window keys, the
+ * compressed selections with misses) at 16 and 32 heads:
+ *   - every output's NaN / inf class equal to the exact kernel's;
+ *   - the bf16 ulp distance histogram over all outputs;
+ *   - against an f64 reference (sampled rows, and every row with an output more than 4 ulp from the exact kernel's):
+ *     |out - ref| <= 2^-8 |ref| + 2^-12 sum_k p_k |k_d| / den for both forms (the second term is the f32 sums'
+ *     scale: cancellation can move a small output by more ulps than its size suggests);
+ *   - batch invariance: the rows launched alone, 16 at a time and as suffixes give the same bytes as in the chunk,
+ *     and a rerun gives the same bytes;
+ *   - edge chunks: a short context (missing window keys and selections), large scores (p down to underflow), a
+ *     large sink, NaN / inf in q and in a key;
+ *   - with the switch set, the engine's form (`form` 0) is the fast one at 1 row and at the chunk;
+ *   - us a launch, exact against fast, at 16 heads. */
+struct AttnDev {
+    const SparseFix& f;
+    Dev q, wc, wbt, cc, cbt, sel, pos, sink, wu, cu;
+    explicit AttnDev(const SparseFix& x)
+        : f(x), q(x.q.size() * 2), wc(x.wc.size() * 2), wbt(x.wbt.size() * 4), cc(x.cc.size() * 2),
+          cbt(x.cbt.size() * 4), sel(x.sel.size() * 4), pos(x.pos.size() * 4), sink(x.sink.size() * 4), wu(4), cu(8) {
+        q.put(x.q.data()); wc.put(x.wc.data()); wbt.put(x.wbt.data()); cc.put(x.cc.data()); cbt.put(x.cbt.data());
+        sel.put(x.sel.data()); pos.put(x.pos.data()); sink.put(x.sink.data());
+    }
+};
+/* Rows [r0, r1) as one launch in `form` into out's rows r0.. (device, bf16 rows of H * D). */
+int attn_form(const Lib& L, hipStream_t s, AttnDev& d, int r0, int r1, int form, void* out) {
+    const SparseFix& f = d.f;
+    const int n = r1 - r0;
+    const int32_t cu[2] = { 0, n }, used = f.pos[(size_t)r1 - 1] + 1;
+    HC(hipMemcpyAsync(d.wu.p, &used, 4, hipMemcpyHostToDevice, s));
+    HC(hipMemcpyAsync(d.cu.p, cu, 8, hipMemcpyHostToDevice, s));
+    char* qp = (char*)d.q.p + (size_t)r0 * f.H * f.D * 2;
+    char* op = (char*)out + (size_t)r0 * f.H * f.D * 2;
+    RadTensor t[11] = { tensor(qp, RAD_BF16, { n, f.H * f.D }),
+                        tensor(d.wc.p, RAD_BF16, { (int64_t)f.nwbt, 1, f.bs, f.D }),
+                        tensor(d.wbt.p, RAD_I32, { 1, f.nwbt }), tensor(d.wu.p, RAD_I32, { 1 }),
+                        tensor(d.cc.p, RAD_BF16, { (int64_t)f.ncbt, 1, f.cbs, f.D / f.ratio }),
+                        tensor(d.cbt.p, RAD_I32, { 1, f.ncbt }),
+                        tensor((char*)d.sel.p + (size_t)r0 * f.topk * 4, RAD_I32, { n, f.topk }),
+                        tensor((char*)d.pos.p + (size_t)r0 * 4, RAD_I32, { n }), tensor(d.cu.p, RAD_I32, { 2 }),
+                        tensor(d.sink.p, RAD_F32, { f.H }), tensor(op, RAD_BF16, { n, f.H * f.D }) };
+    std::vector<RadParam> p = { pi("M", n), pi("heads", f.H), pi("dim", f.D), pi("window", f.win), pi("ratio", f.ratio),
+                                pi("topk", f.topk), pf("scale", 0.04419417382415922), ps("dtype", "bf16") };
+    if (form) p.push_back(pi("form", form));
+    RadArgs a{};
+    a.t = t; a.n_t = 11; a.p = p.data(); a.n_p = (int)p.size();
+    const int rc = L.attn(&a, (RadStream)s);
+    return rc < 0 ? rc : 0;
+}
+/* Row m's f64 reference and bound term at head h (the keys as the launch of the whole chunk sees them). */
+void attn_ref(const SparseFix& f, int m, int h, std::vector<double>& ref, std::vector<double>& mag) {
+    const int D = f.D, p = f.pos[(size_t)m];
+    std::vector<const uint16_t*> keys;
+    for (int k = 0; k < f.win; ++k) {
+        const long j = (long)p - f.win + 1 + k;
+        if (j < 0 || j / f.bs >= f.nwbt) continue;
+        const int blk = f.wbt[(size_t)(j / f.bs)];
+        keys.push_back(&f.wc[((size_t)blk * f.bs + (size_t)(j % f.bs)) * D]);
+    }
+    for (int i = 0; i < f.topk; ++i) {
+        const long c = f.sel[(size_t)m * f.topk + i];
+        if (c < 0 || (c * f.ratio) / f.cbs >= f.ncbt) continue;
+        const int blk = f.cbt[(size_t)((c * f.ratio) / f.cbs)];
+        keys.push_back(&f.cc[((size_t)blk * f.cbs + (size_t)((c * f.ratio) % f.cbs)) * (D / f.ratio)]);
+    }
+    const uint16_t* q = &f.q[((size_t)m * f.H + h) * D];
+    std::vector<double> v(keys.size());
+    double mx = -1e30;
+    for (size_t k = 0; k < keys.size(); ++k) {
+        double sum = 0;
+        for (int d = 0; d < D; ++d) sum += (double)bf16_to_f32(q[d]) * (double)bf16_to_f32(keys[k][d]);
+        v[k] = sum * 0.04419417382415922;
+        if (v[k] > mx) mx = v[k];
+    }
+    double den = std::exp((double)f.sink[(size_t)h] - mx);
+    ref.assign((size_t)D, 0.0);
+    mag.assign((size_t)D, 0.0);
+    for (size_t k = 0; k < keys.size(); ++k) {
+        const double pk = std::exp(v[k] - mx);
+        den += pk;
+        for (int d = 0; d < D; ++d) {
+            const double x = (double)bf16_to_f32(keys[k][d]);
+            ref[(size_t)d] += pk * x;
+            mag[(size_t)d] += pk * std::fabs(x);
+        }
+    }
+    for (int d = 0; d < D; ++d) { ref[(size_t)d] /= den; mag[(size_t)d] /= den; }
+}
+int bf16_ord(uint16_t b) { return (b & 0x8000) ? -(int)(b & 0x7fff) : (int)b; }
+bool bf16_nan(uint16_t b) { return (b & 0x7fff) > 0x7f80; }
+bool bf16_inf(uint16_t b) { return (b & 0x7fff) == 0x7f80; }
+
+struct AwStats {
+    long long outs = 0, eq = 0, u1 = 0, u2 = 0, u4 = 0, u16 = 0, ubig = 0, cls = 0, checked = 0, over = 0, over_x = 0;
+    int maxu = 0;
+    double use = 0, use_x = 0;   /* the largest |err| / bound, fast and exact */
+};
+
+/* Fast against exact over one chunk; true if every check passed. `special`: classes compared, the bound skipped for
+ * non-finite outputs (and for rows carrying a NaN / inf input). */
+bool attnwm_chunk(const Lib& L, hipStream_t s, const SparseFix& f, const char* what, AwStats& st, bool invariance,
+                  long long* inv_rows, bool bound = true) {
+    AttnDev d(f);
+    const size_t n = (size_t)f.M * f.H * f.D;
+    Dev ofast(n * 2), oex(n * 2), o2(n * 2);
+    HC(hipMemsetAsync(ofast.p, 0xAA, n * 2, s));
+    HC(hipMemsetAsync(oex.p, 0x55, n * 2, s));
+    if (attn_form(L, s, d, 0, f.M, 2, ofast.p) < 0 || attn_form(L, s, d, 0, f.M, 1, oex.p) < 0) {
+        std::printf("  FAIL %s: a launch was refused\n", what);
+        return false;
+    }
+    HC(hipStreamSynchronize(s));
+    std::vector<uint16_t> hf(n), hx(n);
+    ofast.get(hf.data());
+    oex.get(hx.data());
+    bool ok = true;
+    AwStats c;
+    std::vector<int> extra;
+    for (int m = 0; m < f.M; ++m) {
+        bool far = false;
+        for (size_t i = (size_t)m * f.H * f.D; i < (size_t)(m + 1) * f.H * f.D; ++i) {
+            const uint16_t a = hf[i], b = hx[i];
+            ++c.outs;
+            if (bf16_nan(a) || bf16_nan(b) || bf16_inf(a) || bf16_inf(b)) {
+                if (bf16_nan(a) != bf16_nan(b) || (bf16_inf(a) || bf16_inf(b)) && a != b) {
+                    if (c.cls < 4) std::printf("  %s: row %d value %zu class differs: fast %04x exact %04x\n", what, m,
+                                               i % ((size_t)f.H * f.D), a, b);
+                    ++c.cls;
+                } else ++c.eq;
+                continue;
+            }
+            const int u = std::abs(bf16_ord(a) - bf16_ord(b));
+            c.maxu = std::max(c.maxu, u);
+            if (u == 0) ++c.eq; else if (u == 1) ++c.u1; else if (u == 2) ++c.u2; else if (u <= 4) ++c.u4;
+            else if (u <= 16) { ++c.u16; far = true; } else { ++c.ubig; far = true; }
+        }
+        if (far && extra.size() < 64) extra.push_back(m);
+    }
+    /* The f64 bound: sampled rows plus every row with a far output (up to 64). */
+    std::vector<int> rows = { 0, f.M / 3, f.M / 2, f.M - 1 };
+    std::mt19937_64 rr(77u + (uint32_t)f.M);
+    for (int i = 0; i < 12; ++i) rows.push_back((int)(rr() % (uint64_t)f.M));
+    rows.insert(rows.end(), extra.begin(), extra.end());
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    std::vector<double> ref, mag;
+    if (!bound) rows.clear();
+    for (int m : rows)
+        for (int h = 0; h < f.H; ++h) {
+            attn_ref(f, m, h, ref, mag);
+            for (int dd = 0; dd < f.D; ++dd) {
+                const size_t i = ((size_t)m * f.H + h) * f.D + dd;
+                if (!std::isfinite(ref[(size_t)dd]) || bf16_nan(hf[i]) || bf16_inf(hf[i]) || bf16_nan(hx[i]) || bf16_inf(hx[i]))
+                    continue;
+                const double bound = 0x1p-8 * std::fabs(ref[(size_t)dd]) + 0x1p-12 * mag[(size_t)dd] + 1e-38;
+                const double ef = std::fabs((double)bf16_to_f32(hf[i]) - ref[(size_t)dd]) / bound;
+                const double ex = std::fabs((double)bf16_to_f32(hx[i]) - ref[(size_t)dd]) / bound;
+                ++c.checked;
+                c.use = std::max(c.use, ef);
+                c.use_x = std::max(c.use_x, ex);
+                if (ef > 1) {
+                    if (c.over < 4) std::printf("  %s: row %d head %d col %d fast %.9g exact %.9g ref %.9g (bound %.3g)\n",
+                                                what, m, h, dd, bf16_to_f32(hf[i]), bf16_to_f32(hx[i]), ref[(size_t)dd], bound);
+                    ++c.over;
+                }
+                if (ex > 1) ++c.over_x;
+            }
+        }
+    if (c.cls || c.over || c.over_x) ok = false;
+    /* Batch invariance and determinism of the fast form: a rerun, rows alone, 16 at a time, and suffixes. */
+    long long inv_bad = 0;
+    if (invariance) {
+        std::vector<uint16_t> h2(n);
+        auto cmp_rows = [&](int r0, int r1) {
+            o2.get(h2.data());
+            long long b = 0;
+            for (size_t i = (size_t)r0 * f.H * f.D; i < (size_t)r1 * f.H * f.D; ++i) b += h2[i] != hf[i];
+            return b;
+        };
+        HC(hipMemsetAsync(o2.p, 0x33, n * 2, s));
+        if (attn_form(L, s, d, 0, f.M, 2, o2.p) < 0) return false;
+        HC(hipStreamSynchronize(s));
+        inv_bad += cmp_rows(0, f.M);
+        for (int cut : { 1, 16 }) {
+            if (cut == 1 && f.M > 512) continue;   /* one launch a row: at 512 rows and below */
+            HC(hipMemsetAsync(o2.p, 0x33, n * 2, s));
+            for (int r0 = 0; r0 < f.M; r0 += cut)
+                if (attn_form(L, s, d, r0, std::min(f.M, r0 + cut), 2, o2.p) < 0) return false;
+            HC(hipStreamSynchronize(s));
+            inv_bad += cmp_rows(0, f.M);
+            *inv_rows += f.M;
+        }
+        for (int r0 : { 1, f.M / 2, f.M - 1 }) {
+            if (r0 <= 0 || r0 >= f.M) continue;
+            HC(hipMemsetAsync(o2.p, 0x33, n * 2, s));
+            if (attn_form(L, s, d, r0, f.M, 2, o2.p) < 0) return false;
+            HC(hipStreamSynchronize(s));
+            inv_bad += cmp_rows(r0, f.M);
+            *inv_rows += f.M - r0;
+        }
+        if (inv_bad) { ok = false; std::printf("  FAIL %s: %lld values differ across launch splits / reruns\n", what, inv_bad); }
+    }
+    std::printf("attnwm: %-34s H=%2d M=%4d: %lld outputs, %.4f%% bit-equal, ulp 1:%lld 2:%lld 3-4:%lld 5-16:%lld >16:%lld "
+                "(max %d), class differences %lld; f64 bound: %lld checked, %lld over (fast, max use %.3f), %lld over "
+                "(exact, max use %.3f)%s\n",
+                what, f.H, f.M, c.outs, 100.0 * (double)c.eq / (double)std::max(1ll, c.outs), c.u1, c.u2, c.u4, c.u16,
+                c.ubig, c.maxu, c.cls, c.checked, c.over, c.use, c.over_x, c.use_x,
+                invariance ? (inv_bad ? "; batch invariance FAILED" : "; rerun, single rows, launches of 16, suffixes: equal") : "");
+    std::fflush(stdout);
+    st.outs += c.outs; st.eq += c.eq; st.u1 += c.u1; st.u2 += c.u2; st.u4 += c.u4; st.u16 += c.u16; st.ubig += c.ubig;
+    st.cls += c.cls; st.checked += c.checked; st.over += c.over; st.over_x += c.over_x;
+    st.maxu = std::max(st.maxu, c.maxu); st.use = std::max(st.use, c.use); st.use_x = std::max(st.use_x, c.use_x);
+    return ok;
+}
+
+int attnwm_check(const Lib& L, int mmax) {
+    if (!L.attn) { std::printf("attnwm: FAIL: the plugin lacks r4d_rad_ds41_attn_sparse_sink\n"); return 1; }
+    int rc = 0;
+    /* The row table: the switch is set for this mode; the attention row must name the form. */
+    {
+        const RadKernelInfo* row = nullptr;
+        for (int i = 0; L.count && L.at && i < L.count(); ++i) {
+            const RadKernelInfo* k = L.at(i);
+            if (k && k->name && !std::strcmp(k->name, "ds41_attn_sparse_sink_d512_bf16")) row = k;
+        }
+        if (!row || !row->computes || !std::strstr(row->computes, ds41p1::kAttnWmmaMark)) {
+            std::printf("attnwm: FAIL: row table: ds41_attn_sparse_sink_d512_bf16 does not name %s\n", ds41p1::kAttnWmmaMark);
+            rc = 1;
+        } else
+            std::printf("PASS: row table: ds41_attn_sparse_sink_d512_bf16 names %s (served form: the WMMA sparse attention)\n",
+                        ds41p1::kAttnWmmaMark);
+    }
+    hipStream_t s;
+    HC(hipStreamCreate(&s));
+    AwStats st;
+    long long inv_rows = 0;
+    bool ok = rc == 0;
+    std::vector<int> Ms = { 1, 16, 17, 48, 49, 64, 256, 1024, 1770, 2048, 4096 };
+    for (int H : { 16, 32 })
+        for (int M : Ms) {
+            if (M > mmax || (H == 32 && M > 2048)) continue;
+            const SparseFix f = sparse_fix(M, H, 4400u + (uint32_t)M + 100u * (uint32_t)H);
+            ok &= attnwm_chunk(L, s, f, "chunk", st, M <= 256 || M == 1770 || M == mmax, &inv_rows);
+        }
+    /* Edge chunks at 16 heads, 256 rows. */
+    {
+        SparseFix f = sparse_fix(256, 16, 5501u);
+        f.P0 = 5;   /* a short context: the window's first keys and most selections missing */
+        for (int m = 0; m < f.M; ++m) f.pos[(size_t)m] = f.P0 + m;
+        for (int m = 0; m < f.M; ++m) {
+            const int reach = (f.pos[(size_t)m] + 1) / f.ratio;
+            for (int i = 0; i < f.topk; ++i) {
+                int32_t& c = f.sel[(size_t)m * f.topk + i];
+                c = i < reach && (i % 3) ? (int32_t)((i * 7 + m) % std::max(1, reach)) : -1;
+            }
+        }
+        ok &= attnwm_chunk(L, s, f, "edge: short context", st, true, &inv_rows);
+    }
+    {
+        SparseFix f = sparse_fix(256, 16, 5502u);
+        /* scores spread over hundreds: p down to f32 underflow, the pieces of p into bf16 subnormals. Classes and
+         * ulps only: here the bound would measure the scores' own f32 error, which both forms carry. */
+        for (auto& v : f.q) v = f32_to_bf16(bf16_to_f32(v) * 128.f);
+        ok &= attnwm_chunk(L, s, f, "edge: large scores (no f64 bound)", st, false, &inv_rows, false);
+    }
+    {
+        SparseFix f = sparse_fix(256, 16, 5503u);
+        for (auto& v : f.sink) v = 12.f;
+        ok &= attnwm_chunk(L, s, f, "edge: large sinks", st, false, &inv_rows);
+    }
+    {
+        SparseFix f = sparse_fix(256, 16, 5504u);
+        f.q[(size_t)(3 * f.H + 2) * f.D + 7] = 0x7f80;                 /* +inf in row 3, head 2 */
+        f.q[(size_t)(5 * f.H + 4) * f.D + 9] = 0x7fc0;                 /* NaN in row 5, head 4 */
+        f.wc[(size_t)7 * f.D + 100] = 0xffc0;                          /* NaN in one window key */
+        ok &= attnwm_chunk(L, s, f, "edge: NaN / inf inputs", st, false, &inv_rows);
+    }
+    /* The engine's form, with the switch set: the fast one at 1 row and at the chunk. */
+    long long served_bad = 0;
+    for (int M : { 1, std::min(mmax, 1770) }) {
+        const SparseFix f = sparse_fix(M, 16, 6600u + (uint32_t)M);
+        AttnDev d(f);
+        const size_t n = (size_t)M * f.H * f.D;
+        Dev o0(n * 2), o2(n * 2);
+        if (attn_form(L, s, d, 0, M, 0, o0.p) < 0 || attn_form(L, s, d, 0, M, 2, o2.p) < 0) { served_bad = -1; break; }
+        HC(hipStreamSynchronize(s));
+        std::vector<uint16_t> a(n), b(n);
+        o0.get(a.data());
+        o2.get(b.data());
+        for (size_t i = 0; i < n; ++i) served_bad += a[i] != b[i];
+    }
+    if (served_bad) { ok = false; std::printf("attnwm: FAIL: the engine's form is not the fast one (%lld)\n", served_bad); }
+    /* Time at 16 heads. */
+    hipEvent_t e0, e1;
+    HC(hipEventCreate(&e0));
+    HC(hipEventCreate(&e1));
+    for (int M : { 16, 64, 256, 1024, 1770, 2048, 4096 }) {
+        if (M > mmax) continue;
+        const SparseFix f = sparse_fix(M, 16, 7700u + (uint32_t)M);
+        AttnDev d(f);
+        Dev o((size_t)M * f.H * f.D * 2);
+        auto run = [&](int form) {
+            std::vector<float> t;
+            for (int i = 0; i < 2; ++i) (void)attn_form(L, s, d, 0, M, form, o.p);
+            for (int r = 0; r < 5; ++r) {
+                HC(hipEventRecord(e0, s));
+                for (int i = 0; i < 5; ++i) (void)attn_form(L, s, d, 0, M, form, o.p);
+                HC(hipEventRecord(e1, s));
+                HC(hipEventSynchronize(e1));
+                float ms = 0;
+                HC(hipEventElapsedTime(&ms, e0, e1));
+                t.push_back(200.f * ms);
+            }
+            std::sort(t.begin(), t.end());
+            return (double)t[2];
+        };
+        const double tx = run(1), tf = run(2);
+        std::printf("attnwm time: H=16 M=%4d: exact %9.1f us, fast %9.1f us, %.2fx\n", M, tx, tf, tx / tf);
+    }
+    HC(hipStreamDestroy(s));
+    std::printf("attnwm: %s: %lld outputs against the exact kernels, %.4f%% bit-equal, ulp 1:%lld 2:%lld 3-4:%lld 5-16:%lld "
+                ">16:%lld (max %d), %lld class differences; %lld outputs against f64 within 2^-8|ref| + 2^-12 sum p|k|/den "
+                "(fast max use %.3f, exact %.3f, %lld / %lld over); batch-invariant over %lld relaunched rows; the engine's "
+                "form served\n",
+                ok ? "PASS" : "FAIL", st.outs, 100.0 * (double)st.eq / (double)std::max(1ll, st.outs), st.u1, st.u2, st.u4,
+                st.u16, st.ubig, st.maxu, st.cls, st.checked, st.use, st.use_x, st.over, st.over_x, inv_rows);
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | lsparse [C] [W:r...] | bal [C] [ROUTES] | p1 [MMAX] [ROUTES] | p1tiled [MMAX] [ROUTES] | sweep [trials] | sweep0 [trials] | aux OUT [trials] | auxtall OUT [MMAX] [trials] | auxrt [jobs] | auxswap [rounds]\n", argv[0]); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | lsparse [C] [W:r...] | bal [C] [ROUTES] | p1 [MMAX] [ROUTES] | p1tiled [MMAX] [ROUTES] | p1wmma [MMAX] [ROUTES] | attnwm [MMAX] | sweep [trials] | sweep0 [trials] | aux OUT [trials] | auxtall OUT [MMAX] [trials] | auxrt [jobs] | auxswap [rounds]\n", argv[0]); return 2; }
     /* `tall`: the switch before the plugin's row table and its sparse launchers first read it, and
      * the routed GEMM as the A/B's servers run it (no live tail); the other modes as the loop's
      * measured runs ran it. */
@@ -4276,12 +5109,25 @@ int main(int argc, char** argv) {
      * `sweep` keeps an LCP already in the environment (its heights) instead of setting EXACT_TALL. */
     /* Every mode but `p1` runs without prefill Phase 1's switch (its twin replaces the LCP twin `lcp` checks). */
     if (std::strcmp(argv[2], ds41p1::kCheckMode) && std::strcmp(argv[2], ds41p1::kTiledCheckMode) &&
-        std::strcmp(argv[2], "auxtall"))
+        std::strcmp(argv[2], ds41p1::kWmmaCheckMode) && std::strcmp(argv[2], "auxtall"))
         unsetenv(ds41p1::kEnv);
+    /* The WMMA twin (inexact): on for `p1wmma` only, beside the tiled switch as a Qw arm has it. */
+    if (!std::strcmp(argv[2], ds41p1::kWmmaCheckMode)) setenv(ds41p1::kWmmaEnv, "1", 1);
+    else unsetenv(ds41p1::kWmmaEnv);
     /* The register-tiled twin: on for `p1tiled`, off for `p1`; `auxtall` keeps the window's (its line says which). */
-    if (!std::strcmp(argv[2], ds41p1::kTiledCheckMode)) setenv(ds41p1::kTiledEnv, "1", 1);
+    if (!std::strcmp(argv[2], ds41p1::kTiledCheckMode) || !std::strcmp(argv[2], ds41p1::kWmmaCheckMode))
+        setenv(ds41p1::kTiledEnv, "1", 1);
     else if (std::strcmp(argv[2], "auxtall")) unsetenv(ds41p1::kTiledEnv);
-    if (!std::strcmp(argv[2], "auxtall")) {
+    /* The fast attention (inexact): on for `attnwm` only (the engine's form is then checked to be it). */
+    if (!std::strcmp(argv[2], ds41p1::kAttnWmmaCheckMode)) setenv(ds41p1::kAttnWmmaEnv, "1", 1);
+    else unsetenv(ds41p1::kAttnWmmaEnv);
+    if (!std::strcmp(argv[2], ds41p1::kAttnWmmaCheckMode)) {
+        /* `attnwm [MMAX]`: LCP=2048 as the window's Lc servers have it (the exact form the scalar kernels at every
+         * height). */
+        setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "2048", 1);
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
+        g_lcp = 2048;
+    } else if (!std::strcmp(argv[2], "auxtall")) {
         /* `auxtall`: LCP=2048 and P1, as the server of an AxrN arm has them (the worker's rows above 16 are the P1
          * twin's); the live tail left as the window has it, as for `aux`. */
         setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "2048", 1);
@@ -4289,7 +5135,8 @@ int main(int argc, char** argv) {
         unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
         unsetenv("RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE");
         g_lcp = 2048;
-    } else if (!std::strcmp(argv[2], ds41p1::kCheckMode) || !std::strcmp(argv[2], ds41p1::kTiledCheckMode)) {
+    } else if (!std::strcmp(argv[2], ds41p1::kCheckMode) || !std::strcmp(argv[2], ds41p1::kTiledCheckMode) ||
+               !std::strcmp(argv[2], ds41p1::kWmmaCheckMode)) {
         /* `p1 [MMAX] [ROUTES]`: LCP=2048 and the switch, as a P1 arm's server has them (`p1tiled`: and kTiledEnv). */
         setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "2048", 1);
         setenv(ds41p1::kEnv, "1", 1);
@@ -4388,6 +5235,19 @@ int main(int argc, char** argv) {
         }
         if (ws.empty()) ws = { { 32769, 1 }, { 65537, 2 }, { 131073, 1 }, { 262145, 2 }, { 524289, 1 } };
         return long_sparse_check(lib, ws);
+    }
+    if (!std::strcmp(argv[2], ds41p1::kAttnWmmaCheckMode)) {
+        const int mmax = argc > 3 ? std::atoi(argv[3]) : 4096;
+        if (mmax < 64 || mmax > 4096) { std::fprintf(stderr, "attnwm MMAX: 64 .. 4096\n"); return 2; }
+        return attnwm_check(lib, mmax);
+    }
+    if (!std::strcmp(argv[2], ds41p1::kWmmaCheckMode)) {
+        const int mmax = argc > 3 ? std::atoi(argv[3]) : ds41p1::kTwinMaxRows;
+        if (mmax < 17 || mmax > ds41p1::kTwinMaxRows) {
+            std::fprintf(stderr, "%s MMAX: 17 .. %d\n", argv[2], ds41p1::kTwinMaxRows);
+            return 2;
+        }
+        return p1w_check(lib, mmax, argc > 4 ? argv[4] : nullptr);
     }
     if (!std::strcmp(argv[2], ds41p1::kCheckMode) || !std::strcmp(argv[2], ds41p1::kTiledCheckMode)) {
         const int mmax = argc > 3 ? std::atoi(argv[3]) : ds41p1::kTwinMaxRows;

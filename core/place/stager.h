@@ -939,6 +939,7 @@ private:
     int64_t lcp_reach_ = 0;            /* the twin's bound, as its bands state it */
     int     lcp_moe_ = 0, lcp_twin_ = 0, lcp_split_ = 0, lcp_runs_ = 0, lcp_ops_ = 0, lcp_pair_ops_ = 0;
     std::string lcp_pairs_;            /* the multi-kernel ops admitted, by family */
+    int     lcp_dense_ops_ = 0, lcp_attn_ops_ = 0;   /* ops on the fast forms (ds41p1::kDenseTiledEnv, kAttnWmmaEnv) */
     /* Batch eligibility only. start() additionally requires this exact native EP layer;
      * selected-routed starts always use Normal. Immutable copy passed per mover call. */
     NativeFileCacheReadPolicy pass_cache_policy_ = NativeFileCacheReadPolicy::Normal;

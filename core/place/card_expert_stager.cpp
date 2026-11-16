@@ -110,6 +110,13 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         return false;
     }
     r.tiled = ts == 1;
+    const char* wm = get(ds41p1::kWmmaEnv);
+    const int ws = ds41p1::env_state(wm);
+    if (ws < 0) {
+        if (why) *why = std::string(ds41p1::kWmmaEnv) + "=" + wm + ": 1 is on, 0 / unset / empty off";
+        return false;
+    }
+    r.wmma = ws == 1;
     const char* once = get(ds41p1::kTailOnceEnv);
     const int os = ds41p1::env_state(once);
     if (os < 0) {
@@ -944,7 +951,11 @@ int CardExpertPath::init(Mover* mover, const Tunables& t, int rank, PlanesGet pl
     if (t_.tail_once)
         RAD_INFO("%s %d (%s=1): the wave relaunches of gate_up and down skip the tail fill (%s=0); the layer's own "
                  "launches fill it", ds41p1::kLogTailOnce, rank_, ds41p1::kTailOnceEnv, ds41p1::kTailParam);
-    if (t_.tiled)
+    if (t_.wmma)
+        RAD_INFO("%s %d (%s=1): every P1 twin call of this rank on %s -- the exact values and products, another f32 "
+                 "summation order: NOT the decode band's bits (an opt-in fast prefill)%s", ds41p1::kLogWmma, rank_,
+                 ds41p1::kWmmaEnv, ds41p1::kWmmaMark, t_.tiled ? "; it takes the calls the register-tiled twin would" : "");
+    else if (t_.tiled)
         RAD_INFO("%s %d (%s=1): every P1 twin call of this rank on %s, each output the decode band's sum "
                  "operation for operation", ds41p1::kLogTiled, rank_, ds41p1::kTiledEnv, ds41p1::kTiledMark);
     if (t_.swiglu_span)

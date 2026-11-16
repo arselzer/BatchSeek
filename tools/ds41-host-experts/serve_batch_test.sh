@@ -19,7 +19,9 @@ fail=0
 ok()  { echo "ok   $*"; }
 bad() { echo "FAIL $*"; fail=1; }
 
-ARM=all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-mA-Qd64-Qa0-Pc-Pch32-Pcs128-L294912-Pf-N256-C256-Ba2048-Bs-Qy60-Qyp60-Qyk-Qsp-Qt-Qz-Ee-Xqprof
+ARM=all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-mA-Qd64-Qa0-Pc-Pch32-Pcs128-L294912-Pf-N256-C256-Ba2048-Bs-Qy60-Qyp60-Qyk-Qsp-Qt-Qz-Ee-Dt-Xqprof
+ARMQW=${ARM%-Dt-Xqprof}-Qw-Dt-Xqprof; ARMQW=${ARMQW/-Qsp-Qt-Qz-/-Qsp-Qz-}   # with the WMMA P1 twin (Qw, inexact) in place of Qt: --fast-prefill 1
+ARMDA=${ARM%-Xqprof}-Aw-Xqprof   # with the WMMA attention (Aw, inexact) too: --fast-attn 1
 mkdir -p "$T/home/kernels" "$T/mirror" "$T/profiles"; echo "{}" > "$T/profiles/prof.json"
 echo "not a library" > "$T/home/kernels/libr4d.so"
 echo '{}' > "$T/prompts.json"
@@ -39,7 +41,8 @@ LW=$(sed -n '/^launch_words() {/,/^}/p' "$W")
   TALL_OK=1 TALL_WHY=test TALL_SUM=$SUM TALL_LIB=$LIB DK_OK=1 DK_WHY=test DK_SUM=$SUM DK_LIB=$LIB
   RB_OK=1 RB_WHY=test RB_SUM=$SUM RB_LIB=$LIB LCP_OK=1 LCP_WHY=test LCP_SUM=$SUM LCP_LIB=$LIB LCP_C=4096
   BAL_OK=1 BAL_WHY=test BAL_SUM=$SUM BAL_LIB=$LIB BAL_MAX_M=4096 P1_OK=1 P1_WHY=test P1_SUM=$SUM P1_LIB=$LIB
-  P1T_OK=1 P1T_WHY=test P1T_SUM=$SUM P1T_LIB=$LIB
+  P1T_OK=1 P1T_WHY=test P1T_SUM=$SUM P1T_LIB=$LIB P1W_OK=1 P1W_WHY=test P1W_SUM=$SUM P1W_LIB=$LIB
+  DT_OK=1 DT_WHY=test DT_SUM=$SUM DT_LIB=$LIB AW_OK=1 AW_WHY=test AW_SUM=$SUM AW_LIB=$LIB
   OUT=$T/out; mkdir -p "$OUT"; CANCEL_FILE=/nonexistent/cancel; CANCEL=$CANCEL_FILE
   echo 'p1: PASS: test, full/span SwiGLU waves, also with the tail filled once' > "$OUT/devcheck-p1.log"
   echo 'p1tiled: PASS: test, also with the tail filled once' > "$OUT/devcheck-p1tiled.log"
@@ -47,14 +50,20 @@ LW=$(sed -n '/^launch_words() {/,/^}/p' "$W")
   eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
   eval "$(sed -n '/^ARM_PRESET_B2=/p;/^ARM_PRESET_B4=/p;/^arm_full() {/,/^}/p' "$W")"
   HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
-  ARMS=$ARM
+  ARMS="$ARM $ARMQW $ARMDA"
   s=$(grep -n '^for a in \$ARMS; do' "$W" | head -1 | cut -d: -f1)
   e=$(awk -v s="$s" 'NR > s && /^done$/ { print NR; exit }' "$W")
   eval "$(sed -n "${s},${e}p" "$W")"
 ) > "$T/loop.txt" 2>&1
 grep -q "^ARM $ARM$" "$T/loop.txt" && ok "the harness launches the arm" ||
   { bad "the harness did not launch the arm: $(grep -m3 -E 'skip|unknown' "$T/loop.txt")"; }
-awk -v a="ARM $ARM" '$0 == a { p = 1; next } p' "$T/loop.txt" > "$T/harness.txt"
+awk -v a="ARM $ARM" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt" > "$T/harness.txt"
+grep -q "^ARM $ARMQW$" "$T/loop.txt" && ok "the harness launches the Qw arm" ||
+  { bad "the harness did not launch the Qw arm: $(grep -m3 -E "arm $ARMQW" "$T/loop.txt")"; }
+awk -v a="ARM $ARMQW" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt" > "$T/harness-qw.txt"
+grep -q "^ARM $ARMDA$" "$T/loop.txt" && ok "the harness launches the Dt-Aw arm" ||
+  { bad "the harness did not launch the Dt-Aw arm: $(grep -m3 -E "arm $ARMDA" "$T/loop.txt")"; }
+awk -v a="ARM $ARMDA" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt" > "$T/harness-da.txt"
 
 RADIANCE_BIN=BIN "$SB" --model MODEL --silu-table SILU --profile "$T/profiles/prof.json" --mirror "$T/mirror" --dry-run > "$T/sb.txt" ||
   bad "serve-batch.sh --dry-run failed"
@@ -67,6 +76,18 @@ if python3 -I "$M" params "$T/harness.txt" > "$T/params.txt" && mapfile -t P < "
    RADIANCE_BIN=BIN "$SB" "${P[@]}" --dry-run > "$T/sb2.txt" && python3 -I "$M" compare "$T/harness.txt" "$T/sb2.txt" > "$T/cmp2.txt"; then
   ok "with serve_batch_match.py params' arguments: $(cat "$T/cmp2.txt"), nothing aside"
 else bad "params: $(tr '\n' ' ' < "$T/params.txt") $(tr '\n' ';' < "$T/cmp2.txt" 2>/dev/null)"; fi
+
+if python3 -I "$M" params "$T/harness-qw.txt" > "$T/params-qw.txt" && mapfile -t P < "$T/params-qw.txt" &&
+   [[ " ${P[*]} " == *" --fast-prefill 1 "* ]] &&
+   RADIANCE_BIN=BIN "$SB" "${P[@]}" --dry-run > "$T/sb3.txt" && python3 -I "$M" compare "$T/harness-qw.txt" "$T/sb3.txt" > "$T/cmp3.txt"; then
+  ok "the Qw arm: params give --fast-prefill 1, and serve-batch.sh with them: $(cat "$T/cmp3.txt")"
+else bad "the Qw arm's params: $(tr '\n' ' ' < "$T/params-qw.txt") $(tr '\n' ';' < "$T/cmp3.txt" 2>/dev/null)"; fi
+
+if python3 -I "$M" params "$T/harness-da.txt" > "$T/params-da.txt" && mapfile -t P < "$T/params-da.txt" &&
+   [[ " ${P[*]} " == *" --fast-dense 1 "* && " ${P[*]} " == *" --fast-attn 1 "* ]] &&
+   RADIANCE_BIN=BIN "$SB" "${P[@]}" --dry-run > "$T/sb4.txt" && python3 -I "$M" compare "$T/harness-da.txt" "$T/sb4.txt" > "$T/cmp4.txt"; then
+  ok "the Dt-Aw arm: params give --fast-dense 1 --fast-attn 1, and serve-batch.sh with them: $(cat "$T/cmp4.txt")"
+else bad "the Dt-Aw arm's params: $(tr '\n' ' ' < "$T/params-da.txt") $(tr '\n' ';' < "$T/cmp4.txt" 2>/dev/null)"; fi
 
 # ---- 2. the parameters
 d128=$("$SB" --model M --silu-table S --streams 128 --dry-run)
@@ -100,7 +121,23 @@ grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TILED=0' <<< "$dq" && grep -qx 'env 
   grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN=0' <<< "$dq" && ok "--tiled 0 --tail-once 0 --swiglu-span 0: off" ||
   bad "--tiled / --tail-once / --swiglu-span"
 
+grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=0' <<< "$dh" && ok "--fast-prefill off by default (Qw: ..._P1_WMMA=0)" ||
+  bad "the --fast-prefill default"
+dw=$("$SB" --model M --silu-table S --fast-prefill 1 --dry-run)
+grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=1' <<< "$dw" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TILED=0' <<< "$dw" &&
+  ok "--fast-prefill 1: Qw (..._P1_WMMA=1), the tiled twin's switch off (the core refuses both)" || bad "--fast-prefill 1"
+
+grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED=1' <<< "$dh" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA=0' <<< "$dh" &&
+  ok "--fast-dense on and --fast-attn off by default (Dt, Aw: ..._DENSE_TILED=1, ..._ATTN_WMMA=0)" || bad "the --fast-dense / --fast-attn defaults"
+dda=$("$SB" --model M --silu-table S --fast-dense 1 --fast-attn 1 --dry-run)
+grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED=1' <<< "$dda" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA=1' <<< "$dda" &&
+  grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=0' <<< "$dda" && ok "--fast-dense 1 --fast-attn 1: Dt and Aw, Qw as it was" ||
+  bad "--fast-dense 1 / --fast-attn 1"
+
 # ---- 3. refusals
+"$SB" --model M --silu-table S --fast-dense 2 --dry-run > /dev/null 2>&1 && bad "--fast-dense 2 accepted" || ok "--fast-dense 2 refused"
+"$SB" --model M --silu-table S --fast-attn x --dry-run > /dev/null 2>&1 && bad "--fast-attn x accepted" || ok "--fast-attn x refused"
+"$SB" --model M --silu-table S --fast-prefill 2 --dry-run > /dev/null 2>&1 && bad "--fast-prefill 2 accepted" || ok "--fast-prefill 2 refused"
 "$SB" --model M --silu-table S --tiled 2 --dry-run > /dev/null 2>&1 && bad "--tiled 2 accepted" || ok "--tiled 2 refused"
 "$SB" --model M --silu-table S --hybrid 401 --dry-run > /dev/null 2>&1 && bad "--hybrid 401 accepted" || ok "--hybrid above 400 refused"
 "$SB" --model M --dry-run > /dev/null 2>&1 && bad "no --silu-table accepted" || ok "no --silu-table refused"

@@ -316,10 +316,13 @@ int moe_form(int form, int grid, const uint16_t* x, int AR, int K, const std::ve
 /* The served twin's kernel: the register-tiled one under RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1 (beside P1 and LCP in
  * the environment), else mx_vp2_kernel; a forced split (`_opts`) always the latter. */
 bool g_tiled = false;
+bool g_wmma = false;   /* the served twin is the WMMA kernel (RADIANCE_EXPERIMENTAL_DS41_P1_WMMA beside P1 and LCP) */
 int p1(const Split* sp, const uint16_t* x, int AR, int K, const std::vector<const void*>& table, int N, const Pass& p,
        bool sorted_order, uint16_t* y, std::string* why, int form = -1, int grid = 0) {
     const int g0 = emu_grids;
-    const char* const want = form == 1 || (form < 0 && g_tiled && (!sp || sp->served())) ? "mx_p1t_kernel" : "mx_vp2_kernel";
+    const bool served = form < 0 && (!sp || sp->served());
+    const char* const want = form == 2 || (served && g_wmma) ? "mx_p1w_kernel"
+                             : form == 1 || (served && g_tiled) ? "mx_p1t_kernel" : "mx_vp2_kernel";
     const int rc = form >= 0 ? moe_form(form, grid, x, AR, K, table, N, p, sorted_order, y)
                              : moe(r4d_rad_moe_gemm_mxfp4_gemv_tall_p1, sp, x, AR, K, table, N, p, sorted_order, y);
     const int n = emu_grids - g0;
@@ -792,6 +795,268 @@ void cut_case(const Bank& gu, const Bank& dn, const Padded& pgu, const Padded& p
     std::fflush(stdout);
 }
 
+
+/* ---- the WMMA twin (RADIANCE_EXPERIMENTAL_DS41_P1_WMMA, form 2): inexact by design -----------------------------
+ *
+ * `wmma` holds mx_p1w_kernel to what its contract promises instead of T1's bits: against the exact twin (form 0)
+ * every bf16 output equal or one ulp apart, or (cancellation) apart by no more than an f32 reordering of its sum can
+ * move it; its f32 outputs (the checker export, before the bf16 rounding) within 2^-16 of sum |w x| of the f64 sum of
+ * the exact products; NaN and infinity where the exact twin has them; the same bytes on every grid and on a second
+ * run; T3 and T4 as the twin's (skipped rows untouched, the tail zeros); and batch invariance: one token's rows
+ * (its gate_up slots and their down slots) the same bits inside passes of 1, 7, 64 and 1896 tokens, whatever the
+ * other tokens and their routing. */
+
+float bf2f(uint16_t v) { uint32_t u = (uint32_t)v << 16; float f; std::memcpy(&f, &u, 4); return f; }
+/* bf16 ordered distance (finite values). */
+long ulp16(uint16_t a, uint16_t b) {
+    auto ord = [](uint16_t v) { return (v & 0x8000u) ? -(long)(v & 0x7fffu) : (long)v; };
+    return std::labs(ord(a) - ord(b));
+}
+bool fin16(uint16_t v) { return (v & 0x7f80u) != 0x7f80u; }
+/* The exact products of weight row n (block_mxfp4) with activation row x: their f64 sum and sum of magnitudes. */
+void host_dot(const uint8_t* blk, int K, int n, const uint16_t* x, double* S, double* Aabs) {
+    static const float kv[16] = { 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12 };
+    const int UK = K / 32;
+    double s = 0, a = 0;
+    for (int u = 0; u < UK; ++u) {
+        const uint8_t* b = blk + ((size_t)n * UK + u) * 17;
+        const uint32_t e = b[0];
+        const uint32_t bits = e < 2u ? (0x00200000u << e) : ((e - 1u) << 23);
+        float d;
+        std::memcpy(&d, &bits, 4);
+        for (int v = 0; v < 32; ++v) {
+            const int nib = v < 16 ? (b[1 + v] & 15) : (b[1 + v - 16] >> 4);
+            const double p = (double)(kv[nib] * d) * (double)bf2f(x[(size_t)u * 32 + v]);
+            s += p;
+            a += std::fabs(p);
+        }
+    }
+    *S = s;
+    *Aabs = a;
+}
+int moe_f32(int grid, const uint16_t* x, int AR, int K, const std::vector<const void*>& table, int N, const Pass& p,
+            bool sorted_order, uint16_t* y, float* y32) {
+    const int T = (int)p.sorted.size();
+    std::vector<const void*> tab = table;
+    std::vector<int32_t> so = p.sorted, of = p.off;
+    RadTensor t[5] = { ten((void*)x, RAD_BF16, { AR, K }), ten(tab.data(), RAD_U8, { kNe, N, K / 32 * 17 }),
+                       ten(so.data(), RAD_I32, { T }), ten(of.data(), RAD_I32, { kNe + 1 }),
+                       ten(y, RAD_BF16, { T, N }) };
+    t[1].stride[0] = 0;
+    RadParam pr[6] = { pstr("type", "mxfp4"), pint("N", N), pint("K", K), pint("n_expert", kNe), pint("top_k", kTop),
+                       pstr("a_order", sorted_order ? "sorted" : "token") };
+    RadArgs a{};
+    a.t = t;
+    a.n_t = 5;
+    a.p = pr;
+    a.n_p = 6;
+    return r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_wmma_f32(&a, nullptr, y32, grid);
+}
+struct WmmaStats {
+    long long outputs = 0, same = 0, one = 0, more = 0, more_bad = 0, nan_inf_bad = 0, f32_checked = 0, f32_bad = 0;
+    double f32_max_rel = 0, f32_max_abs = 0;
+    long long range = 0;   /* NaN/inf class differences on rows with an activation above 2^120 */
+} g_ws;
+
+void wmma_case(const Bank& b, const Shape& sh, int M, int kind, uint32_t seed) {
+    ++g_cases;
+    const auto t0c = std::chrono::steady_clock::now();
+    std::mt19937_64 rng(seed);
+    const Picks pk = make_picks(kind, M, rng);
+    const Pass full = make_pass(pk, 0, M);
+    const int T = M * kTop, AR = sh.sorted ? T : M, N = sh.N, K = sh.K;
+    const std::vector<uint16_t> act = make_x(sh.sorted ? T : M, K, rng);
+    std::vector<uint16_t> xin;
+    if (sh.sorted) {
+        xin.assign((size_t)T * K, 0);
+        for (int i = 0; i < full.local; ++i)
+            std::memcpy(&xin[(size_t)i * K], &act[(size_t)full.sorted[(size_t)i] * K], (size_t)K * 2);
+    } else {
+        xin = act;
+    }
+    /* Block, packed and skipped entries as the rows cases mix them: the exact twin reads both forms alike. */
+    const std::vector<int> forms = make_forms(full, rng);
+    const std::vector<const void*> tab = table_of(b, forms);
+    const std::string label = std::string("wmma ") + sh.name + " M=" + std::to_string(M) + " " + kind_name(kind) +
+                              " rank " + std::to_string(pk.rank);
+    std::string why;
+    std::vector<uint16_t> ye((size_t)T * N, 0xAAAAu), yw((size_t)T * N, 0xAAAAu);
+    if (p1(nullptr, xin.data(), AR, K, tab, N, full, sh.sorted, ye.data(), &why, 0, 0)) {
+        fail(label + ": the exact twin: " + why);
+        return;
+    }
+    /* The served call: the WMMA kernel when the switch is on (`wmma` mode runs with it), else form 2 forced. */
+    if (p1(nullptr, xin.data(), AR, K, tab, N, full, sh.sorted, yw.data(), &why, g_wmma ? -1 : 2, 0)) {
+        fail(label + ": the WMMA twin: " + why);
+        return;
+    }
+    std::vector<int> ex((size_t)std::max(1, full.local));
+    for (int e = 0; e < kNe; ++e)
+        for (int i = full.off[(size_t)e]; i < full.off[(size_t)e + 1]; ++i) ex[(size_t)i] = e;
+    size_t untouched_bad = 0, tail_bad = 0;
+    long long same = 0, one = 0, more = 0, more_bad = 0, cls_bad = 0;
+    std::vector<float> y32((size_t)T * N, 0.f);
+    std::vector<uint16_t> y3((size_t)T * N, 0xAAAAu);
+    if (moe_f32(0, xin.data(), AR, K, tab, N, full, sh.sorted, y3.data(), y32.data()) != RAD_OK) {
+        fail(label + ": the f32 export refused the call");
+        return;
+    }
+    size_t f32_bad = 0, f32_n = 0;
+    for (int i = 0; i < full.local; ++i) {
+        const int e = ex[(size_t)i];
+        const uint16_t *pe = &ye[(size_t)i * N], *pw = &yw[(size_t)i * N];
+        if (forms[(size_t)e] == 2) {
+            for (int c = 0; c < N; ++c) untouched_bad += pw[c] != 0xAAAAu;
+            continue;
+        }
+        const int f = full.sorted[(size_t)i];
+        const int tok = sh.sorted ? i : f / kTop;
+        const uint16_t* xr = &xin[(size_t)tok * K];
+        bool row_finite = true, row_huge = false;   /* huge: an activation above 2^120 (the kernel's range note) */
+        for (int k = 0; k < K; ++k) {
+            row_finite &= fin16(xr[k]);
+            row_huge |= fin16(xr[k]) && std::fabs(bf2f(xr[k])) > 0x1p120f;
+        }
+        for (int c = 0; c < N; ++c) {
+            ++g_ws.outputs;
+            if (pe[c] == pw[c] || (nan16(pe[c]) && nan16(pw[c]))) { ++same; continue; }
+            if (!fin16(pe[c]) || !fin16(pw[c])) {
+                if (row_huge) ++g_ws.range; else ++cls_bad;   /* kv x past f32 before d: the documented range */
+                continue;
+            }
+            const long d = ulp16(pe[c], pw[c]);
+            if (d <= 1) { ++one; continue; }
+            ++more;
+            double S, Aa;
+            host_dot(b.e[(size_t)e]->block, K, c, xr, &S, &Aa);
+            const double gap = std::fabs((double)bf2f(pe[c]) - (double)bf2f(pw[c]));
+            const double u = std::ldexp(1.0, std::ilogb(std::max(std::fabs(bf2f(pe[c])), std::fabs(bf2f(pw[c])))) - 7);
+            if (gap > std::ldexp(Aa, -15) + u) {
+                if (more_bad < 4)
+                    std::printf("  %s: slot %d col %d: exact %04x wmma %04x (%ld ulp), sum %.9g of |%.9g|\n",
+                                label.c_str(), i, c, pe[c], pw[c], d, S, Aa);
+                ++more_bad;
+            }
+        }
+        /* f32: every output of the first 6 finite rows of the case, against the f64 sum of the exact products. */
+        if (row_finite && !row_huge && f32_n < (size_t)6 * N) {
+            for (int c = 0; c < N; ++c) {
+                double S, Aa;
+                host_dot(b.e[(size_t)e]->block, K, c, xr, &S, &Aa);
+                if (!std::isfinite(S)) continue;
+                const double got = y32[(size_t)i * N + c], err = std::fabs(got - S);
+                ++f32_n;
+                if (err > std::ldexp(Aa, -16) + 1e-37) {
+                    if (f32_bad < 4)
+                        std::printf("  %s: slot %d col %d: f32 %.9g, f64 sum %.12g, |sum| %.9g\n", label.c_str(), i, c,
+                                    got, S, Aa);
+                    ++f32_bad;
+                }
+                if (Aa > 0) g_ws.f32_max_rel = std::max(g_ws.f32_max_rel, err / Aa);
+                g_ws.f32_max_abs = std::max(g_ws.f32_max_abs, err);
+            }
+        }
+    }
+    for (size_t i = (size_t)full.local * N; i < yw.size(); ++i) tail_bad += yw[i] != 0;
+    /* The bf16 the f32 export wrote is the served call's. */
+    size_t f32_bytes = 0;
+    for (size_t i = 0; i < yw.size(); ++i) f32_bytes += yw[i] != y3[i];
+    /* Determinism: other grids and a second run, the same bytes. */
+    size_t det = 0;
+    for (int grid : { 0, 1, 3, 50 }) {
+        std::vector<uint16_t> y2((size_t)T * N, 0xAAAAu);
+        if (p1(nullptr, xin.data(), AR, K, tab, N, full, sh.sorted, y2.data(), &why, 2, grid)) {
+            fail(label + ": form 2 on grid " + std::to_string(grid) + ": " + why);
+            continue;
+        }
+        for (size_t i = 0; i < y2.size(); ++i) det += y2[i] != yw[i];
+    }
+    g_ws.same += same; g_ws.one += one; g_ws.more += more; g_ws.more_bad += more_bad; g_ws.nan_inf_bad += cls_bad;
+    g_ws.f32_checked += (long long)f32_n; g_ws.f32_bad += (long long)f32_bad;
+    g_rows += full.local;
+    if (more_bad) fail(label + ": " + std::to_string(more_bad) + " values further from the exact twin than f32 reordering allows");
+    if (cls_bad) fail(label + ": " + std::to_string(cls_bad) + " values NaN or infinite in one twin and not the other");
+    if (f32_bad) fail(label + ": " + std::to_string(f32_bad) + " f32 outputs beyond 2^-16 sum|w x| of the f64 sum");
+    if (untouched_bad) fail(label + ": " + std::to_string(untouched_bad) + " values of skipped experts' rows written");
+    if (tail_bad) fail(label + ": " + std::to_string(tail_bad) + " values past the live end are not zero");
+    if (det) fail(label + ": " + std::to_string(det) + " values differ between grids or runs");
+    if (f32_bytes) fail(label + ": the f32 export's bf16 differs from the served call's in " + std::to_string(f32_bytes));
+    std::printf("  %s: %d local slots: %lld same, %lld 1-ulp, %lld more (cancellation, %lld beyond), %zu f32 checked "
+                "(%zu bad), grids/rerun %zu differ, %.1f s\n", label.c_str(), full.local, same, one, more, more_bad,
+                f32_n, f32_bad, det, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0c).count());
+    std::fflush(stdout);
+}
+
+/* Batch invariance: token 0 routed to three local experts of rank 0 (and three of others), its activation rows
+ * fixed, inside passes of `Ms` tokens whose other tokens are random; its gate_up rows and its slots' down rows must
+ * be the same bits in every pass. */
+void wmma_invariance(const Bank& gu, const Bank& dn, const std::vector<int>& Ms) {
+    ++g_cases;
+    const auto t0c = std::chrono::steady_clock::now();
+    const int me[kTop] = { 3, 150, 50, 300, 95, 200 };   /* 3, 50, 95 local to rank 0 */
+    std::mt19937_64 r0(77);
+    const std::vector<uint16_t> x0 = make_x(1, gu.K, r0);
+    std::vector<uint16_t> a0((size_t)kTop * dn.K);
+    {
+        std::normal_distribution<float> nd(0.f, 0.6f);
+        for (auto& v : a0) v = f2bf(nd(r0));
+    }
+    std::vector<uint16_t> refg, refd;
+    size_t bad = 0;
+    std::string why;
+    for (int M : Ms) {
+        std::mt19937_64 rng(1000 + (uint64_t)M);
+        Picks pk = make_picks(kUniform, M, rng);
+        pk.rank = 0;
+        for (int k = 0; k < kTop; ++k) pk.p[(size_t)k] = me[k];
+        const Pass p = make_pass(pk, 0, M);
+        const int T = M * kTop;
+        std::vector<uint16_t> x = make_x(M, gu.K, rng);
+        std::copy(x0.begin(), x0.end(), x.begin());
+        std::vector<const void*> tg((size_t)kNe), td((size_t)kNe);
+        for (int e = 0; e < kNe; ++e) {
+            const bool pkd = e % 3 == 1;   /* the same entries in every pass */
+            tg[(size_t)e] = pkd ? ds41p1::mark(gu.e[(size_t)e]->packed, ds41p1::kMarkPacked) : gu.e[(size_t)e]->block;
+            td[(size_t)e] = pkd ? ds41p1::mark(dn.e[(size_t)e]->packed, ds41p1::kMarkPacked) : dn.e[(size_t)e]->block;
+        }
+        /* down's input: a row a slot, token 0's slots the fixed rows (by its pick k), the rest random. */
+        std::vector<uint16_t> din((size_t)T * dn.K);
+        {
+            std::normal_distribution<float> nd(0.f, 0.6f);
+            for (auto& v : din) v = f2bf(nd(rng));
+        }
+        std::vector<int> mine;   /* token 0's local slots, in pick order */
+        for (int k = 0; k < kTop; ++k)
+            for (int i = 0; i < p.local; ++i)
+                if (p.sorted[(size_t)i] == k) {
+                    mine.push_back(i);
+                    std::memcpy(&din[(size_t)i * dn.K], &a0[(size_t)k * dn.K], (size_t)dn.K * 2);
+                }
+        std::vector<uint16_t> G((size_t)T * gu.N, 0xAAAAu), D((size_t)T * dn.N, 0xAAAAu);
+        if (p1(nullptr, x.data(), M, gu.K, tg, gu.N, p, false, G.data(), &why, g_wmma ? -1 : 2, 0) ||
+            p1(nullptr, din.data(), T, dn.K, td, dn.N, p, true, D.data(), &why, g_wmma ? -1 : 2, 0)) {
+            fail("wmma invariance M=" + std::to_string(M) + ": " + why);
+            return;
+        }
+        std::vector<uint16_t> g, d;
+        for (int i : mine) {
+            g.insert(g.end(), G.begin() + (ptrdiff_t)i * gu.N, G.begin() + (ptrdiff_t)(i + 1) * gu.N);
+            d.insert(d.end(), D.begin() + (ptrdiff_t)i * dn.N, D.begin() + (ptrdiff_t)(i + 1) * dn.N);
+        }
+        if (mine.size() != 3) { fail("wmma invariance: token 0 has " + std::to_string(mine.size()) + " local slots"); return; }
+        if (refg.empty()) { refg = g; refd = d; }
+        size_t dd = 0;
+        for (size_t i = 0; i < g.size(); ++i) dd += g[i] != refg[i];
+        for (size_t i = 0; i < d.size(); ++i) dd += d[i] != refd[i];
+        bad += dd;
+        std::printf("  wmma invariance: M %4d (%5d local slots): token 0's 3 gate_up and 3 down rows: %zu values differ "
+                    "from M %d's\n", M, p.local, dd, Ms[0]);
+        std::fflush(stdout);
+    }
+    if (bad) fail("wmma invariance: " + std::to_string(bad) + " values of one token's rows depend on the pass");
+    std::printf("  wmma invariance: %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0c).count());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -801,6 +1066,7 @@ int main(int argc, char** argv) {
      * in the environment (beside P1 and LCP) the served twin must be the tiled one, which every case then holds to
      * the 16-token gemv. */
     const bool tiled_mode = argc > 1 && !std::strcmp(argv[1], "tiled");
+    const bool wmma_mode = argc > 1 && !std::strcmp(argv[1], "wmma");
     const bool quick = (argc > 1 && !std::strcmp(argv[1], "quick")) || tiled_mode;
     g_forms = tiled_mode;
     {
@@ -812,6 +1078,23 @@ int main(int argc, char** argv) {
         if (asked && !g_tiled) {
             std::printf("FAIL: %s=1, but the served twin is not the tiled one (P1 and LCP in the environment?)\n",
                         kR4dDs41P1TiledEnv);
+            return 1;
+        }
+    }
+    {
+        const char* e = std::getenv(kR4dDs41P1WmmaEnv);
+        const bool asked = e && !std::strcmp(e, "1");
+        g_wmma = r4d_ds41_p1_wmma_on() != 0;
+        if (g_wmma || wmma_mode)
+            std::printf("WMMA P1 twin: %s (%s %s)\n", g_wmma ? "served" : "forced as form 2", kR4dDs41P1WmmaEnv,
+                        asked ? "=1" : "unset");
+        if (asked && !g_wmma) {
+            std::printf("FAIL: %s=1, but the served twin is not the WMMA one (P1 and LCP in the environment?)\n",
+                        kR4dDs41P1WmmaEnv);
+            return 1;
+        }
+        if (g_wmma && !wmma_mode) {
+            std::printf("FAIL: the WMMA twin is served, which the exact modes cannot hold to the 16-token gemv: run `wmma`\n");
             return 1;
         }
     }
@@ -827,6 +1110,29 @@ int main(int argc, char** argv) {
         { "K 1056, N 37", 37, 1056, false },
     };
     const Bank b0(shapes[0].N, shapes[0].K, 101), b1(shapes[1].N, shapes[1].K, 202), b2(shapes[2].N, shapes[2].K, 303);
+    if (wmma_mode) {
+        /* The WMMA twin: shapes as above (gate_up, down, a short K over four 256-row column groups, and K 1056 / N 37:
+         * a one-block last chunk and weight rows past N), heights cut short and crossing 64-row tiles. */
+        const Bank b3w(shapes[3].N, shapes[3].K, 808);
+        const Bank* wb[] = { &b0, &b1, &b2, &b3w };
+        for (int si = 0; si < 4; ++si)
+            for (int M : { 17, 64, 100 })
+                for (int k = 0; k < kKinds; ++k) {
+                    if (k == kReal && !real) continue;
+                    if (si >= 2 && M == 100 && k != kSkewed && k != kReal) continue;
+                    wmma_case(*wb[si], shapes[si], M, k, 5151u * (uint32_t)M + 31u * (uint32_t)k + (uint32_t)si);
+                }
+        wmma_invariance(b0, b1, { 1, 7, 64, 1896 });
+        std::printf("%s: %d cases, %lld rows; WMMA twin against the exact twin: %lld outputs, %lld same, %lld 1-ulp, "
+                    "%lld further (%lld beyond the reordering bound), %lld NaN/inf class differences (%lld more on rows with "
+                    "|x| > 2^120, the range note); f32 %lld checked, "
+                    "%lld beyond 2^-16 sum|wx|, max |err|/sum|wx| %.3g, max |err| %.3g; %.0f s\n",
+                    g_fails ? "FAIL" : "PASS", g_cases, g_rows, g_ws.outputs, g_ws.same, g_ws.one, g_ws.more,
+                    g_ws.more_bad, g_ws.nan_inf_bad, g_ws.range, g_ws.f32_checked, g_ws.f32_bad, g_ws.f32_max_rel, g_ws.f32_max_abs,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        munmap(page, 1 << 16);
+        return g_fails ? 1 : 0;
+    }
     std::unique_ptr<Bank> b3;
     if (tiled_mode) b3.reset(new Bank(shapes[3].N, shapes[3].K, 808));
     const Bank* banks[] = { &b0, &b1, &b2, b3.get() };
