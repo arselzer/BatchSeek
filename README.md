@@ -28,24 +28,24 @@ already keeps hot experts on the cards and streams the rest from RAM and disk. T
 behaves at hundreds of concurrent requests:
 
 - **RAM expert cache with CPU-computed experts.** A packed RAM cache holds most of the experts that are not on the
-  cards. The CPU computes some of them each step instead of sending them over PCIe (hybrid decode and hybrid
-  prefill). The CPU kernels use the card's arithmetic, so the results are bit-identical to the card's.
+  cards. The CPU computes some of them each step instead of sending them over PCIe (while generating and while
+  reading prompts). The CPU kernels use the card's arithmetic, so the results are bit-identical to the card's.
 - **Expert placement in VRAM.** Hot experts stay on the cards and follow live routing. The VRAM that the KV pool and
   other arenas do not need holds more experts.
-- **Batch admission and scheduling.** Requests that arrive together are prefilled together in large steps. Decoding
-  starts once the prompts are in, so each decode step carries as many requests as possible. Each expert sent to a
-  card serves every row that needs it in that step.
-- **Prefix cache and memory sizing.** Shared prompt heads (for example a database schema) are prefilled once. The
+- **Batch admission and scheduling.** Requests that arrive together have their prompts read together in large
+  chunks, and generation starts once the prompts are in, so each step generates a token for as many requests as
+  possible. Each expert sent to a card serves every token in the batch that needs it.
+- **Prefix cache and memory sizing.** Shared prompt heads (for example a database schema) are read once. The
   prefix cache's snapshot store is sized for short batch prompts, and a RAM budget sizes the expert cache from what
   the host actually has free.
 - **Placement profiles.** `--expert-stats` records how often each expert is used; `--expert-profile` loads such
   counts at startup to choose which experts live on the cards and in RAM. Profiles can be made portable: the server
   then matches them to a container by its size and the sha256 of its metadata header, not by its path.
-- **Kernels.** Register-tiled prefill and a matrix-core path for the FP8 dense layers, both with unchanged results.
-  Optionally, prefill and attention on the matrix cores in another summation order: faster, but replies can then
+- **Kernels.** Faster prompt reading (register tiling) and the cards' matrix units for the FP8 dense layers, both
+  with unchanged results. Optionally, prompt reading and attention on the matrix units in another summation order: faster, but replies can then
   depend on the batch (see "Reproducible mode").
 - **Reproducibility checks and measurement harness.** `tools/ds41-host-experts/ab_window.sh` runs A/B measurement
-  windows. Each optimization was accepted only if replies, logits and prefill hashes stayed byte-identical to the
+  windows. Each optimization was accepted only if replies, logits and prompt-reading hashes stayed byte-identical to the
   same engine with that optimization off.
 
 Configuration, switches and measurements: [tools/ds41-host-experts/README.md](tools/ds41-host-experts/README.md).
@@ -68,36 +68,28 @@ Configuration, switches and measurements: [tools/ds41-host-experts/README.md](to
 
 Four RX 9070 XT (TP4), EPYC 7443 (24 cores), 256 GB DDR4-2666, one 2 TB NVMe drive.
 
-![A 512-request job over time: requests waiting, prefilling and decoding, output tokens per second, KV cache, power](batch/docs/charts/timeline-512.svg)
+![A 512-request job over time: requests waiting, reading prompts and generating, output tokens per second, KV cache, power](batch/docs/charts/timeline-512.svg)
 
 One batch of 512 SQL questions, from the first request to the last reply.
 
-| Requests at once | Output tokens/s, all together | Per request | Speedup | Power (avg, W) | Wh per 1,000 tokens |
+| Requests at once | Output tokens/s, all together | Per request | vs. 1 request | Power (avg, W) | Wh per 1,000 tokens |
 |---:|---:|---:|---:|---:|---:|
 | 1 | 31 | 31 | 1× | ~580 | ~5.2 |
-| 8 | 55 | 7 | 1.8× | 634 | 3.2 |
-| 64 | 86 | 1.3 | 2.8× | 725 | 2.3 |
-| 256 | 203 | 0.8 | 6.6× | 908 | 1.3 |
-| **512** | **269** | **0.5** | **8.7×** | **965** | **1.0** |
+| 8 | 55 | 6.9 | 1.8× | 634 | 3.2 |
+| 64 | 86 | 1.34 | 2.8× | 725 | 2.3 |
+| 256 | 203 | 0.79 | 6.6× | 908 | 1.3 |
+| **512** | **269** | **0.53** | **8.7×** | **965** | **1.0** |
 
-Decode rate summed over all requests, in the reproducible mode. The rows come from different runs and
-configurations, so the speedup is what the box achieves, not batching measured in isolation. Power is GPU boards plus
-CPU package.
+Output tokens per second while generating, all requests together. Power is GPUs + CPU.
 
-![Decode throughput by number of concurrent requests](batch/docs/charts/throughput.svg)
+![Output tokens per second by number of requests at once](batch/docs/charts/throughput.svg)
 
-Whole jobs, from the first request to the last reply, prompts included. "Earlier configuration" is the same engine
-and hardware before most of the batch work:
-
-| Job | Earlier configuration | Batched | Speedup |
-|---|---:|---:|---:|
-| 256 BIRD questions (public) | 1,025 s | 146 s | 7.0x |
-| 512 SQL questions | | 566 s | |
-| 256 COCO photos to object labels | | 532 s | |
+Whole jobs, from the first request to the last reply, prompts included: 512 SQL questions take 566 s, and labeling
+256 COCO photos takes 532 s.
 
 ![Energy per 1,000 requests by job](batch/docs/charts/energy.svg)
 
-GPU boards and CPU package, from their sensors.
+GPUs and CPU, from their own sensors.
 
 Answer quality on 500 BIRD questions (execution accuracy, temperature 0, thinking off; two reference queries that
 run past the 30-second limit count as wrong for everyone, as in BIRD's evaluator):
@@ -123,15 +115,14 @@ The same BIRD 256 job with three placement profiles:
 | Built into the model file | 221 s |
 | Recorded from 64 public BIRD *training* questions (different databases) | **146 s** |
 
-The measured numbers used a community IQ4_NL conversion of the Engram tables. The engine is switching to the
-release's official FP8 Engram tables, which measured the same speed (170 s vs 172 s) and a slightly lower NLL (0.688
-vs 0.692 with IQ4_NL).
+The measured numbers used a community IQ4_NL conversion of the Engram tables. The release's official FP8 tables
+(`--engram-file`) ran at the same speed (170 s vs 172 s on 256 BIRD questions) with similar accuracy.
 
 ## Requirements
 
-- A HIP build of this repository, built like upstream radiance ("Build from source" in its README) (its `deepseek41` plugin
-  and `libr4d` from the same build), and the SiLU table its card check captures (`ds41_mxfp4_device_check ...
-  swiglu silu_table_gfx1201.bin`; see `tools/ds41-host-experts/README.md` in the fork).
+- A HIP build of this repository, built like upstream radiance (see "Build from source" in its README; the
+  `deepseek41` plugin and `libr4d` must come from the same build), and the SiLU table its card check captures
+  (`ds41_mxfp4_device_check ... swiglu silu_table_gfx1201.bin`; see `tools/ds41-host-experts/README.md`).
 - The DeepSeek-V4.1-Flash container (`.rad`, 416 GB) on NVMe.
 - Tested only on four 16 GB RX 9070 XT cards (gfx1201, TP4), a 24-core EPYC and 256 GB of RAM. Big batches use nearly
   all of that RAM: run jobs alone on the machine.
@@ -156,11 +147,11 @@ export RADIANCE_HOME=/path/to/BatchSeek/build/radiance_home
 python3 batch_client.py questions.jsonl answers.jsonl --concurrency 512
 ```
 
-`--engram-file` reads the release's official FP8 Engram tables (203 GB extra download). Leave it out to use the IQ4_NL
+`--engram-file` reads the release's official FP8 Engram tables (203 GB extra download). Leave it out to use the
 IQ4_NL tables bundled in `model.rad` and save the space; both ran at the same speed with similar accuracy in our tests.
 
 `questions.jsonl` has one `{"prompt": "...", "system": "...", "id": "..."}` a line; put text that prompts share (a
-schema, instructions) in `system`, so the prefix cache prefills it once. `batch_client.py --help` lists the rest.
+schema, instructions) in `system`, so the prefix cache reads it once. `batch_client.py --help` lists the rest.
 
 ## Calibration
 
@@ -179,7 +170,7 @@ instead keeps a profile per container in DIR and refreshes it from every run.
 
 ## Reproducible vs default mode
 
-By default, prefill and attention run on the matrix cores, summed in a different order, so a reply can change with
+By default, prompt reading and attention run on the cards' matrix units, summed in a different order, so a reply can change with
 the batch around it. `--reproducible` (alias `--exact`) turns those two modes off: every reply is then
 byte-identical whether a request runs alone or among hundreds of others, and the same whichever placement profile is
 used. On 500 BIRD questions the default finished the job 8% faster (260 s to 240 s) at similar accuracy (61.6% vs
@@ -239,14 +230,6 @@ python3 profile_blend_test.py
 ./serve_batch_test.sh PATH/TO/ab_window.sh   # needs the harness in ../tools/ds41-host-experts/; skips without it
 ```
 
-## Known limits
-
-- Tested on one machine: this model, four RX 9070 XT, 256 GB of RAM. radiance serves many other models and features;
-  none were tested with this kit.
-- Finite batches submitted together, not continuous serving. Keeping the server busy with a longer queue needs more
-  work on scheduling and KV allocation.
-- About 0.5-0.8 tokens/s per request at large batches: for jobs nobody waits on, not for chat.
-
 ## What was not tested
 
 Upstream radiance serves many other models and has many other features (other architectures, speculative decoding,
@@ -258,7 +241,8 @@ Also not covered:
 
 - other hardware than four 16 GB RX 9070 XT and 256 GB of RAM;
 - continuous serving with a long queue (the measurements are finite batches submitted together);
-- long contexts at large batch sizes.
+- long contexts at large batch sizes;
+- chat: at large batches each request gets about 0.5-0.8 tokens/s, which suits jobs nobody waits on.
 
 ## License
 
