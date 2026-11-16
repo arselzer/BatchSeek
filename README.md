@@ -56,7 +56,7 @@ Configuration, switches and measurements: [tools/ds41-host-experts/README.md](to
 
 - `serve-batch.sh` starts the fork's server with the measured batch configuration (`--help` explains every
   option; `--dry-run` prints the environment and command without starting anything).
-- `batch_client.py` sends a JSONL file of prompts N at a time, refilling as replies finish, and writes the replies
+- `batch_client.py` (optional; any OpenAI-API client works) sends a JSONL file of prompts N at a time, refilling as replies finish, and writes the replies
   in input order. Standard library only.
 - `calibrate.sh` records a placement profile on your own prompts in one command.
 - `profile_blend.py` blends, checks and shows placement profiles; `profiles/profile_rebind.py` makes one portable
@@ -168,7 +168,9 @@ Disk: joining the parts needs room for the parts and `model.rad` at once (about 
 bundled in `model.rad`; both ran at the same speed with similar accuracy in our tests. Or rebuild `model.rad` from
 DeepSeek's release with `batch/convert/convert.sh` (CPU only; see [convert/README.md](batch/convert/README.md)).
 
-`my-questions.jsonl` is your own file, with one `{"prompt": "...", "system": "...", "id": "..."}` a line; put text that prompts share (a
+The server speaks the OpenAI API, so any client works as long as it sends many requests at once (one request at a
+time gets about 31 tokens/s instead of 269). `batch_client.py` is a small helper that does that for a JSONL file and
+keeps the answers in order. `my-questions.jsonl` is your own file, with one `{"prompt": "...", "system": "...", "id": "..."}` a line; put text that prompts share (a
 schema, instructions) in `system`, so the prefix cache reads it once. `batch_client.py --help` lists the rest.
 
 **Long prompts.** Each request gets `--ctx-per-stream` tokens for prompt plus reply (default 1,152, enough for short
