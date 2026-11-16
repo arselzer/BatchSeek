@@ -70,47 +70,36 @@ Configuration, switches and measurements: [tools/ds41-host-experts/README.md](to
 
 ## Results
 
-Four RX 9070 XT (TP4), EPYC 7443 (24 cores), 256 GB DDR4-2666, one 2 TB NVMe drive.
+Four RX 9070 XT (TP4), EPYC 7443 (24 cores), 256 GB DDR4-2666, one 2 TB NVMe drive. All 500 questions of BIRD's 2026
+mini-dev set (official prompts, replies up to 2048 tokens) in one batch, default mode, the release's FP8 Engram tables
+(`--engram-file`) and the BIRD training profile:
 
-![A 512-request job over time: requests waiting, processing prompts and generating, output tokens per second, KV cache, power](batch/docs/charts/timeline-512.svg)
+![A 500-request job over time: requests waiting, processing prompts and generating, output tokens per second, KV cache, power](batch/docs/charts/timeline-500.svg)
 
-One batch of 512 SQL questions from my own workload (not public), from the first request to the last reply.
+| BIRD 2026 questions at once | Peak output tokens/s | Whole job, tokens/s | Power (avg, W) | Wh per 1,000 tokens |
+|---:|---:|---:|---:|---:|
+| 500 | ~340 | 112 | 589 | 1.45 |
 
-| Requests at once | Output tokens/s, all together | Per request | vs. 1 request | Power (avg, W) | Wh per 1,000 tokens |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 31 | 31 | 1× | ~580 | ~5.2 |
-| 8 | 55 | 6.9 | 1.8× | 634 | 3.2 |
-| 64 | 86 | 1.34 | 2.8× | 725 | 2.3 |
-| 256 | 203 | 0.79 | 6.6× | 908 | 1.2 |
-| **512** | **269** | **0.53** | **8.7×** | **965** | **1.0** |
+The job takes 49 minutes from the first request to the last reply and produces 328,110 output tokens: six minutes of
+prompt processing, then generation. The peak is measured from the KV cache's growth over 10 seconds while all 500
+generate. Replies vary a lot in length, so for most of the second half only a shrinking group of long answers is still
+running. Power is GPUs + CPU, from their own sensors.
 
-Output tokens per second while generating, all requests together. Power is GPUs + CPU.
+Execution accuracy on both versions of BIRD's 500-question mini-dev set (thinking off, temperature 0 where a model
+accepts it), and the cost of the 2026 job:
 
-![Output tokens per second by number of requests at once](batch/docs/charts/throughput.svg)
+| Who runs the model | BIRD 2026 | BIRD original | Cost, 2026 set |
+|---|---:|---:|---:|
+| **This box** (default mode, BIRD training profile) | **50.2%** | **61.6%** | **€0.14** at €0.30/kWh |
+| DeepSeek API | 50.8% | 59.8% | €0.22 |
+| DeepInfra (FP8) | 47.2% | 60.2% | €0.12 |
+| Wafer (MXFP4) | 49.0% | 60.2% | €0.16 |
+| *Other models* | | | |
+| Claude Haiku 5.5 | 53.4% | 62.0% | €0.28 |
+| GPT-6 Luna | 43.0% | 55.8% | €0.17 |
 
-Whole jobs, from the first request to the last reply, prompts included: the 512 SQL questions take 566 s with the best
-configuration measured (the launcher's defaults: about 600 s).
-
-![Energy per 1,000 requests by job](batch/docs/charts/energy.svg)
-
-GPUs and CPU, from their own sensors.
-
-Answer quality on 500 BIRD questions (execution accuracy, temperature 0, thinking off; two reference queries that
-run past the 30-second limit count as wrong for everyone, as in BIRD's evaluator):
-
-| Who runs the model | Execution accuracy | Cost for 500 questions |
-|---|---:|---:|
-| **This box** (default mode, public profile) | **61.6%** | **€0.014** at €0.30/kWh |
-| DeepSeek API | 59.8% | €0.031 |
-| DeepInfra (FP8) | 60.2% | €0.015 |
-| Wafer (MXFP4) | 60.2% | €0.021 |
-| *Other models* | | |
-| Claude Haiku 5.5 | 62.0% | €0.10 |
-| GPT-6 Luna | 55.8% | €0.063 |
-
-API prices as charged through OpenRouter on 16 November 2026, at $1.12 per euro. Apart from GPT-6 Luna, the
-accuracy differences are within noise. The other models ran with thinking off at their default sampling (they don't
-accept temperature 0), with prompts written for DeepSeek.
+API costs as billed through OpenRouter on 16 November 2026, at $1.12 per euro. Haiku and Luna ran at their default
+sampling, as they don't accept temperature 0. Differences of a few points are noise.
 
 The model file carries no profile. Without one, the experts kept on the GPUs are an arbitrary fixed set; the RAM cache
 adapts either way, filling with the experts the job uses while it runs. The same 256 BIRD questions without a profile and with a recorded one:
@@ -120,8 +109,10 @@ adapts either way, filling with the experts the job uses while it runs. The same
 | None | 221 s |
 | Recorded from 64 public BIRD *training* questions (different databases) | **146 s** |
 
-The measured numbers used the IQ4_NL Engram tables from [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)'s GGUF release. The release's official FP8 tables
-(`--engram-file`) ran at the same speed (170 s vs 172 s on 256 BIRD questions) with similar accuracy.
+The 500-question run used the release's official FP8 Engram tables (`--engram-file`); the other BIRD runs used the
+IQ4_NL tables from [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)'s GGUF
+release that are bundled in `model.rad`. Both ran at the same speed (170 s vs 172 s on 256 BIRD questions) with similar
+accuracy.
 
 ## Requirements
 
@@ -172,13 +163,13 @@ bundled in `model.rad`; both ran at the same speed with similar accuracy in our 
 DeepSeek's release with `batch/convert/convert.sh` (CPU only; see [convert/README.md](batch/convert/README.md)).
 
 The server speaks the OpenAI API, so any client works as long as it sends many requests at once (one request at a
-time gets about 31 tokens/s instead of 269). `batch_client.py` is a small helper that does that for a JSONL file and
+time is many times slower). `batch_client.py` is a small helper that does that for a JSONL file and
 keeps the answers in order. `my-questions.jsonl` is your own file, with one `{"prompt": "...", "system": "...", "id": "..."}` a line; put text that prompts share (a
 schema, instructions) in `system`, so the prefix cache processes it once. `batch_client.py --help` lists the rest.
 
 **Long prompts.** Each request gets `--ctx-per-stream` tokens for prompt plus reply (default 1,152, enough for short
 SQL questions). For longer prompts or replies, raise it and lower `--streams` so that streams x ctx-per-stream stays
-at most about 1.2 million tokens (tested: `--streams 256 --ctx-per-stream 4608` for BIRD's 2026 prompts). `--dry-run` shows the resulting settings.
+at most about 2.4 million tokens (tested: `--streams 512 --ctx-per-stream 4608` for all 500 of BIRD's 2026 prompts at once). `--dry-run` shows the resulting settings.
 
 ## Calibration
 
