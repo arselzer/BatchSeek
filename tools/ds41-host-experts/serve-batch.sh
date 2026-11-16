@@ -25,16 +25,18 @@
 #     --hybrid-prefill 0 turns both off.
 #   - --engram-early (Ee, RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY=1): the next Engram layer's table rows read ahead; on by
 #     default (exact, 256 NL-SQL 266 -> 250 s in an A-B-B-A, window ab-20261115T173507Z); --engram-early 0 turns it off.
-#   - --fast-prefill (Qw, ..._P1_WMMA): the P1 twin's routed-expert GEMMs on the matrix cores (WMMA), OFF by default.
+#   - --fast-prefill (Qw, ..._P1_WMMA): the P1 twin's routed-expert GEMMs on the matrix cores (WMMA), ON by default.
 #     NOT exact: the same bf16 weights and activations, another f32 summation order, so replies are not byte-identical
-#     to the exact engine's (bf16 outputs mostly identical, rare 1-ulp differences). Give 1 to turn it on; unmeasured
-#     until its window (FASTPREFILL-20261115.md).
+#     to the exact engine's and depend on the batch. BIRD 500 (window ab-20261116T104839Z): EX 62.4 exact vs 61.4 Qw+Dt
+#     (McNemar p 0.33) and 61.8 with Aw (p 0.65); job 260.1 -> 243.6 / 239.5 s. --exact (or --fast-prefill 0) for the
+#     exact, batch-invariant engine (FASTPREFILL-20261115.md).
 #   - --fast-dense (Dt, ..._DENSE_TILED): the FP8-stored dense linears above 64 rows on the LDS-tiled WMMA form, ON by
 #     default: EXACT (the m64 kernel's bits; FASTDENSE-20261115.md), 256 NL-SQL 267.2 -> 250.6 s, prefill -8.8%, every
 #     reply identical and the KL run identical (window ab-20261116T041838Z); --fast-dense 0 turns it off.
-#   - --fast-attn (Aw, ..._ATTN_WMMA): the sparse attention at every height on the matrix cores, OFF by default. NOT
+#   - --fast-attn (Aw, ..._ATTN_WMMA): the sparse attention at every height on the matrix cores, ON by default. NOT
 #     exact: q.k and sum p k summed in another f32 order (the softmax's exp, max and normaliser the exact kernel's), so
-#     replies are not byte-identical to the exact engine's. Give 1 to turn it on (FASTDENSE-20261115.md).
+#     replies are not byte-identical to the exact engine's. --exact (or --fast-attn 0) turns it off (FASTDENSE-20261115.md).
+#   - --exact: both inexact modes off (--fast-prefill 0 --fast-attn 0): replies byte-identical whatever the batch.
 #   - --hybrid-cal M (QycM, ..._P1_HYBRID_CAL): the hybrid split's CPU rate learnt from completions (1), one share for
 #     every rank with the choice reserved under one lock (2), or both (3); exact (selection only). OFF (0) until window
 #     H58 measures it (core/place/p1_hybrid.h "calibration").
@@ -85,7 +87,7 @@
 #                       [--ctx-per-stream 1152] [--profile FILE] [--mirror DIR] [--shared-head 32] [--served-name ds41]
 #                       [--radiance-home DIR] [--hybrid 60] [--max-seq-len N] [--tiled 0|1] [--tail-once 0|1]
 #                       [--swiglu-span 0|1] [--engram-early 0|1] [--hybrid-prefill 60] [--fast-prefill 0|1]
-#                       [--fast-dense 0|1] [--fast-attn 0|1] [--early K] [--pack W] [--pack-once 0|1] [--hybrid-cal M]
+#                       [--fast-dense 0|1] [--fast-attn 0|1] [--exact] [--early K] [--pack W] [--pack-once 0|1] [--hybrid-cal M]
 #                       [--arena-split 0|1] [--kv-auto T] [--ram-per-seq-mib N] [--kv-lend 0|1] [--decode-min N]
 #                       [--capture FILE] [--auto-profile DIR] [--dry-run]
 #                       [-- more radiance flags, e.g. --expert-stats FILE to record a profile; outside the measured set]
@@ -95,7 +97,7 @@
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
-EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=0 FASTDN=1 FASTAT=0 EARLY=0 PACK=0 PACKONCE=0 HYBCAL=0 ASPLIT=0 KVAUTO=0 PERSEQ="" KVLEND=0 DECMIN=0 CAPTURE="" STREAMS_SET=0 AUTO=""
+EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=1 FASTDN=1 FASTAT=1 EARLY=0 PACK=0 PACKONCE=0 HYBCAL=0 ASPLIT=0 KVAUTO=0 PERSEQ="" KVLEND=0 DECMIN=0 CAPTURE="" STREAMS_SET=0 AUTO="" FAST_SET=0
 while (( $# )); do
   case $1 in
     --model) MODEL=${2:?}; shift ;;
@@ -118,9 +120,10 @@ while (( $# )); do
     --engram-early) ENGEARLY=${2:?}; shift ;;
     --hybrid-prefill) HYBPF=${2:?}; shift ;;
     --swiglu-span) SPAN=${2:?}; shift ;;
-    --fast-prefill) FASTPF=${2:?}; shift ;;
+    --fast-prefill) FASTPF=${2:?}; FAST_SET=1; shift ;;
     --fast-dense) FASTDN=${2:?}; shift ;;
-    --fast-attn) FASTAT=${2:?}; shift ;;
+    --fast-attn) FASTAT=${2:?}; FAST_SET=1; shift ;;
+    --exact) FASTPF=0; FASTAT=0; FAST_SET=1 ;;
     --early) EARLY=${2:?}; shift ;;
     --pack) PACK=${2:?}; shift ;;
     --pack-once) PACKONCE=${2:?}; shift ;;
@@ -137,6 +140,8 @@ while (( $# )); do
   esac
   shift
 done
+# a calibration run is the exact engine unless the fast modes are named (its replies are the base engine's)
+[[ -n "$CAPTURE" ]] && (( FAST_SET == 0 )) && { FASTPF=0; FASTAT=0; }
 [[ -n "$CAPTURE" && -n "$AUTO" ]] && die "--capture and --auto-profile both record the counts; give one"
 # A calibration run: few streams and batch admission without the split (see --capture above).
 BA=2048 BSPLIT=1

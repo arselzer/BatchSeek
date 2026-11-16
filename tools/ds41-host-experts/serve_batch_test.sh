@@ -89,7 +89,7 @@ grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_KV_LEND=0' <<< "$dv" && grep -qx 'env R
 "$SB" --model M --silu-table S --kv-lend 2 --dry-run > /dev/null 2>&1 && bad "--kv-lend 2 accepted" || ok "--kv-lend 2 refused"
 "$SB" --model M --silu-table S --kv-auto 8 --dry-run > /dev/null 2>&1 && bad "--kv-auto 8 accepted" || ok "--kv-auto under 16 refused"
 
-RADIANCE_BIN=BIN "$SB" --model MODEL --silu-table SILU --profile "$T/profiles/prof.json" --mirror "$T/mirror" --dry-run > "$T/sb.txt" ||
+RADIANCE_BIN=BIN "$SB" --model MODEL --silu-table SILU --profile "$T/profiles/prof.json" --mirror "$T/mirror" --exact --dry-run > "$T/sb.txt" ||
   bad "serve-batch.sh --dry-run failed"
 
 M=$HERE/serve_batch_match.py
@@ -158,23 +158,26 @@ grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=0' <<< "$d0h" && [[ $d0h == *
 [[ $dh != *--max-seq-len* ]] && ok "no --max-seq-len by default" || bad "a --max-seq-len by default"
 
 dq=$("$SB" --model M --silu-table S --tiled 0 --tail-once 0 --swiglu-span 0 --dry-run)
-grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1' <<< "$dh" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=1' <<< "$dh" &&
-  grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN=1' <<< "$dh" && ok "Qt, Qz, Qsp on by default" || bad "the Qt/Qz/Qsp defaults"
+dx=$("$SB" --model M --silu-table S --exact --dry-run)
+grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1' <<< "$dx" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=1' <<< "$dh" &&
+  grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN=1' <<< "$dh" && ok "Qz, Qsp on by default; Qt on with --exact" || bad "the Qt/Qz/Qsp defaults"
 grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TILED=0' <<< "$dq" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=0' <<< "$dq" &&
   grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN=0' <<< "$dq" && ok "--tiled 0 --tail-once 0 --swiglu-span 0: off" ||
   bad "--tiled / --tail-once / --swiglu-span"
 
-grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=0' <<< "$dh" && ok "--fast-prefill off by default (Qw: ..._P1_WMMA=0)" ||
+grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=1' <<< "$dh" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TILED=0' <<< "$dh" &&
+  grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=0' <<< "$dx" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA=0' <<< "$dx" &&
+  ok "--fast-prefill on by default (Qw, Qt off); --exact turns Qw and Aw off" ||
   bad "the --fast-prefill default"
 dw=$("$SB" --model M --silu-table S --fast-prefill 1 --dry-run)
 grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=1' <<< "$dw" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_TILED=0' <<< "$dw" &&
   ok "--fast-prefill 1: Qw (..._P1_WMMA=1), the tiled twin's switch off (the core refuses both)" || bad "--fast-prefill 1"
 
-grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED=1' <<< "$dh" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA=0' <<< "$dh" &&
-  ok "--fast-dense on and --fast-attn off by default (Dt, Aw: ..._DENSE_TILED=1, ..._ATTN_WMMA=0)" || bad "the --fast-dense / --fast-attn defaults"
-dda=$("$SB" --model M --silu-table S --fast-dense 1 --fast-attn 1 --dry-run)
+grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED=1' <<< "$dh" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA=1' <<< "$dh" &&
+  ok "--fast-dense and --fast-attn on by default (Dt, Aw: ..._DENSE_TILED=1, ..._ATTN_WMMA=1)" || bad "the --fast-dense / --fast-attn defaults"
+dda=$("$SB" --model M --silu-table S --fast-prefill 0 --fast-dense 1 --fast-attn 1 --dry-run)
 grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED=1' <<< "$dda" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA=1' <<< "$dda" &&
-  grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=0' <<< "$dda" && ok "--fast-dense 1 --fast-attn 1: Dt and Aw, Qw as it was" ||
+  grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=0' <<< "$dda" && ok "--fast-prefill 0 --fast-dense 1 --fast-attn 1: Dt and Aw, Qw off" ||
   bad "--fast-dense 1 / --fast-attn 1"
 
 grep -qx 'env RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN=0' <<< "$dh" && ok "--decode-min off by default (DmN: ..._DECODE_MIN=0)" ||
