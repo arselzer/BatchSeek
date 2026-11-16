@@ -2312,6 +2312,24 @@ fi
 # checked (LCP_CHECK_C).
 LCP_OK="" LCP_LIB="" LCP_SUM="" LCP_C=0
 LCP_WHY="no large-chunk prefill device checks in this window (DEVICE_CHECKS=lcp with TALL_CHECK and TALL_LIBR4D)"
+# Device-check receipts reused within one build (DEVCHECK_REUSE_DIR: an earlier window's output dir). A check's log is
+# copied instead of rerun only when that window stored the same key beside it: the SHA-256 of the check binary, the
+# library and any input file, and the check's arguments. Any other case runs the check, and stores its key.
+dc_key() {   # check binary, library, input files..., -- args...
+  local k="" f
+  while (( $# )) && [[ $1 != -- ]]; do k+="$(sha256sum "$1" 2>/dev/null | cut -c1-64) "; shift; done
+  [[ ${1:-} == -- ]] && shift
+  printf '%s| %s' "$k" "$*"
+}
+dc_reuse() {   # log file, key
+  local f=$1 key=$2 src
+  [[ -n "${DEVCHECK_REUSE_DIR:-}" ]] || return 1
+  src="$DEVCHECK_REUSE_DIR/$(basename "$f")"
+  [[ -f "$src" && -f "$src.key" && "$(cat "$src.key")" == "$key" ]] || return 1
+  cp "$src" "$f" && printf '%s' "$key" > "$f.key" &&
+    log "device check $(basename "$f"): reused from $DEVCHECK_REUSE_DIR (same check binary, library, inputs and arguments)"
+}
+
 if [[ " ${DEVICE_CHECKS:-1} " == *" lcp "* ]]; then
   # RADIANCE_EXPERIMENTAL_DS41_LCP on card 0: the twin and the sparse ops at chunk heights up to
   # LCP_CHECK_C (`lcp`, which also sweeps every other height-dependent op through that chunk, gemm_nt by the
@@ -3570,23 +3588,6 @@ fi
 HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
 CANCEL=${CANCEL_FILE:-/home/as/ds41-claude-build/work/cancel_window}
 
-# Device-check receipts reused within one build (DEVCHECK_REUSE_DIR: an earlier window's output dir). A check's log is
-# copied instead of rerun only when that window stored the same key beside it: the SHA-256 of the check binary, the
-# library and any input file, and the check's arguments. Any other case runs the check, and stores its key.
-dc_key() {   # check binary, library, input files..., -- args...
-  local k="" f
-  while (( $# )) && [[ $1 != -- ]]; do k+="$(sha256sum "$1" 2>/dev/null | cut -c1-64) "; shift; done
-  [[ ${1:-} == -- ]] && shift
-  printf '%s| %s' "$k" "$*"
-}
-dc_reuse() {   # log file, key
-  local f=$1 key=$2 src
-  [[ -n "${DEVCHECK_REUSE_DIR:-}" ]] || return 1
-  src="$DEVCHECK_REUSE_DIR/$(basename "$f")"
-  [[ -f "$src" && -f "$src.key" && "$(cat "$src.key")" == "$key" ]] || return 1
-  cp "$src" "$f" && printf '%s' "$key" > "$f.key" &&
-    log "device check $(basename "$f"): reused from $DEVCHECK_REUSE_DIR (same check binary, library, inputs and arguments)"
-}
 
 # A chain trace's file base: chain-<arm>, or chain-<sha1 of the arm, 16 hex> when chain-<arm>.stamps.csv would pass the
 # file system's 255-byte name limit (the engine drops a trace it cannot open); the long form is noted in chain-names.txt.
