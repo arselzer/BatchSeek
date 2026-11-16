@@ -8,7 +8,7 @@ serve_batch_test.sh).
       --ctx-per-stream (--max-model-len / --max-num-seqs, which must divide), --port, --served-name,
       --radiance-home, --shared-head, --hybrid (..._P1_HYBRID: QyP's P, 0 or unset off; a held share, Qyf, is
       refused), --tiled / --tail-once / --swiglu-span / --fast-prefill / --fast-dense / --fast-attn (Qt / Qz / Qsp / Qw /
-      Dt / Aw: ..._P1_TILED, _P1_TAIL_ONCE, _P1_SWIGLU_SPAN, _P1_WMMA, _DENSE_TILED, _ATTN_WMMA, 0 or unset off), --early (QxK: ..._P1_EARLY, 0 or unset off), and --profile, --mirror, --reserve-mib, --max-seq-len (SlN) where the launch has them. Exit 1
+      Dt / Aw: ..._P1_TILED, _P1_TAIL_ONCE, _P1_SWIGLU_SPAN, _P1_WMMA, _DENSE_TILED, _ATTN_WMMA, 0 or unset off), --early (QxK: ..._P1_EARLY, 0 or unset off), --pack-once (Qo: ..._P1_PACK_ONCE, 0 or unset off), and --profile, --mirror, --reserve-mib, --max-seq-len (SlN) where the launch has them. Exit 1
       with the reason when a value is missing or does not fit.
   serve_batch_match.py compare WORDS DRYRUN [FLAG ...]
       DRYRUN: serve-batch.sh --dry-run's output. Each side resolved as the server sees it (every variable at its
@@ -27,6 +27,7 @@ ADAPT = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT"
 HYB_PREFILL = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL"   # Qyp: --hybrid-prefill
 KERNEL_COST = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST"   # Qyk: on with it
 EARLY = "RADIANCE_EXPERIMENTAL_DS41_P1_EARLY"   # QxK: --early K
+PACK_ONCE = "RADIANCE_EXPERIMENTAL_DS41_P1_PACK_ONCE"   # Qo: --pack-once 0|1
 P1_SWITCHES = (("--tiled", "RADIANCE_EXPERIMENTAL_DS41_P1_TILED"), ("--tail-once", "RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE"),
                ("--swiglu-span", "RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN"),
                ("--engram-early", "RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY"),    # Ee (the harness sets it only when on)
@@ -110,6 +111,7 @@ def params(words):
                          % (HYB_PREFILL, hp, KERNEL_COST, kc))
     out += ["--hybrid-prefill", hp]
     out += ["--early", env.get(EARLY) or "0"]
+    out += ["--pack-once", env.get(PACK_ONCE) or "0"]
     if flags.get("--max-seq-len"):
         out += ["--max-seq-len", flags["--max-seq-len"]]
     return out

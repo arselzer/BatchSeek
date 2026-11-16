@@ -222,6 +222,13 @@
 # only if rank 0 logs "ds41 p1: early ring copies on (RADIANCE_EXPERIMENTAL_DS41_P1_EARLY=K)" once at startup (any
 # other arm only without it) and at exit (qx_gate) some rank's stats line counts early copies bound to their layer
 # ("early copies N (B bound to their layer", B > 0): otherwise the switch never acted.
+# Qo: pack once (RADIANCE_EXPERIMENTAL_DS41_P1_PACK_ONCE=1; ds41_p1.h kPackOnceEnv; every other arm states 0): a drive
+# miss the RAM cache admits is packed by the card path's packer straight into the packed RAM cache and its ring copy
+# reads the cache slots under their lease, instead of being packed into a pinned ready slot and packed again from its
+# planes by the background insert threads. The same bytes in the cache and on the card: replies must be identical to
+# the arm without it. Needs P1 and K (the packed cache). Measured only if rank 0 logs "ds41 p1: pack once on
+# (RADIANCE_EXPERIMENTAL_DS41_P1_PACK_ONCE=1)" once at startup (any other arm only without it) and at exit (qo_gate)
+# some rank's stats line counts units packed once ("packed once into the RAM cache N", N > 0).
 # QdN: decode passes on the cards (..._P1_DECODE_ROWS=N, 17 to N_Lc; every other arm states 0): a pure
 # decode pass of N rows or more (decode rows only, no draft, speculation or cut) arms the card path for its
 # routed layers as a prefill pass of the threshold's rows does, and takes the lent slots back as one does;
@@ -879,7 +886,8 @@ kld_finish() {   # name; the run is SERVER_PID
      ! extra_why=$(dt_gate "$OUT/$name.server.log" "${ARM_DT:-}") ||
      ! extra_why=$(aw_gate "$OUT/$name.server.log" "${ARM_AW:-}") ||
      ! extra_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" exit) ||
-     ! extra_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" exit); then
+     ! extra_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" exit) ||
+     ! extra_why=$(qo_gate "$OUT/$name.server.log" "${ARM_QO:-}" exit); then
     log "arm $name: $extra_why; Kld not measured"; return 1
   fi
   # Qw / Aw (inexact by design): its run scored the engine against KLD_REF (--kld-ref); the engine's KL report is the
@@ -1178,6 +1186,20 @@ qx_gate() {   # log, requested K, start/exit: rank 0's early-copies line naming 
   [[ "$stage" == exit ]] || return 0
   while read -r b; do [[ -n "$b" ]] && (( b > best )) && best=$b; done < <(sed -nE 's/.*ds41 p1 stats, rank [0-3]: .*; early copies [0-9]+ \(([0-9]+) bound to their layer.*/\1/p' "$f")
   if (( best == 0 )); then echo "Qx$on, but no rank bound an early copy to its layer (the switch never acted)"; return 1; fi
+  return 0
+}
+
+qo_gate() {   # log, requested switch, start/exit: rank 0's pack-once line once (and units packed once at exit)
+  local f=$1 on=$2 stage=${3:-start} count b best=0
+  if [[ -z "$on" ]]; then
+    if grep -q 'ds41 p1: pack once on' "$f"; then echo 'no Qo part, but pack once is on'; return 1; fi
+    return 0
+  fi
+  count=$(grep -cE "ds41 p1: pack once on \(RADIANCE_EXPERIMENTAL_DS41_P1_PACK_ONCE=1\)" "$f")
+  if [[ $count != 1 ]]; then echo "Qo, but rank 0 lacks one 'ds41 p1: pack once on (..._P1_PACK_ONCE=1)' startup line"; return 1; fi
+  [[ "$stage" == exit ]] || return 0
+  while read -r b; do [[ -n "$b" ]] && (( b > best )) && best=$b; done < <(sed -nE 's/.*ds41 p1 stats, rank [0-3]: .*; packed once into the RAM cache ([0-9]+) .*/\1/p' "$f")
+  if (( best == 0 )); then echo "Qo, but no rank packed an admitted miss once (the switch never acted)"; return 1; fi
   return 0
 }
 
@@ -1586,7 +1608,8 @@ EOF2
      ! qsp_why=$(dt_gate "$OUT/$name.server.log" "${ARM_DT:-}") ||
      ! qsp_why=$(aw_gate "$OUT/$name.server.log" "${ARM_AW:-}") ||
      ! qsp_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" start) ||
-     ! qsp_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" start); then
+     ! qsp_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" start) ||
+     ! qsp_why=$(qo_gate "$OUT/$name.server.log" "${ARM_QO:-}" start); then
     log "arm $name: $qsp_why; not measured"; stop_server; return 1
   fi
   # In / Is (RADIANCE_EXPERIMENTAL_DS41_INSERT_NT / _SLICE_KIB) and Ph (_HOST_EXPERTS_LEAN_TILES):
@@ -1881,7 +1904,8 @@ EOF2
   local qsp_exit_why
   if ! qsp_exit_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" exit) ||
      ! qsp_exit_why=$(qz_gate "$OUT/$name.server.log" "${ARM_QZ:-}" exit) ||
-     ! qsp_exit_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" exit); then
+     ! qsp_exit_why=$(qx_gate "$OUT/$name.server.log" "${ARM_QX:-}" exit) ||
+     ! qsp_exit_why=$(qo_gate "$OUT/$name.server.log" "${ARM_QO:-}" exit); then
     log "arm $name: $qsp_exit_why; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
@@ -3719,7 +3743,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$(arm_full "$a")"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" xs="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq="" ba="" bsp="" sg="" pcn=""
-  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qyp="" qyk="" qsp="" qt="" qw="" dt="" aw="" qz="" qx="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr="" ee=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qd="" qv="" qy="" qyf="" qyp="" qyk="" qsp="" qt="" qw="" dt="" aw="" qz="" qx="" qo="" lh="" ls="" la="" lhh="" lr="" ar_rows="" ag_rows="" sl="" cr="" ee=""
   ctp=""   # Ctp / CtpN: the prefill chain trace (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_PREFILL)
   ax="" axv="" axf=""   # Ax / AxN / Axv / Ax0 / AxfN (the aux expert worker)
   axs="" axo="" axod="" axt="" axten=""   # AxS / AxSx / AxO / AxOd / AxT / AxF (its card sharing and online set)
@@ -3942,6 +3966,7 @@ for a in $ARMS; do
       Qz)      qz=1 ;;                                                  # the twin's tail filled once a layer (..._P1_TAIL_ONCE=1)
       Dt)      dt=1 ;;                                                  # gemm_nt_bf16f8's tiled form above 64 rows, exact (..._DENSE_TILED=1)
       Aw)      aw=1 ;;                                                  # attn_sparse_sink's WMMA form, inexact (..._ATTN_WMMA=1)
+      Qo)      qo=1 ;;                                                  # admitted drive misses packed once, into the RAM cache (..._P1_PACK_ONCE=1)
       Qx[0-9]*)                                                        # early ring copies: K of the next layer's units (..._P1_EARLY=K)
                if [[ -n "$qx" ]]; then log "arm $a: two Qx parts; the arm is skipped"; skip=1
                elif [[ ${p#Qx} =~ ^[0-9]+$ ]] && (( 10#${p#Qx} >= 1 && 10#${p#Qx} <= 64 )); then qx=$((10#${p#Qx}))
@@ -4564,6 +4589,9 @@ for a in $ARMS; do
   # Qx: early ring copies, stated in every arm (0 off); with P1.
   env+=(RADIANCE_EXPERIMENTAL_DS41_P1_EARLY=${qx:-0})
   [[ -n "$qx" && -z "$p1" ]] && { log "arm $a: Qx needs P1; the arm is skipped"; skip=1; }
+  # Qo: pack once, stated in every arm (0 off); with P1 and K (the packed RAM cache).
+  env+=(RADIANCE_EXPERIMENTAL_DS41_P1_PACK_ONCE=${qo:-0})
+  [[ -n "$qo" && -z "$p1" ]] && { log "arm $a: Qo needs P1; the arm is skipped"; skip=1; }
   # Qz: the tail filled once a layer, stated in every arm (0 off); with P1 and the oracle's tail-once waves.
   env+=(RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE=${qz:-0})
   if [[ -n "$qz" ]]; then
@@ -4678,6 +4706,9 @@ for a in $ARMS; do
   if [[ -n "$ins_wait" && -z "$ins_kib" ]]; then log "arm $a: Iw needs an Is part (the wait is the pieces'); the arm is skipped"; skip=1; fi
   if [[ -n "$ins_nt$ins_kib" && " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1 "* ]]; then
     log "arm $a: In / Is write into the packed RAM cache only (a K part); the arm is skipped"; skip=1
+  fi
+  if [[ -n "$qo" && " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1 "* ]]; then
+    log "arm $a: Qo packs into the packed RAM cache only (a K part); the arm is skipped"; skip=1
   fi
   env+=(RADIANCE_EXPERIMENTAL_DS41_INSERT_NT=${ins_nt:-0} RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB=${ins_kib:-0}
         RADIANCE_EXPERIMENTAL_DS41_INSERT_WAIT_US=${ins_wait} RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=${lean:-0})
@@ -4795,7 +4826,7 @@ print(v if type(v) is int and v > 0 else "")' "$ARM_PROMPTS" 2>&1); then
   if [[ -n "$ARM_TIMEOUT" ]] && ! [[ $ARM_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]]; then
     log "arm $a: AB_REQUEST_TIMEOUT_S=$ARM_TIMEOUT is not a whole number of seconds (1-999999); the arm is skipped"; skip=1
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QYP=$qyp ARM_QYK=$qyk ARM_QSP=$qsp ARM_QT=$qt ARM_QW=$qw ARM_DT=$dt ARM_AW=$aw ARM_QZ=$qz ARM_QX=$qx ARM_LH=$lh ARM_EE=$ee
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QD=$qd ARM_QY=$qy ARM_QYF=$qyf ARM_QYP=$qyp ARM_QYK=$qyk ARM_QSP=$qsp ARM_QT=$qt ARM_QW=$qw ARM_DT=$dt ARM_AW=$aw ARM_QZ=$qz ARM_QX=$qx ARM_QO=$qo ARM_LH=$lh ARM_EE=$ee
   ARM_LS=$ls ARM_LA=$la ARM_LHH=$lhh ARM_LR=$lr ARM_SL=$sl ARM_CTX=$arm_ctx ARM_CR=$cr
   if [[ -n "$cr" ]]; then
     crk=${ARM_CONC:-${AB_CONCURRENCY:-1}}

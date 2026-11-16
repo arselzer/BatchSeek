@@ -517,6 +517,31 @@ ARMS="$ARMS $EE $EEQY $QY60"
 ARMS="$ARMS $QYP30 $QYPQY $QYPSG $QYPV $QYPAX $QYP0 $QYPTWO $QYPNOP $QYK $QYKP $QYKTWO"
 # Qw: the WMMA P1 twin (inexact by design) on the N256-like preset (Qsp-Qt-Qz), beside Qv, without P1, with Kld (no
 # reference yet in the loop: skipped; with KLD_REF set: --kld-ref), and the wave part Qw2 (unchanged: the wave size).
+# Qo's gates: rank 0's pack-once line once at startup, and at exit some rank's units packed once above 0.
+eval "$(sed -n '/^qo_gate() {/,/^}/p' "$W")"
+declare -F qo_gate >/dev/null || { echo "FAIL no qo_gate in $W"; exit 1; }
+{
+  echo "I[0] ds41 p1: pack once on (RADIANCE_EXPERIMENTAL_DS41_P1_PACK_ONCE=1): an admitted drive miss is packed once, ..."
+  for rank in 0 1 2 3; do
+    echo "I[$rank] ds41 p1 stats, rank $rank: passes 3; wave tail fills skipped 412; packed once into the RAM cache $((rank * 100)) (1.80 GB, ring copies from the cache slots), 3 admitted misses the cache did not take whole (packed for the ring and inserted as before); early copies 960 (12 bound to their layer, 12 unread, 0 not in the RAM cache when posted)"
+  done
+} > "$T/qo-good.log"
+sed -E 's/RAM cache [0-9]+ \(/RAM cache 0 (/' "$T/qo-good.log" > "$T/qo-idle.log"
+cat "$T/qo-good.log" "$T/qo-good.log" > "$T/qo-twice.log"
+oexpect() {
+  local want=$1 label=$2 rc; shift 2
+  qo_gate "$@" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$label"; else bad "$label: exit $rc, want $want"; fi
+}
+oexpect 0 'Qo startup line' "$T/qo-good.log" 1 start
+oexpect 0 'Qo units packed once at exit' "$T/qo-good.log" 1 exit
+oexpect 1 'Qo line twice' "$T/qo-twice.log" 1 start
+oexpect 0 'Qo idle at startup' "$T/qo-idle.log" 1 start
+oexpect 1 'Qo never packed a unit once' "$T/qo-idle.log" 1 exit
+oexpect 1 'Qo unrequested activation' "$T/qo-good.log" '' start
+oexpect 0 'Qo explicitly off' "$T/qt-off.log" '' exit
+oexpect 1 'Qo asked, no line' "$T/qt-off.log" 1 start
+
 QW=$FAST-Qsp-Qt-Qz-Qw
 QWV=$FAST-Qw-Qv8
 QWNOP=$REF-Qw
@@ -538,6 +563,10 @@ QXNOP=$REF-Qx12
 QXBIG=$FAST-Qx65
 QXTWO=$FAST-Qx4-Qx8
 ARMS="$ARMS $QX $QXNOP $QXBIG $QXTWO"
+QO=$FAST-Qd64-Qy60-Qo
+QONOP=$REF-Qo
+QONOK=${FAST/-K-/-}-Qo
+ARMS="$ARMS $QO $QONOP $QONOK"
 run_loop() {   # actual balance-oracle bound; every model action remains stubbed
  (
   set +u
@@ -918,6 +947,23 @@ done
 qdskip "$QXNOP" "Qx needs P1; the arm is skipped"
 qdskip "$QXBIG" "Qx65: Qx takes 1-64 (units); the arm is skipped"
 qdskip "$QXTWO" "two Qx parts; the arm is skipped"
+# ---- 8c. Qo in the arm loop: the switch at 1 on the fast arm with Qd64-Qy60, every other switch as the fast arm;
+# every arm without the part states it 0; Qo without P1 or without K (the packed RAM cache) skipped.
+sec=$(section "$QO")
+if [[ -z "$sec" ]]; then bad "the Qo arm $QO was not launched: $(grep -m3 "arm $QO" "$T/loop.txt")"
+else
+  has "Qo" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_PACK_ONCE 1
+  has "Qo with the packed cache" "$sec" RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE 1
+  for v in RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_P1_EARLY \
+           RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE RADIANCE_EXPERIMENTAL_DS41_P1_TILED; do
+    has "Qo as the fast arm" "$sec" "$v" "$(val "$fast" "$v")"
+  done
+fi
+for a in "$REF" "$NEW" "$FAST" "$QD200" "$QX" "$QZ" "$QT"; do
+  has "no Qo part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_P1_PACK_ONCE 0
+done
+qdskip "$QONOP" "Qo needs P1; the arm is skipped"
+qdskip "$QONOK" "Qo packs into the packed RAM cache only (a K part); the arm is skipped"
 
 short_out=$(run_loop 2048)
 for a in "$COLD4K" "$PC4K"; do
