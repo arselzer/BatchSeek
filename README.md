@@ -128,30 +128,50 @@ The measured numbers used a community IQ4_NL conversion of the Engram tables. Th
   all of that RAM: run jobs alone on the machine.
 - Python 3 (standard library only, except `batch/docs/charts/decode_steps.py`, which needs numpy and scipy).
 
-## Quick start
+## From zero
 
-The commands below run from `batch/`. Note (16 November 2026): the engine update behind the launcher's newest
-options (the faster default mode, `--reproducible` and `--engram-file`) is being merged into `main` today; until then
-`main` runs the reproducible configuration.
-
-The model (`model.rad`) and the release's FP8 Engram shards (`engram-fp8/`) are on Hugging Face:
-[aselzer/DeepSeek-V4.1-Flash-1017-radiance](https://huggingface.co/aselzer/DeepSeek-V4.1-Flash-1017-radiance).
-Or rebuild `model.rad` yourself from DeepSeek's release with `batch/convert/convert.sh` (CPU only, about 870 GB of disk
-and 650 GB of downloads; see [convert/README.md](batch/convert/README.md)).
+Note (16 November 2026): the engine update behind the launcher's newest options (the faster default mode,
+`--reproducible` and `--engram-file`) is being merged into `main` today; until then `main` runs the reproducible
+configuration and ignores `--engram-file`.
 
 ```sh
-export RADIANCE_HOME=/path/to/BatchSeek/build/radiance_home
-./serve-batch.sh --model model.rad --silu-table silu_table_gfx1201.bin --streams 512 \
+git clone https://github.com/arselzer/BatchSeek && cd BatchSeek
+
+# 1. Build (HIP for the cards it finds; everything lands in build/radiance_home)
+./build.sh
+make -C tools/ds41-host-experts mxfp4-check
+# once per build: capture the card's SiLU table, which the launcher needs
+HIP_VISIBLE_DEVICES=0 tools/ds41-host-experts/ds41_mxfp4_device_check build/radiance_home/kernels/libr4d.so \
+  swiglu silu_table_gfx1201.bin
+
+# 2. Get the model (8 parts of about 52 GB, plus the official FP8 Engram shards)
+hf download aselzer/DeepSeek-V4.1-Flash-1017-radiance --local-dir model
+cd model && cat model.rad.part-0{1..8} > model.rad && sha256sum -c SHA256SUMS --ignore-missing \
+  && rm model.rad.part-* && cd ..
+
+# 3. Serve (takes a few minutes to load; ready when http://localhost:8000/v1/models answers)
+export RADIANCE_HOME=$PWD/build/radiance_home
+cd batch
+./serve-batch.sh --model ../model/model.rad --silu-table ../silu_table_gfx1201.bin --streams 512 \
   --profile profiles/bird-train.profile.json \
-  --engram-file engram-fp8/model-00047-of-00048.safetensors,engram-fp8/model-00048-of-00048.safetensors
+  --engram-file ../model/engram-fp8/model-00047-of-00048.safetensors,../model/engram-fp8/model-00048-of-00048.safetensors &
+
+# 4. A first test with 8 questions, then the whole file
+head -8 questions.jsonl > first8.jsonl && python3 batch_client.py first8.jsonl first8-answers.jsonl
 python3 batch_client.py questions.jsonl answers.jsonl --concurrency 512
 ```
 
-`--engram-file` reads the release's official FP8 Engram tables (203 GB extra download). Leave it out to use the
-IQ4_NL tables bundled in `model.rad` and save the space; both ran at the same speed with similar accuracy in our tests.
+Disk: joining the parts needs room for the parts and `model.rad` at once (about 830 GB), plus 203 GB for
+`engram-fp8/`. `--engram-file` is optional: leave it out (and skip `engram-fp8/`) to use the IQ4_NL Engram tables
+bundled in `model.rad`; both ran at the same speed with similar accuracy in our tests. Or rebuild `model.rad` from
+DeepSeek's release with `batch/convert/convert.sh` (CPU only; see [convert/README.md](batch/convert/README.md)).
 
 `questions.jsonl` has one `{"prompt": "...", "system": "...", "id": "..."}` a line; put text that prompts share (a
 schema, instructions) in `system`, so the prefix cache reads it once. `batch_client.py --help` lists the rest.
+
+**Long prompts.** Each request gets `--ctx-per-stream` tokens for prompt plus reply (default 1,152, enough for short
+SQL questions). For longer prompts or replies, raise it and lower `--streams` so that streams x ctx-per-stream stays
+at most about 1.2 million tokens (tested: `--streams 256 --ctx-per-stream 4608` for BIRD's 2026 prompts). `--dry-run` shows the resulting settings.
 
 ## Calibration
 
