@@ -43,6 +43,8 @@
                                           one's at the same verify cap and block), tokens a step
                                           (predicted_n / (predicted_n - accepted)) and decode tokens/s,
                                           and whether its texts equal the first arm's
+  ab_requests.py --kld-between REF DIR    KL(REF || DIR) at every position of two --kld-record directories of
+                                          the same corpus (full form), top-1 agreement and both NLLs
   ab_requests.py --kld-compare REF DIR    two --kld-record directories byte for byte: every
                                           position's log-probabilities, top entries and row values
                                           (exit 1 when any differ, naming the first positions)
@@ -469,9 +471,26 @@ def by_receipt(data):
     return [(tuple(g[0]), sorted(g[2], key=order.get)) for g in groups]
 
 
+INEXACT_PARTS = ("Qw", "Aw")   # the WMMA P1 twin, the WMMA sparse attention
+
+
+def inexact_parts(a):
+    """The parts that make an arm's replies not the exact engine's by design (Qw: the WMMA P1 twin; Aw: the WMMA
+    sparse attention; each an f32 summation order of its own)."""
+    w = "-" + a.replace(".before", "") + "-"
+    return [p for p in INEXACT_PARTS if "-%s-" % p in w]
+
+
+def inexact(a):
+    """An arm with an inexact part. Its texts are reported against the reference, never used as one, and never read as
+    an exactness result."""
+    return bool(inexact_parts(a))
+
+
 def ref_arm(data, cols, n):
-    """The arm request n is compared against: the first of `cols` that sent it."""
-    return next(a for a in cols if n in data[a])
+    """The arm request n is compared against: the first of `cols` that sent it, an exact arm before any inexact one."""
+    sent = [a for a in cols if n in data[a]]
+    return next((a for a in sent if not inexact(a)), sent[0])
 
 
 def compare(d, arms):
@@ -485,8 +504,10 @@ def compare(d, arms):
                 names[0], names[-1], len(names), cols[0]))
         print("%-12s" % "request" + "".join("%18s" % a for a in cols))
         tot = {a: [0.0, 0] for a in cols}
+        inx = {a: [0, 0] for a in cols if inexact(a)}   # texts that differ, texts compared
         for n in names:
-            ref = data[ref_arm(data, cols, n)][n]
+            ra = ref_arm(data, cols, n)
+            ref = data[ra][n]
             cells = []
             for a in cols:
                 r = data[a].get(n)
@@ -494,6 +515,9 @@ def compare(d, arms):
                     cells.append("%18s" % "-")
                     continue
                 same = r["text"] == ref["text"]
+                if a in inx and a != ra and ref["text"] is not None:
+                    inx[a][0] += 0 if same else 1
+                    inx[a][1] += 1
                 tps = r["timings"].get("predicted_per_second") or 0.0
                 tot[a][0] += r["timings"].get("predicted_ms") or 0.0
                 tot[a][1] += r["timings"].get("predicted_n") or 0
@@ -501,6 +525,8 @@ def compare(d, arms):
             print("%-12s" % n + "".join(cells))
         print("%-12s" % "decode" + "".join(
             "%12.2f tok/s" % (tot[a][1] / tot[a][0] * 1e3 if tot[a][0] else 0.0) for a in cols))
+        for a, (k, m) in inx.items():
+            print("%s: differ from reference: %d of %d (inexact arm, %s)" % (a, k, m, ", ".join(inexact_parts(a))))
 
 
 def prompt_tokens(t):
@@ -676,6 +702,40 @@ def kld_compare(ref, cand):
         print("kld identical: %d positions over %d documents (logp.f16, top.bin, rows.f32, tokens.i32), %s against %s"
               % (rows, len(docs), cand, ref))
     return 1 if bad else 0
+
+
+def kld_between(ref, cand):
+    """KL(P_ref || Q_cand) at every position two --kld-record directories of the same corpus score, from their
+    full-vocabulary f16 log-probabilities (logp.f16), for two models that differ by design (an Ef arm's FP8 Engram
+    tables against the container's IQ4_NL ones): mean, median, 99th / 99.9th percentile and max, top-1 agreement,
+    and each one's mean next-token NLL (rows.f32). The f16 rows bound the precision at ~1e-4 nats a position."""
+    import numpy as np
+    a, b = json.load(open(ref + "/kld.json")), json.load(open(cand + "/kld.json"))
+    key = lambda m: (m["n_vocab"], m["rows"], [(d["tokens"], d["score_from"], d["row0"]) for d in m["docs"]])
+    if key(a) != key(b) or "logp.f16" not in os.listdir(ref) or "logp.f16" not in os.listdir(cand):
+        print("kld-between: %s and %s do not record the same documents in the full form" % (ref, cand))
+        return 1
+    if open(ref + "/tokens.i32", "rb").read() != open(cand + "/tokens.i32", "rb").read():
+        print("kld-between: the corpus was tokenised differently")
+        return 1
+    rows, nv = a["rows"], a["n_vocab"]
+    kl, agree = np.empty(rows, np.float64), 0
+    with open(ref + "/logp.f16", "rb") as fa, open(cand + "/logp.f16", "rb") as fb:
+        r = 0
+        while r < rows:
+            n = min(256, rows - r)
+            lp = np.frombuffer(fa.read(n * nv * 2), np.float16).reshape(n, nv).astype(np.float64)
+            lq = np.frombuffer(fb.read(n * nv * 2), np.float16).reshape(n, nv).astype(np.float64)
+            p = np.exp(lp)
+            kl[r:r + n] = np.maximum((p * (lp - lq)).sum(axis=1), 0.0)
+            agree += int((lp.argmax(axis=1) == lq.argmax(axis=1)).sum())
+            r += n
+    nll = lambda d: float(np.frombuffer(open(d + "/rows.f32", "rb").read(), np.float32).reshape(rows, -1)[:, 0].mean())
+    q = np.percentile(kl, [50, 99, 99.9])
+    print("kld-between: %s against %s, %d positions over %d documents: KL mean %.5f median %.5f p99 %.4f p99.9 %.4f "
+          "max %.4f nats; top-1 agreement %.2f%%; NLL %.4f (ref) %.4f (cand)"
+          % (cand, ref, rows, len(a["docs"]), kl.mean(), q[0], q[1], q[2], kl.max(), 100.0 * agree / rows, nll(ref), nll(cand)))
+    return 0
 
 
 def acceptance(d, arms):
@@ -1188,5 +1248,7 @@ if __name__ == "__main__":
         sys.exit(0 if kld_corpus(a[1], int(a[2]), a[3:]) > 0 else 1)
     elif a[0] == "--kld-compare":
         sys.exit(kld_compare(a[1], a[2]))
+    elif a[0] == "--kld-between":
+        sys.exit(kld_between(a[1], a[2]))
     else:
         run(a[0], a[1], int(a[2]), a[3])

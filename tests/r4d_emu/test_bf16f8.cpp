@@ -38,6 +38,7 @@
 
 extern "C" int r4d_rad_gemm_bf16_m64(const RadArgs*, RadStream);
 extern "C" int r4d_rad_gemm_bf16f8_m64(const RadArgs*, RadStream);
+extern "C" int r4d_rad_gemm_bf16_tiled(const RadArgs*, RadStream);
 
 namespace {
 
@@ -275,6 +276,78 @@ void run_case(const Case& c, std::mt19937_64& rng) {
             }
 }
 
+/* The tiled form (RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED's, `form` 2): gemm_bf16_nt_tiled's grid over the stored
+ * form. Against gemm_bf16_nt_tiled over the plane, operand for operand (the same blocks, threads and WMMA sequence:
+ * the tap's streams must be equal), and byte for byte against both that kernel and the m64 one (`form` 1). Without the
+ * switch in the environment the engine's form (0) is the m64 kernel's. */
+long long g_tiled_cases = 0, g_tiled_calls = 0;
+void run_tiled(int64_t N, int64_t K, int64_t M, int64_t lda_pad, int64_t ldc_pad, bool zeros, std::mt19937_64& rng) {
+    const int64_t lda = K + lda_pad, ldc = N + ldc_pad;
+    const auto W = weight(N, K, rng, zeros);
+    const auto blob = store(W, N, K);
+    std::vector<uint16_t> A((size_t)(M * lda));
+    for (size_t i = 0; i < A.size(); ++i) {
+        A[i] = rad_f32_to_bf16((float)((int)(rng() % 2001) - 1000) / 256.0f);
+        if (zeros && rng() % 4 == 0) A[i] = (uint16_t)((rng() & 1) << 15);
+        if (zeros && (i % (size_t)lda) % 2) A[i] = A[i - 1];
+    }
+    std::vector<uint64_t> Wb((blob.size() + 7) / 8 + 2), Wp((W.size() * 2 + 7) / 8 + 2);
+    std::memcpy(Wb.data(), blob.data(), blob.size());
+    std::memcpy(Wp.data(), W.data(), W.size() * 2);
+    std::vector<uint16_t> yt((size_t)(M * ldc)), y8((size_t)(M * ldc)), ym((size_t)(M * ldc)), y0((size_t)(M * ldc));
+    auto args = [&](std::vector<RadParam>& ps, RadTensor (&t)[3], bool f8, std::vector<uint16_t>& y, int form) {
+        ps = { RAD_INT("M", M), RAD_INT("N", N), RAD_INT("K", K), RAD_STR("dtype", "bf16") };
+        if (form) ps.push_back(RAD_INT("form", form));
+        t[0] = view(A.data(), RAD_BF16, M, K, lda);
+        t[1] = f8 ? view(Wb.data(), R4D_DT_BF16F8, N, K, K) : view(Wp.data(), RAD_BF16, N, K, K);
+        t[2] = view(y.data(), RAD_BF16, M, N, ldc);
+        RadArgs a{};
+        a.t = t; a.n_t = 3; a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
+        return a;
+    };
+    std::fill(yt.begin(), yt.end(), (uint16_t)0xA5A5);
+    std::fill(y8.begin(), y8.end(), (uint16_t)0x5A5A);
+    std::fill(ym.begin(), ym.end(), (uint16_t)0x3C3C);
+    std::fill(y0.begin(), y0.end(), (uint16_t)0x4B4B);
+    std::vector<RadParam> p1, p2, p3, p4;
+    RadTensor t1[3], t2[3], t3[3], t4[3];
+    RadArgs at = args(p1, t1, false, yt, 0), a8 = args(p2, t2, true, y8, 2), am = args(p3, t3, true, ym, 1),
+            a0 = args(p4, t4, true, y0, 0);
+    std::map<Key, Stream> tt, t8;
+    int rt = 0, r8 = 0;
+    traced(&tt, [&] { rt = r4d_rad_gemm_bf16_tiled(&at, nullptr); });
+    traced(&t8, [&] { r8 = r4d_rad_gemm_bf16f8_m64(&a8, nullptr); });
+    const int rm = r4d_rad_gemm_bf16f8_m64(&am, nullptr), r0 = r4d_rad_gemm_bf16f8_m64(&a0, nullptr);
+    char at_[200];
+    std::snprintf(at_, sizeof at_, "tiled N=%lld K=%lld M=%lld lda=%lld ldc=%lld%s", (long long)N, (long long)K,
+                  (long long)M, (long long)lda, (long long)ldc, zeros ? " zeros" : "");
+    ++g_cases;
+    ++g_tiled_cases;
+    if (rt != RAD_OK || r8 != RAD_OK || rm != RAD_OK || r0 != RAD_OK) {
+        fail(std::string(at_) + ": a launch refused (" + std::to_string(rt) + ", " + std::to_string(r8) + ", " +
+             std::to_string(rm) + ", " + std::to_string(r0) + ")");
+        return;
+    }
+    const std::string op = first_difference(tt, t8);
+    if (!op.empty()) fail(std::string(at_) + ": WMMA operands differ from gemm_bf16_nt_tiled's: " + op);
+    if (t8.empty()) fail(std::string(at_) + ": no WMMA traced");
+    for (const auto& kv : t8) g_tiled_calls += kv.second.calls;
+    long long dt = 0, dm = 0, d0 = 0, pad = 0;
+    for (int64_t m = 0; m < M; ++m) {
+        for (int64_t n = 0; n < N; ++n) {
+            const size_t i = (size_t)(m * ldc + n);
+            dt += y8[i] != yt[i];
+            dm += y8[i] != ym[i];
+            d0 += ym[i] != y0[i];
+        }
+        for (int64_t n = N; n < ldc; ++n) pad += y8[(size_t)(m * ldc + n)] != 0x5A5A;
+    }
+    if (dt) fail(std::string(at_) + ": " + std::to_string(dt) + " outputs differ from gemm_bf16_nt_tiled's");
+    if (dm) fail(std::string(at_) + ": " + std::to_string(dm) + " outputs differ from the m64 kernel's");
+    if (d0) fail(std::string(at_) + ": the engine's form without the switch is not the m64 kernel (" + std::to_string(d0) + ")");
+    if (pad) fail(std::string(at_) + ": " + std::to_string(pad) + " padding values written");
+}
+
 /* The entry's refusals, and its hand-off of a bf16 plane. */
 void refusals(std::mt19937_64& rng) {
     const int64_t N = 64, K = 256, M = 3;
@@ -344,10 +417,22 @@ int main() {
         { 32, 4096, 16, false, 4096, 32, false },
     };
     for (const Case& c : cases) run_case(c, rng);
+    /* The tiled form: the 64 x 64 tile (small grids) with partial row and column tiles, a slice that ends inside a
+     * staged K tile (N 256, K 640: SK 8, 5 k steps a slice), pitched rows, signed zeros, a single row, and the
+     * 128 x 128 tile (a grid of 32 blocks). */
+    run_tiled(128, 64, 65, 0, 0, false, rng);
+    run_tiled(144, 192, 100, 0, 0, false, rng);
+    run_tiled(256, 640, 129, 0, 0, false, rng);
+    run_tiled(128, 256, 77, 64, 16, false, rng);
+    run_tiled(128, 128, 70, 0, 0, true, rng);
+    run_tiled(160, 64, 1, 0, 0, false, rng);
+    run_tiled(1024, 64, 512, 0, 0, false, rng);
     refusals(rng);
     if (g_negzero_b == 0) fail("no -0 reached a WMMA's B operand: the zero cases test nothing");
     std::printf("gemm_bf16f8_nt_m64 vs gemm_bf16_nt_m64 on the emulator: %d launch pairs, %lld lane WMMAs "
                 "compared operand for operand (%lld -0 B elements), %d failures\n",
                 g_cases, g_calls, g_negzero_b, g_fail);
+    std::printf("the tiled form (form 2) vs gemm_bf16_nt_tiled and the m64 kernel: %lld cases, %lld lane WMMAs compared "
+                "operand for operand\n", g_tiled_cases, g_tiled_calls);
     return g_fail ? 1 : 0;
 }

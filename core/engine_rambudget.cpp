@@ -264,6 +264,7 @@ void Engine::ram_guard_loop() {
 }
 
 void Engine::ram_guard_stop() {
+    kv_lend_report();
     if (!ram_guard_thread_.joinable()) return;
     {
         std::lock_guard<std::mutex> lk(ram_guard_mu_);

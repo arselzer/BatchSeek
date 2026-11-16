@@ -24,15 +24,20 @@
 # on it: each micro-batch against a lone step of its rows, and no read of the other's writes.
 # ds41_shape_probe_arch_test is deepseek41's sizing declare (RadBuildCtx::shape_probe, for prefill
 # Phase 1's lent arena) on it: the real declare's graph at fewer rows, and the arena levels' sizes.
+# ds41_fp8_engram_arch_test is deepseek41's Engram table as the release stores it (fp8_e4m3*e8m0[1x32]),
+# gathered from its planes in place.
 # ds41_work_rows_arch_test is deepseek41's compressor tail at the rows a step needs (work_rows) on it:
 # the bound, the same bytes at either bound on host forms of the ops, and the recorded passes' key.
+# ds41_engram_file_arch_test is deepseek41 on the native container's metadata with the release's FP8 Engram
+# tables per layer (RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE): codes and scale views, no codebook, the early read-ahead.
 # ds41_engram_early_arch_test is deepseek41's early Engram read-ahead (RADIANCE_EXPERIMENTAL_DS41_
 # ENGRAM_EARLY, rad_row_read_ahead) on it: no issue changes on any kind of pass, one read-ahead.
 set(RAD_TESTS_NO_CORE kv_growth_test arch_test glm5next_test nemotron35_test mapped_slab_pregrow_test draft_policy_test ds41_prefetch_arch_test
                       ds41_prefetch_plan_test ds41_consumer_skip_arch_test consumer_skip_test
                       ds41_dspark_fp8_arch_test ds41_tbo_arch_test ds41_dspark_defer_arch_test
                       ds41_shape_probe_arch_test ds41_work_rows_arch_test ds41_ar_rows_arch_test ds41_ag_rows_arch_test
-                      ds41_engram_early_arch_test aux_share_test aux_online_test spark25_arch_test)
+                      ds41_engram_early_arch_test ds41_fp8_engram_arch_test ds41_engram_file_arch_test aux_share_test aux_online_test
+                      spark25_arch_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and
@@ -601,6 +606,13 @@ set_tests_properties(serve_batch_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RA
 # batch_client.py (the batch preset's client) against a stub server on the loopback.
 add_test(NAME batch_client_test COMMAND python3 -I ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/batch_client_test.py)
 set_tests_properties(batch_client_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+# profile_blend.py (placement profiles: blends, portable output, --container sealing, mixed steps) on synthetic records.
+add_test(NAME profile_blend_test COMMAND python3 -I ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/profile_blend_test.py)
+set_tests_properties(profile_blend_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+# calibrate.sh and serve-batch.sh --auto-profile end to end against a stub server on the loopback. No card, no model.
+add_test(NAME calibrate_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/calibrate_test.sh)
+set_tests_properties(calibrate_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 # ab_window.sh's long-context prompt sets (receipts with max_context_tokens: the context gate and the request
 # timeout), the --hashes-ref step and the lsparse card check's wiring, all with every action stubbed.
 add_test(NAME ab_window_longctx_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_longctx_test.sh)
@@ -879,6 +891,13 @@ if(R4D_EMU_BUILT)
   add_test(NAME r4d_emu_ds41p1_tiled COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1 tiled)
   set_tests_properties(r4d_emu_ds41p1_tiled PROPERTIES LABELS "r4d_emu;slow" TIMEOUT 3600
                        ENVIRONMENT "RADIANCE_EXPERIMENTAL_DS41_LCP=2048;RADIANCE_EXPERIMENTAL_DS41_P1=1;RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1")
+  # The WMMA form (RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=1 beside P1, LCP and the tiled switch, as a Qw arm has them;
+  # inexact by design): the served twin is mx_p1w_kernel, held to the exact twin within f32 reordering (bf16 equal
+  # or 1 ulp, or within the cancellation bound; f32 within 2^-16 sum|wx| of the f64 sum), T3/T4, the same bytes on
+  # every grid and rerun, and one token's rows the same bits in passes of 1, 7, 64 and 1896 tokens.
+  add_test(NAME r4d_emu_ds41p1_wmma COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1 wmma)
+  set_tests_properties(r4d_emu_ds41p1_wmma PROPERTIES LABELS "r4d_emu;slow" TIMEOUT 3600
+                       ENVIRONMENT "RADIANCE_EXPERIMENTAL_DS41_LCP=2048;RADIANCE_EXPERIMENTAL_DS41_P1=1;RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1;RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=1")
 endif()
 
 # The aux expert worker's launches (core/place/aux_expert_worker.h, work/aux/SPEC.md §15.5) on the emulator: gemv_vp

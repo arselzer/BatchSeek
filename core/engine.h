@@ -38,6 +38,7 @@
 #include "format/table_copy.h"
 #include "format/table_share.h"
 #include "format/dspark_rad_banks.h"
+#include "format/ds41_engram_file.h"
 #include "place/vram_packed.h"
 #include "place/aux_expert_worker.h"
 #include "place/aux_control.h"
@@ -164,6 +165,10 @@ private:
     /* Both borrowed owners outlive every rank, queued copy and cached source reference. */
     std::unique_ptr<RadFile> draft_file_;
     std::unique_ptr<DsparkRadBanks> source_banks_;
+    /* RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE (format/ds41_engram_file.h): the Engram tables read
+     * from the release's safetensors instead of the container; null without it. Mapped for the
+     * engine's life, like file_. */
+    std::unique_ptr<Ds41EngramFile> engram_file_;
     const RadFileEntry* source_entry(const std::string& name) const;
     std::unique_ptr<Checkpoint> ckpt_;
     std::unique_ptr<CheckpointSources> ckpt_src_;
@@ -728,6 +733,19 @@ private:
     void loan_tick(bool idle);
     bool     lending_ = false;
     uint64_t loan_last_ns_ = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_KV_LEND (ds41_p1.h kKvLendEnv): the KV pool's free tail lent to the P1 lender's KV
+     * slots (FileStager::p1_kv_set). kv_lend_tokens_ is the loan every rank's lender follows at a pass's begin: the
+     * scheduler lowers it before the cache's mark (the reclaim hook, a shrinking tick) and raises it after. */
+    bool     kv_lend_ = false;
+    std::atomic<int64_t> kv_lend_tokens_{ 0 };
+    int64_t  kv_lend_margin_ = 0, kv_lend_max_ = 0;
+    uint64_t kv_lend_reclaims_ = 0, kv_lend_shrinks_ = 0, kv_lend_grows_ = 0;
+    bool     kv_lend_reported_ = false;
+    void     kv_lend_tick();
+    int      kv_lend_bringup(std::string* why);
+public:
+    void     kv_lend_report();
+private:
     /* The activation arena's loan (Engine::arena_step). `arena_rows_[k]` is the largest step Ctx
      * level k serves (level 0 is the full plan); empty when the arena lends nothing. The floor is
      * the largest recent step: the loan grows past it only after no step that large has run for a

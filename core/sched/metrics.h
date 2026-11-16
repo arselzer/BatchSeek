@@ -64,9 +64,21 @@ struct SchedMetrics {
     int64_t batch_split_head_waits = 0;
     int64_t batch_close_waiting = 0, batch_close_rows = 0, batch_close_alone = 0;
     int64_t batch_close_opener = 0, batch_close_seqs = 0;
+    /* RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD: steps that held an open batch when admission ended, their
+     * rows and their room (the batch's rows at most, or the step's budget if less); prompts the lookahead
+     * took past a refused one, the candidates it asked, and the ones it passed for a head another entry of
+     * the step snapshots (Scheduler::pack_head_conflict). Fill is counted with the switch at 0 too. */
+    int64_t pack_steps = 0, pack_rows = 0, pack_room = 0;
+    int64_t pack_picks = 0, pack_asked = 0, pack_head_skips = 0;
     /* --prefill-interleave: decode-only steps the hold inserted, issued ahead or not; each kept a
      * ready chunk out. */
     int64_t steps_held = 0;
+    /* RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN (Scheduler::decode_min_report): decode-only steps the
+     * policy chose while a prefill chunk or an admission was ready (each would have been a prefill
+     * step without it), and the decode rows of every decode-only step, issued ahead or not, so
+     * `decode_step_rows / steps_decode` is the mean decode batch. */
+    int64_t decode_min_forced = 0;
+    int64_t decode_step_rows = 0;
     int64_t decode_rows_unspeculated = 0;
     /* Steps whose forward pass was enqueued behind the previous step before it committed
      * (Scheduler::step_next). Every other step leaves the card idle during the host's commit and

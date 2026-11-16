@@ -178,6 +178,7 @@ struct Sim final : Device {
     /* What the current layer's waves must compute: expert -> (unit, packed). */
     std::map<int, std::pair<int, bool>> expect;
     std::map<std::pair<int, int>, int> computed;   /* (layer, expert) -> waves that computed it */
+    std::map<std::pair<int, int>, int> read_unit;  /* (layer, expert) -> the unit its wave's slot held */
     std::set<int> copied;                          /* units whose copy has run */
     std::set<int> queued;                          /* units whose copy was queued */
     std::map<std::pair<int, int>, int> handle_unit;
@@ -219,6 +220,8 @@ struct Sim final : Device {
                     bad("layer " + std::to_string(c.layer) + ": a wave read slot " + std::to_string(r.first) +
                         " holding " + std::to_string(ring[(size_t)r.first]) + " for unit " + std::to_string(r.second));
             for (int e : c.es) ++computed[{ c.layer, e }];
+            for (size_t i = 0; i < c.es.size() && i < c.reads.size(); ++i)
+                read_unit[{ c.layer, c.es[i] }] = ring[(size_t)c.reads[i].first];
             break;
         }
     }
@@ -243,8 +246,15 @@ struct Sim final : Device {
         host.push_back(h ? 1 : 0);
         return (int)rec.size() - 1;
     }
+    /* A failing copy (fail_copy_at: the Nth call from now, 0 never): part of it queued -- the wait, the slot taken,
+     * the bytes read from the source -- and the done event recorded after it (Mover::ring_copy's contract on
+     * failure), then -1. The source must not be let go before that queued part has run. */
+    int fail_copy_at = 0;
+    int failed_copies = 0;
     int copy(int slot, const Source& src, int wait, int d) override {
         progress();
+        const bool fail = fail_copy_at > 0 && --fail_copy_at == 0;
+        if (fail) ++failed_copies;
         const int u = unit_of(src.gu);
         if (unit_of(src.dn) != u || src.dn != src_dn(u)) bad("a copy's two weights name different units");
         if (!host[(size_t)d]) bad("a copy's done event cannot be queried");
@@ -269,7 +279,7 @@ struct Sim final : Device {
         c.ev = d;
         c.gen = ++rec[(size_t)d];
         q[1].push_back(c);
-        return 0;
+        return fail ? -1 : 0;
     }
     int compute_wait(int ev) override {
         Cmd c;
@@ -573,6 +583,30 @@ TEST(p1_tiled_and_tail_once_switches_are_default_off_and_accept_only_zero_or_one
             CHECK(!parse_tunables(get, &t, &why));
             CHECK(why.find(env) != std::string::npos);
         }
+    }
+}
+
+/* The WMMA twin (ds41p1::kWmmaEnv, inexact by design): default off, 0 / 1 / empty only, independent of the tiled
+ * switch. */
+TEST(p1_wmma_switch_is_default_off_and_accepts_only_zero_or_one) {
+    std::string value;
+    bool set = false;
+    auto get = [&](const char* k) -> const char* { return set && !std::strcmp(k, ds41p1::kWmmaEnv) ? value.c_str() : nullptr; };
+    Tunables t;
+    std::string why;
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK(!t.wmma);
+    set = true;
+    for (const char* v : { "", "0", "1" }) {
+        value = v;
+        REQUIRE(parse_tunables(get, &t, &why));
+        CHECK_EQ(t.wmma, value == "1");
+        CHECK(!t.tiled);
+    }
+    for (const char* v : { "2", "01", "yes", "-1", "1 " }) {
+        value = v;
+        CHECK(!parse_tunables(get, &t, &why));
+        CHECK(why.find(ds41p1::kWmmaEnv) != std::string::npos);
     }
 }
 
@@ -963,6 +997,308 @@ TEST(p1_ring_stress_two_slots_waves_of_one_random_completion) {
                 ++runs;
             }
     CHECK_EQ(runs, (2 + 3 + 3 + 3) * 40);
+}
+
+/* ---- early copies (ds41p1::kEarlyEnv) ---------------------------------------------------------------------------
+ *
+ * Between layers the stager copies the next layer's likely units into the ring before that layer's counts. The
+ * simulated card checks what it checks for any copy: a wave reads the unit its table names (so an early slot is
+ * never overwritten under a bound unit's reader, nor a lapped slot under an earlier wave's), and a source goes
+ * only after its copy ran. On top: every selected unit is computed by exactly one wave, an unbound early copy by
+ * none, early() never waits on the host, and the waves of a layer compute the same (expert, unit) pairs as
+ * without early copies. */
+namespace {
+
+struct EUnit { int e, rows, unit; bool drive, packed; };
+
+Source ram_src(int u, bool packed) {
+    return Source{ src_gu(u), packed ? 11999296 : ds41p1::kDnOff, src_dn(u), packed ? 6001984 : 6266880, packed };
+}
+
+/* A layer with given unit ids; the early units of `early` (unit -> packed) are bound with add_early when the layer
+ * selects them as RAM units (and their bytes agree), the rest added as run_layer does. Returns the units bound. */
+int run_layer_ids(Sim& sim, CardExpertStager& st, int layer, const std::vector<EUnit>& us, int* bound) {
+    sim.layer = layer;
+    sim.expect.clear();
+    *bound = 0;
+    if (st.begin_layer(layer & 1) < 0) return -1;
+    for (const EUnit& x : us) {
+        sim.expect[x.e] = { x.unit, x.packed };
+        if (x.drive) {
+            sim.drive_pending.push_back({ x.unit, x.e });
+            sim.drive_packed_form[x.unit] = x.packed;
+            if (st.add_drive(x.e, x.unit, x.rows) < 0) return -1;
+            continue;
+        }
+        if (st.is_early(x.unit)) {
+            const int b = st.add_early(x.e, x.unit, x.rows, ram_src(x.unit, x.packed));
+            if (b < 0) return -1;
+            if (b == 0) {
+                ++*bound;
+                continue;
+            }
+        }
+        const int h = sim.next_handle++;
+        sim.handle_unit[{ (int)Kind::Ram, h }] = x.unit;
+        if (st.add_ram(x.e, x.unit, x.rows, ram_src(x.unit, x.packed), h) < 0) return -1;
+    }
+    if (st.start() < 0) return -1;
+    return st.run();
+}
+
+/* Posts early copies of `units` (unit -> packed) the way CardExpertPath::early does; returns those queued. */
+int post_early(Sim& sim, CardExpertStager& st, const std::vector<std::pair<int, bool>>& units) {
+    int n = 0;
+    for (const auto& up : units) {
+        const int h = sim.next_handle++;
+        sim.handle_unit[{ (int)Kind::Ram, h }] = up.first;
+        const int r = st.early(up.first, ram_src(up.first, up.second), h);
+        if (r < 0) return -1;
+        if (r > 0) {   /* not taken: the caller lets its lease go at once */
+            sim.handle_unit.erase({ (int)Kind::Ram, h });
+            continue;
+        }
+        ++n;
+    }
+    return n;
+}
+
+}  // namespace
+
+TEST(p1_early_copies_tunable_is_default_off_and_takes_0_to_64) {
+    std::map<std::string, std::string> env;
+    auto get = [&](const char* k) -> const char* {
+        const auto it = env.find(k);
+        return it == env.end() ? nullptr : it->second.c_str();
+    };
+    Tunables t;
+    std::string why;
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.early, 0);
+    env[ds41p1::kEarlyEnv] = "";
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.early, 0);
+    for (const char* ok : { "0", "1", "12", "64" }) {
+        env[ds41p1::kEarlyEnv] = ok;
+        REQUIRE(parse_tunables(get, &t, &why));
+        CHECK_EQ(t.early, std::atoi(ok));
+    }
+    for (const char* bad : { "65", "-1", "x", "1.5", " 4" }) {
+        env[ds41p1::kEarlyEnv] = bad;
+        CHECK(!parse_tunables(get, &t, &why));
+        CHECK(why.find(ds41p1::kEarlyEnv) != std::string::npos);
+    }
+}
+
+TEST(p1_early_copies_bound_units_run_once_from_their_slots_unbound_ones_never_and_no_host_wait) {
+    Sim sim(77, 12);
+    CardExpertStager st;
+    std::string why;
+    sim.st = &st;
+    REQUIRE_EQ(st.init(&sim, g_ring, 12, 2, 96, g_alias, 6, &why), 0);
+    sim.lag = 0;   /* nothing runs until the host waits */
+    std::vector<EUnit> l0, l1;
+    for (int i = 0; i < 20; ++i) l0.push_back({ i, 100 + i, 1 + i, false, (i & 1) != 0 });
+    for (int i = 0; i < 20; ++i) l1.push_back({ 50 + i, 100 + i, 100 + i, i == 19, (i & 2) != 0 });
+    int bound = 0;
+    REQUIRE_EQ(run_layer_ids(sim, st, 0, l0, &bound), 0);
+    CHECK_EQ(bound, 0);
+    /* Early: eight of layer 1's RAM units (one with other bytes than layer 1 will name) and four it never selects. */
+    std::vector<std::pair<int, bool>> ear;
+    for (int i = 0; i < 8; ++i) ear.push_back({ 100 + i, i == 5 ? !((i & 2) != 0) : (i & 2) != 0 });
+    for (int i = 0; i < 4; ++i) ear.push_back({ 900 + i, false });
+    ear.push_back({ 950, false });   /* the thirteenth: the ring is full of early units */
+    const uint64_t syncs = st.stats().release_syncs;
+    CHECK_EQ(post_early(sim, st, ear), 12);
+    CHECK_EQ(st.stats().release_syncs, syncs);   /* early() never waited on the host */
+    CHECK_EQ(st.early_units(), 12);
+    CHECK(st.is_early(103));
+    CHECK(!st.is_early(950));
+    REQUIRE_EQ(run_layer_ids(sim, st, 1, l1, &bound), 0);
+    CHECK_EQ(bound, 7);   /* unit 105's bytes differ: added as usual, its early copy unread */
+    CHECK_EQ(st.stats().early, (uint64_t)12);
+    CHECK_EQ(st.stats().early_bound, (uint64_t)7);
+    CHECK_EQ(st.stats().early_unread, (uint64_t)5);
+    CHECK_EQ(st.early_units(), 0);
+    /* The bound units' waves came first, in their copy order: the first wave reads units 100 and 101. */
+    REQUIRE_EQ(st.end_pass(), 0);
+    sim.drain();
+    CHECK_EQ(sim.violations, 0);
+    if (sim.violations) std::fprintf(stderr, "%s\n", sim.first.c_str());
+    for (const EUnit& x : l1) CHECK_EQ(sim.computed[std::make_pair(1, x.e)], 1);
+    for (const EUnit& x : l0) CHECK_EQ(sim.computed[std::make_pair(0, x.e)], 1);
+    CHECK_EQ(st.held(), 0);
+    CHECK_EQ(sim.released.size(), sim.handle_unit.size());
+}
+
+TEST(p1_early_copies_are_refused_in_an_open_layer_and_go_unread_into_another_layer_or_the_pass_end) {
+    Sim sim(3, 6);
+    CardExpertStager st;
+    std::string why;
+    sim.st = &st;
+    REQUIRE_EQ(st.init(&sim, g_ring, 6, 2, 96, g_alias, 6, &why), 0);
+    REQUIRE_EQ(st.begin_layer(0), 0);
+    CHECK(st.early(5, ram_src(5, false), 1) < 0);   /* a layer is open */
+    CHECK(st.add_early(1, 5, 10, ram_src(5, false)) == 1);   /* nothing early */
+    REQUIRE_EQ(st.start(), 0);
+    REQUIRE_EQ(st.run(), 0);
+    /* Early units, then the pass ends with no layer taking them. */
+    CHECK_EQ(post_early(sim, st, { { 7, false }, { 8, true }, { 9, false } }), 3);
+    REQUIRE_EQ(st.end_pass(), 0);
+    CHECK_EQ(st.held(), 0);
+    CHECK_EQ(st.early_units(), 0);
+    CHECK_EQ(st.stats().early_unread, (uint64_t)3);
+    sim.drain();
+    CHECK_EQ(sim.violations, 0);
+    CHECK_EQ(sim.released.size(), sim.handle_unit.size());
+}
+
+/* The stress: rings of 2 to 12 slots, waves of 1 to 3, random completion, layers with drive units (and ready-slot
+ * pressure), early sets that overlap the next layer by a random share and name units it never selects, and passes
+ * that end with early units waiting. Every selected unit runs in exactly one wave from bytes the card holds for it,
+ * no source goes before its copy, every source goes by the pass end, and the (layer, expert) -> unit pairs the
+ * waves compute are the ones the layers selected. */
+TEST(p1_early_copies_stress_random_rings_waves_overlap_and_completion) {
+    int runs = 0;
+    uint64_t bound_total = 0, unread_total = 0;
+    for (int n_slots : { 2, 3, 4, 7, 12 })
+        for (int wave = 1; wave <= std::min(3, n_slots); ++wave)
+            for (unsigned seed = 1; seed <= 30; ++seed) {
+                const bool defer = (seed & 1) != 0;   /* half the runs retire sources late (set_defer) */
+                Sim sim(seed * 104729u + (unsigned)n_slots * 17u + (unsigned)wave, n_slots);
+                sim.lag = 1 + (int)(seed % 6);
+                sim.max_hand = 1 + (int)(seed % 3);
+                CardExpertStager st;
+                std::string why;
+                sim.st = &st;
+                const int ready = 1 + (int)(seed % 6);
+                sim.ready_cap = ready;
+                REQUIRE_EQ(st.init(&sim, g_ring, n_slots, wave, 96, g_alias, ready, &why), 0);
+                st.set_defer(defer);
+                std::mt19937 rng(seed * 3u + 1u);
+                int uid = 1;
+                for (int pass = 0; pass < 2; ++pass) {
+                    std::vector<std::vector<EUnit>> layers;
+                    for (int layer = 0; layer < 6; ++layer) {
+                        const auto lu = random_layer(rng, (int)(rng() % 30), (int)(rng() % 60), 50);
+                        std::vector<EUnit> us;
+                        for (const LUnit& x : lu) us.push_back({ x.e, x.rows, uid++, x.drive, x.packed });
+                        layers.push_back(us);
+                    }
+                    for (int layer = 0; layer < 6; ++layer) {
+                        int bound = 0;
+                        REQUIRE_EQ(run_layer_ids(sim, st, pass * 100 + layer, layers[(size_t)layer], &bound), 0);
+                        bound_total += (uint64_t)bound;
+                        /* Early for the next layer (or, after the last, for a layer that never comes). */
+                        std::vector<std::pair<int, bool>> ear;
+                        if (layer + 1 < 6)
+                            for (const EUnit& x : layers[(size_t)layer + 1])
+                                if (!x.drive && (int)(rng() % 100) < 70) ear.push_back({ x.unit, x.packed });
+                        for (int k = (int)(rng() % 4); k > 0; --k) ear.push_back({ 100000 + uid++, false });
+                        std::shuffle(ear.begin(), ear.end(), rng);
+                        REQUIRE(post_early(sim, st, ear) >= 0);
+                        CHECK(st.early_units() <= n_slots);
+                    }
+                    REQUIRE_EQ(st.end_pass(), 0);
+                    REQUIRE_EQ(st.held(), 0);
+                }
+                unread_total += st.stats().early_unread;
+                sim.drain();
+                if (sim.violations) {
+                    CHECK_EQ(sim.violations, 0);
+                    std::fprintf(stderr, "slots %d wave %d seed %u: %s\n", n_slots, wave, seed, sim.first.c_str());
+                    return;
+                }
+                for (const auto& kv : sim.computed)
+                    if (kv.second != 1) {
+                        CHECK_EQ(kv.second, 1);
+                        return;
+                    }
+                CHECK_EQ(sim.released.size(), sim.handle_unit.size());
+                CHECK_EQ(st.stats().early, st.stats().early_bound + st.stats().early_unread);
+                ++runs;
+            }
+    CHECK_EQ(runs, (2 + 3 + 3 + 3 + 3) * 30);
+    CHECK(bound_total > 1000);
+    CHECK(unread_total > 100);
+}
+
+/* Deferred retirement (set_defer, on with early copies): the issuing thread never syncs for a slot's last copy in
+ * queue_one, yet every source still goes only after its copy ran (the simulated card flags any other release), every
+ * unit is computed once, and the pinned ready slots never starve the packer (drive units at a ready cap of 1-3). */
+TEST(p1_deferred_retirement_drops_release_syncs_and_keeps_every_source_until_its_copy) {
+    for (unsigned seed = 1; seed <= 60; ++seed) {
+        const int drive_pct = (seed & 1) ? 25 : 0;
+        for (int defer = 0; defer < 2; ++defer) {
+            Sim sim(seed * 7u + 1u, 12);
+            sim.lag = 1 + (int)(seed % 4);
+            sim.ready_cap = 1 + (int)(seed % 3);
+            CardExpertStager st;
+            std::string why;
+            sim.st = &st;
+            REQUIRE_EQ(st.init(&sim, g_ring, 12, 2, 96, g_alias, sim.ready_cap, &why), 0);
+            st.set_defer(defer != 0);
+            std::mt19937 rng(seed);
+            int uid = 1;
+            for (int layer = 0; layer < 6; ++layer)
+                REQUIRE_EQ(run_layer(sim, st, layer, random_layer(rng, 10 + (int)(rng() % 40), drive_pct, 50), &uid), 0);
+            /* Without drive units nothing but the pass end may sync once retirement is deferred (with them, run()
+             * syncs for a held pinned ready slot when the packer needs one). */
+            if (defer && drive_pct == 0) CHECK_EQ(st.stats().release_syncs, (uint64_t)0);
+            REQUIRE_EQ(st.end_pass(), 0);
+            CHECK_EQ(st.held(), 0);
+            sim.drain();
+            CHECK_EQ(sim.violations, 0);
+            if (sim.violations) std::fprintf(stderr, "seed %u defer %d: %s\n", seed, defer, sim.first.c_str());
+            for (const auto& kv : sim.computed) CHECK_EQ(kv.second, 1);
+            CHECK_EQ(sim.released.size(), sim.handle_unit.size());
+        }
+    }
+}
+
+/* With and without early copies the waves of each layer compute the same experts from the same units: only the
+ * copies' timing moves. */
+TEST(p1_early_copies_compute_the_same_expert_unit_pairs_as_without) {
+    for (unsigned seed = 1; seed <= 20; ++seed) {
+        std::map<std::pair<int, int>, int> pairs[2];
+        for (int with = 0; with < 2; ++with) {
+            Sim sim(seed, 12);
+            sim.lag = 2;
+            CardExpertStager st;
+            std::string why;
+            sim.st = &st;
+            REQUIRE_EQ(st.init(&sim, g_ring, 12, 2, 96, g_alias, 6, &why), 0);
+            std::mt19937 rng(seed);
+            int uid = 1;
+            std::vector<std::vector<EUnit>> layers;
+            for (int layer = 0; layer < 8; ++layer) {
+                const auto lu = random_layer(rng, 5 + (int)(rng() % 40), 20, 50);
+                std::vector<EUnit> us;
+                for (const LUnit& x : lu) us.push_back({ x.e, x.rows, uid++, x.drive, x.packed });
+                layers.push_back(us);
+            }
+            for (int layer = 0; layer < 8; ++layer) {
+                int bound = 0;
+                REQUIRE_EQ(run_layer_ids(sim, st, layer, layers[(size_t)layer], &bound), 0);
+                if (with && layer + 1 < 8) {
+                    std::vector<std::pair<int, bool>> ear;
+                    for (const EUnit& x : layers[(size_t)layer + 1])
+                        if (!x.drive) ear.push_back({ x.unit, x.packed });
+                    REQUIRE(post_early(sim, st, ear) >= 0);
+                }
+            }
+            REQUIRE_EQ(st.end_pass(), 0);
+            sim.drain();
+            CHECK_EQ(sim.violations, 0);
+            for (const auto& kv : sim.computed) CHECK_EQ(kv.second, 1);
+            if (with) CHECK(st.stats().early_bound > 0);
+            pairs[with] = sim.read_unit;
+            size_t n = 0;
+            for (const auto& l : layers) n += l.size();
+            CHECK_EQ(pairs[with].size(), n);
+        }
+        CHECK(pairs[0] == pairs[1]);
+    }
 }
 
 /* ---- units the plan pinned in the host pool ---------------------------------------------------------------
@@ -1505,6 +1841,7 @@ struct FakeLend final : LendHost {
         int  src = 0;                  /* 0 none, 1 a reload buffer, 2 a RAM-cache lease */
         bool reading = false, copying = false, copy_done = false, published = false;
         uint64_t copy_gen = 0, content_gen = ~0ull, fenced_gen = ~0ull;
+        uint64_t copy_ep = 0, content_ep = 0;
         int  loads = 0, copies = 0, fences = 0;
         /* The heat policy's retargets: the unit the slot is for now, the one its load in flight read, the one
          * its queued copy carries, the one whose bytes the slot holds, the one last published there; whether
@@ -1530,13 +1867,30 @@ struct FakeLend final : LendHost {
      * pass, withdrawn but in a retarget, or written by the card path (its content has no generation). */
     int keep_from = 1 << 30;
     bool kept(int k) const { return k >= keep_from; }
+    /* The arena split (RingLender::set_arena): slots from arena_from up to the kept ones are the arena's, which only
+     * a step at the full plan writes (its own generation, agen), not every card-path pass. */
+    int arena_from = 1 << 30;
+    uint64_t agen = 0;
+    /* Slot availability (RingLender::set_avail): by slot, the owner's epoch (one more each time the owner takes the
+     * slot); a unit may be published only from a copy queued in the current epoch, and never while taken. */
+    std::vector<uint64_t> ep;
+    std::vector<uint8_t> taken;
+    bool in_arena(int k) const { return k >= arena_from && !kept(k) && !in_kv(k); }
+    /* The KV pool's lent slots (RingLender::set_kv): written by no pass, only by their owner (the epochs below). */
+    int kv_from = 1 << 30, kv_to = 1 << 30;
+    bool in_kv(int k) const { return k >= kv_from && k < kv_to; }
     /* The rest (RingLender::set_rest): whether drive reads are held, how often that changed, the load_ram
      * calls. A drive read begun is not let land while held (the reload thread's hold). */
     bool held = false;
     int  hold_calls = 0, ram_calls = 0;
+    /* The arena split: while set, a drive read of an arena slot is a violation (a pass that took the ring back begins
+     * an arena load only from the RAM cache). */
+    bool forbid_arena_drive = false;
 
     FakeLend(unsigned seed, int n) : rng(seed) {
         s.assign((size_t)n, S{});
+        ep.assign((size_t)n, 0);
+        taken.assign((size_t)n, 0);
         ram.assign((size_t)n, 0);
         for (int k = 0; k < n; ++k) s[(size_t)k].unit = 100 + k;
     }
@@ -1574,6 +1928,8 @@ struct FakeLend final : LendHost {
     int load(int k) override {
         if (refuse.count(k)) return -1;
         if (held && !ram[(size_t)k]) bad("slot " + std::to_string(k) + "'s drive read begun in the rest");
+        if (forbid_arena_drive && (in_arena(k) || in_kv(k)) && !ram[(size_t)k])
+            bad("arena slot " + std::to_string(k) + "'s drive read begun in a pass that took the ring back");
         if (s[(size_t)k].src) bad("a load of slot " + std::to_string(k) + " that holds a source");
         if (ram[(size_t)k]) {
             s[(size_t)k].src = 2;
@@ -1614,7 +1970,9 @@ struct FakeLend final : LendHost {
         x.rfenced = false;
         x.copying = true;
         x.copy_done = false;
-        x.copy_gen = gen;
+        x.copy_gen = in_kv(k) ? 0 : in_arena(k) ? agen : gen;
+        x.copy_ep = ep[(size_t)k];
+        if (taken[(size_t)k]) bad("slot " + std::to_string(k) + " copied into while its owner holds it");
         x.copy_unit = x.load_unit;
         x.t_copy = ++seq;
         ++x.copies;
@@ -1632,6 +1990,7 @@ struct FakeLend final : LendHost {
         if (!x.src) bad("slot " + std::to_string(k) + " let go of nothing");
         if (x.reading) bad("slot " + std::to_string(k) + "'s buffer let go while its read runs");
         if (x.copying && x.copy_done) {
+            x.content_ep = x.copy_ep;
             x.content_gen = x.copy_gen;
             x.content_unit = x.copy_unit;
         }
@@ -1644,9 +2003,14 @@ struct FakeLend final : LendHost {
         S& x = s[(size_t)k];
         if (on) {
             if (x.published) bad("slot " + std::to_string(k) + " published twice");
-            if (!kept(k) && x.content_gen != gen)
+            if (taken[(size_t)k]) bad("slot " + std::to_string(k) + " published while its owner holds it");
+            if (x.content_ep != ep[(size_t)k])
+                bad("slot " + std::to_string(k) + " published from a copy of epoch " + std::to_string(x.content_ep) +
+                    ", before its owner last took it");
+            const uint64_t now_gen = in_kv(k) ? 0 : in_arena(k) ? agen : gen;
+            if (!kept(k) && x.content_gen != now_gen)
                 bad("slot " + std::to_string(k) + " published from a copy of generation " + std::to_string(x.content_gen) +
-                    " in generation " + std::to_string(gen) + " (the card path may have written it since)");
+                    " in generation " + std::to_string(now_gen) + " (the card path may have written it since)");
             if (x.content_unit != x.unit)
                 bad("slot " + std::to_string(k) + " published as unit " + std::to_string(x.unit) + " holding unit " +
                     std::to_string(x.content_unit) + "'s bytes");
@@ -4189,6 +4553,9 @@ struct ArenaHost final : LendHost {
         return 0;
     }
     void retarget(int k) override { cur[(size_t)k] = next_unit++; }
+    /* The arena split's loads in a pass that took the ring: from the RAM cache only (ram_all: every unit is there). */
+    bool ram_all = false;
+    int load_ram(int k) override { return ram_all ? load(k) : 0; }
 };
 
 /* `steps` passes, about one in `full_in` at the full plan; each step's host calls let the card run a little.
@@ -4745,4 +5112,612 @@ TEST(p1_card_path_is_decided_per_layer_under_the_per_row_cut) {
     EpCountsHostProbe::disarm(fs);
 }
 
+/* ---- the lent arena's own take-back (..._P1_LEND_ARENA_SPLIT) ------------------------------------------------
+ *
+ * RingLender::set_arena: the arena's slots are taken back only by a step at the full plan (begin_pass's `arena`), a
+ * card-path pass below it takes the ring's alone. The simulated host keeps the arena's slots in a generation of
+ * their own that only full steps advance, so a unit published in an arena slot from a copy queued before the last
+ * full step is caught; the ring's are written by every card-path pass as before. */
+TEST(p1_lend_arena_split_switch_parses_and_is_off_by_default) {
+    std::map<std::string, std::string> env;
+    auto get = [&](const char* k) -> const char* {
+        const auto it = env.find(k);
+        return it == env.end() ? nullptr : it->second.c_str();
+    };
+    Tunables t;
+    std::string why;
+    CHECK(parse_tunables(get, &t, &why));
+    CHECK(!t.lend_arena_split);
+    for (const char* off : { "", "0" }) {
+        env[ds41p1::kLendArenaSplitEnv] = off;
+        CHECK(parse_tunables(get, &t, &why));
+        CHECK(!t.lend_arena_split);
+    }
+    env[ds41p1::kLendArenaSplitEnv] = "1";
+    CHECK(parse_tunables(get, &t, &why));
+    CHECK(t.lend_arena_split);
+    for (const char* bad : { "2", "on", "yes", "-1" }) {
+        env[ds41p1::kLendArenaSplitEnv] = bad;
+        CHECK(!parse_tunables(get, &t, &why));
+        CHECK(why.find(ds41p1::kLendArenaSplitEnv) != std::string::npos);
+    }
+}
+
+namespace {
+/* A pass through the split lender: p1 arms the card path, full is a step at the full plan (which arms or not). The
+ * host's checks around it, for the groups the pass takes and the ones it leaves. */
+int split_pass(RingLender& l, FakeLend& h, bool p1, bool full, int64_t now) {
+    if (p1 || full) ++h.gen;    /* the card path writes the ring's slots in any armed pass (and the ring's in a full one) */
+    if (full) ++h.agen;         /* only a full step writes the arena's top */
+    std::vector<int> queued;
+    for (size_t k = 0; k < h.s.size(); ++k)
+        if (h.s[k].copying) queued.push_back((int)k);
+    std::vector<int> fences0;
+    std::vector<uint8_t> pub0;
+    for (const auto& x : h.s) {
+        fences0.push_back(x.fences);
+        pub0.push_back(x.published ? 1 : 0);
+    }
+    h.forbid_arena_drive = (p1 || full) && !full;
+    const int r = l.begin_pass(p1 || full, now, full);
+    h.forbid_arena_drive = false;
+    for (size_t k = 0; k < h.s.size(); ++k) {
+        const int kk = (int)k;
+        const bool arena = h.in_arena(kk), kept = h.kept(kk), kv = h.in_kv(kk), ring = !arena && !kept && !kv;
+        const bool taken = (ring && (p1 || full)) || (arena && full);
+        if (taken && h.s[k].published) h.bad("slot " + std::to_string(k) + " published through a pass that takes it");
+        if (kept && pub0[k] && !h.s[k].published) h.bad("kept slot " + std::to_string(k) + " withdrawn by a pass");
+        if (kv && pub0[k] && !h.s[k].published) h.bad("KV slot " + std::to_string(k) + " withdrawn by a pass");
+        if (arena && (p1 || full) && !full && pub0[k] && !h.s[k].published)
+            h.bad("arena slot " + std::to_string(k) + " withdrawn by a card-path pass below the full plan");
+        if (!taken && h.s[k].fences != fences0[k]) h.bad("slot " + std::to_string(k) + " fenced by a pass that leaves it");
+    }
+    for (int k : queued)
+        if (((!h.in_arena(k) && !h.kept(k) && !h.in_kv(k) && (p1 || full)) || (h.in_arena(k) && full)) &&
+                 h.s[(size_t)k].fenced_gen != h.gen)
+            h.bad("slot " + std::to_string(k) + "'s queued copy not fenced by the pass that takes it");
+    if (l.residents() != h.published()) h.bad("the lender's residents and the host's published units differ");
+    return r;
+}
+
+int published_in(const FakeLend& h, int lo, int hi) {
+    int n = 0;
+    for (int k = lo; k < hi; ++k) n += h.s[(size_t)k].published;
+    return n;
+}
+}  // namespace
+
+TEST(p1_lend_arena_split_keeps_arena_residents_through_armed_passes_below_the_full_plan) {
+    /* Ring slots 0-1, arena slots 2-4, a kept (slab) slot 5; every unit in the RAM cache but arena slot 4's. */
+    FakeLend h(11, 6);
+    h.land_pct = h.copy_pct = 100;
+    h.keep_from = 5;
+    h.arena_from = 2;
+    for (int k = 0; k < 6; ++k) h.ram[(size_t)k] = k != 4;
+    RingLender l;
+    REQUIRE_EQ(l.init(&h, 6, 1000, 1), 0);
+    REQUIRE_EQ(l.set_arena(2), 0);
+    CHECK_EQ(l.set_arena(2), -1);   /* once */
+    CHECK(l.arena_slot(2) && l.arena_slot(4) && !l.arena_slot(1) && !l.arena_slot(5));
+    int64_t t = 0;
+    for (int i = 0; i < 20 && l.residents() < 6; ++i) split_pass(l, h, false, false, t += 10);
+    CHECK_EQ(l.residents(), 6);
+    CHECK(!l.lent());
+    /* Armed decode passes (below the full plan): the ring's two go, the arena's three and the slab's stay. */
+    for (int i = 0; i < 50; ++i) split_pass(l, h, true, false, t += 20);
+    CHECK_EQ(published_in(h, 0, 2), 0);
+    CHECK_EQ(published_in(h, 2, 5), 3);
+    CHECK_EQ(published_in(h, 5, 6), 1);
+    CHECK_EQ(l.stats().arena_spared, (uint64_t)50);
+    CHECK_EQ(l.stats().arena_spared_res, (uint64_t)150);
+    CHECK_EQ(l.stats().withdrawn, (uint64_t)2);
+    CHECK(l.lent());
+    CHECK(!l.arena_lent());
+    /* A step at the full plan (a long prefill chunk) takes the arena's slots back before it issues anything. */
+    CHECK_EQ(split_pass(l, h, true, true, t += 20), 1);
+    CHECK_EQ(published_in(h, 0, 5), 0);
+    CHECK_EQ(published_in(h, 5, 6), 1);
+    CHECK(l.arena_lent());
+    l.end_p1(t += 300);
+    const int64_t full_end = t;
+    /* Armed decode passes inside the arena's grace: nothing of the arena comes back. */
+    for (; t < full_end + 990; t += 30) split_pass(l, h, true, false, t);
+    CHECK_EQ(published_in(h, 2, 5), 0);
+    /* Past the grace, still under armed decode: the arena returns, its RAM-cache units reload and publish; slot 4
+     * (no RAM-cache copy) waits, since a pass that takes the ring begins no drive read. */
+    const int loads4 = h.s[4].loads;
+    for (int i = 0; i < 10; ++i) split_pass(l, h, true, false, t += 30);
+    CHECK_EQ(published_in(h, 2, 4), 2);
+    CHECK(!h.s[4].published);
+    CHECK_EQ(h.s[4].loads, loads4);
+    CHECK(l.stats().arena_p1_loads >= (uint64_t)2);
+    CHECK_EQ(published_in(h, 0, 2), 0);   /* the ring stays lent through armed passes */
+    /* A pass that does not arm, past the ring's grace: the ring returns, slot 4 reads the drive. */
+    t += 2000;
+    for (int i = 0; i < 20 && l.residents() < 6; ++i) split_pass(l, h, false, false, t += 10);
+    CHECK_EQ(l.residents(), 6);
+    CHECK_EQ(h.s[4].loads, loads4 + 1);
+    CHECK_EQ(h.violations, 0);
+    if (h.violations) std::fprintf(stderr, "%s\n", h.first.c_str());
+
+    /* The control, without the split: the same armed decode passes take the arena's slots back every time. */
+    FakeLend h2(12, 6);
+    h2.land_pct = h2.copy_pct = 100;
+    h2.keep_from = 5;
+    for (int k = 0; k < 6; ++k) h2.ram[(size_t)k] = 1;
+    RingLender l2;
+    REQUIRE_EQ(l2.init(&h2, 6, 1000, 1), 0);
+    int64_t t2 = 0;
+    for (int i = 0; i < 20 && l2.residents() < 6; ++i) lend_pass(l2, h2, false, t2 += 10);
+    CHECK_EQ(l2.residents(), 6);
+    for (int i = 0; i < 50; ++i) lend_pass(l2, h2, true, t2 += 20);
+    CHECK_EQ(published_in(h2, 0, 5), 0);
+    CHECK_EQ(published_in(h2, 5, 6), 1);
+    CHECK_EQ(l2.stats().arena_spared, (uint64_t)0);
+    CHECK_EQ(h2.violations, 0);
+}
+
+TEST(p1_lend_arena_split_random_passes_landings_and_failures) {
+    int runs = 0;
+    for (unsigned seed = 1; seed <= 400; ++seed) {
+        std::mt19937 rng(seed);
+        const int nr = (int)(rng() % 4), na = 1 + (int)(rng() % 6), nk = (int)(rng() % 3), n = nr + na + nk;
+        FakeLend h(seed * 7u + 3u, n);
+        h.land_pct = 20 + (int)(rng() % 70);
+        h.copy_pct = 20 + (int)(rng() % 70);
+        h.bufs = 1 + (int)(rng() % 3);
+        h.keep_from = nr + na;
+        h.arena_from = nr;
+        for (int k = 0; k < n; ++k) h.ram[(size_t)k] = rng() % 3 != 0;
+        RingLender l;
+        const int64_t grace = (int64_t)(rng() % 4) * 50;
+        REQUIRE_EQ(l.init(&h, n, grace, nk), 0);
+        REQUIRE_EQ(l.set_arena(nr), 0);
+        if (rng() % 2) l.set_rest(100);
+        int64_t t = 0, last_full_end = -1;
+        bool in_full = false;
+        std::vector<uint8_t> pub(n, 0);
+        for (int step = 0; step < 400; ++step) {
+            if (rng() % 17 == 0) h.fail_load_once.insert((int)(rng() % (unsigned)n));
+            if (rng() % 19 == 0) h.fail_copy_once.insert((int)(rng() % (unsigned)n));
+            const unsigned kind = rng() % 10;   /* 0-1 full, 2-6 armed below it, 7-9 neither */
+            const bool full = kind < 2, p1 = kind < 7;
+            for (int k = 0; k < n; ++k) pub[(size_t)k] = h.s[(size_t)k].published;
+            split_pass(l, h, p1, full, t);
+            /* An arena slot published by this pass: only once the arena's grace has run out since the last full
+             * step's end. */
+            for (int k = nr; k < nr + na; ++k)
+                if (!pub[(size_t)k] && h.s[(size_t)k].published && last_full_end >= 0 && t - last_full_end < grace && !full)
+                    h.bad("arena slot " + std::to_string(k) + " published inside the arena's grace");
+            in_full = full;
+            if (p1 || full) {
+                t += 1 + (int64_t)(rng() % 40);
+                l.end_p1(t);
+                if (in_full) last_full_end = t;
+            }
+            t += 1 + (int64_t)(rng() % 40);
+            if (h.violations) break;
+        }
+        /* Liveness: a full step (its return makes a failed slot want its unit again), then armed decode only, past
+         * the arena's grace: every arena slot whose unit the RAM cache holds comes back; then another full step and
+         * passes that do not arm bring everything back. */
+        h.fail_load_once.clear();
+        h.fail_copy_once.clear();
+        h.refuse.clear();
+        h.settle_all();
+        split_pass(l, h, true, true, t += 5);
+        l.end_p1(t += 1);
+        t += grace + 1000;
+        for (int i = 0; i < 300; ++i) {
+            h.settle_all();
+            split_pass(l, h, true, false, t += 5);
+            l.end_p1(t += 1);
+        }
+        for (int k = nr; k < nr + na; ++k)
+            if (h.ram[(size_t)k] && !h.s[(size_t)k].published && !l.lost(k))
+                h.bad("arena slot " + std::to_string(k) + " (RAM-cache unit) not back under armed decode");
+        split_pass(l, h, true, true, t += 5);
+        l.end_p1(t += 1);
+        t += grace + 1000;
+        for (int i = 0; i < 300 && l.residents() < n; ++i) {
+            h.settle_all();
+            split_pass(l, h, false, false, t += 5);
+        }
+        if (l.residents() != n) h.bad("only " + std::to_string(l.residents()) + " of " + std::to_string(n) + " resident at the end");
+        if (h.bufs_used != 0 && l.busy() == 0) h.bad("a reload buffer held with nothing in flight");
+        if (h.violations) {
+            CHECK_EQ(h.violations, 0);
+            std::fprintf(stderr, "seed %u: %s\n", seed, h.first.c_str());
+            return;
+        }
+        ++runs;
+    }
+    CHECK_EQ(runs, 400);
+}
+
+namespace {
+/* The two-stream card (ArenaHost) with the split: three pass kinds, a step at the full plan (writes the arena's top,
+ * the lender takes every lent slot back first), an armed pass below it (the card path's own buffers only: every
+ * published arena resident is read from its slot by the plugin's ops) and a plain one (reads them the same). `wrong`
+ * is the control: full steps tell the lender `arena` = false, as a split that ignored the level would. */
+int arena_split_run(unsigned seed, bool wrong, int steps, std::string* why) {
+    std::mt19937 rng(seed);
+    const int n = 1 + (int)(rng() % 8);
+    ArenaHost h(seed * 31u + 7u, n);
+    h.bufs = 1 + (int)(rng() % 3);
+    h.ram_all = true;
+    RingLender l;
+    if (l.init(&h, n, (int64_t)(rng() % 3) * 20) < 0 || l.set_arena(0) < 0) return -1;
+    int64_t t = 0;
+    auto pass = [&](int s, int kind) {   /* 0 full, 1 armed below it, 2 neither */
+        const bool full = kind == 0, armed = kind <= 1;
+        l.begin_pass(armed, t, full && !wrong);
+        if (full) {
+            for (int k = 0; k < n; ++k)
+                if (l.resident(k)) {
+                    h.bad("arena slot " + std::to_string(k) + " still resident when full step " + std::to_string(s) +
+                          " writes the arena's top");
+                }
+            ArenaHost::Cmd c;
+            c.t = ArenaHost::FullWrite;
+            c.step = s;
+            h.push(0, c);
+            h.progress();
+            c.t = ArenaHost::FullRead;
+            h.push(0, c);
+        } else {
+            for (int k = 0; k < n; ++k)
+                if (l.resident(k)) {
+                    ArenaHost::Cmd c;
+                    c.t = ArenaHost::ResRead;
+                    c.k = k;
+                    c.unit = h.cur[(size_t)k];
+                    h.push(0, c);
+                }
+        }
+        h.progress();
+        if (armed) {
+            l.end_p1(t);
+            /* FileStager::end_pass: an armed pass's own end_pass makes the mover's stream wait on its end; a full
+             * step's too. */
+            h.record(0, h.end_ev);
+            h.wait(1, h.end_ev);
+        }
+        t += 1 + (int64_t)(rng() % 30);
+    };
+    for (int s = 0; s < steps; ++s) {
+        const unsigned r = rng() % 10;
+        pass(s, r < 2 ? 0 : r < 8 ? 1 : 2);
+    }
+    /* Armed decode only from here: the arena comes back with no pass that does not arm. */
+    for (int s = 0; s < 6 * n + 40; ++s) {
+        pass(steps + s, 1);
+        h.drain();
+        t += 100;
+    }
+    h.drain();
+    if (l.residents() != n) h.bad("only " + std::to_string(l.residents()) + " of " + std::to_string(n) + " arena slots resident under armed decode");
+    if (why && h.violations) *why = h.first;
+    return h.violations;
+}
+}  // namespace
+
+TEST(p1_lend_arena_split_full_steps_take_the_arena_back_before_use_on_the_two_streams) {
+    int runs = 0;
+    for (unsigned seed = 1; seed <= 300; ++seed) {
+        std::string why;
+        const int v = arena_split_run(seed, false, 150, &why);
+        if (v) {
+            CHECK_EQ(v, 0);
+            std::fprintf(stderr, "seed %u: %s\n", seed, why.c_str());
+            return;
+        }
+        ++runs;
+    }
+    CHECK_EQ(runs, 300);
+    /* The control: a split that left the arena's slots to a full step finds them resident at its write (or a reload
+     * copy inside its activations) in some run. */
+    int wrong = 0;
+    for (unsigned seed = 1; seed <= 300; ++seed) wrong += arena_split_run(seed, true, 150, nullptr) > 0;
+    CHECK(wrong > 0);
+    std::fprintf(stderr, "  runs that fail with the arena left to full steps: %d of 300\n", wrong);
+}
+
+
+/* The lender's half of a KV pool that lends its unused blocks (RingLender::set_avail, a prototype the engine does not
+ * call yet): an owner (the KV cache's live mark) takes the top slots back and gives them again at random pass
+ * boundaries, while passes of both kinds run and loads land and copies pass at random. Checks: a slot is never
+ * published while its owner holds it, never from a copy queued before the owner last took it, a copy still queued
+ * when the owner takes the slot is fenced first, and once every slot is given back they all come back. */
+TEST(p1_lend_slot_availability_follows_a_moving_owner_mark) {
+    int runs = 0;
+    for (unsigned seed = 1; seed <= 300; ++seed) {
+        std::mt19937 rng(seed);
+        const int n = 2 + (int)(rng() % 10);
+        FakeLend h(seed * 13u + 1u, n);
+        h.land_pct = 20 + (int)(rng() % 70);
+        h.copy_pct = 20 + (int)(rng() % 70);
+        h.bufs = 1 + (int)(rng() % 3);
+        for (int k = 0; k < n; ++k) h.ram[(size_t)k] = rng() % 2;
+        RingLender l;
+        REQUIRE_EQ(l.init(&h, n, (int64_t)(rng() % 3) * 30), 0);
+        int mark = n;   /* slots from the mark up are the owner's */
+        int64_t t = 0;
+        for (int step = 0; step < 300 && !h.violations; ++step) {
+            if (rng() % 4 == 0) {
+                const int to = (int)(rng() % (unsigned)(n + 1));
+                for (int k = to; k < mark; ++k) {   /* the owner takes slots [to, mark) */
+                    const bool queued = h.s[(size_t)k].copying;
+                    const int f0 = h.s[(size_t)k].fences;
+                    ++h.ep[(size_t)k];
+                    l.set_avail(k, false);
+                    h.taken[(size_t)k] = 1;
+                    if (h.s[(size_t)k].published) h.bad("slot " + std::to_string(k) + " still published when its owner takes it");
+                    if (queued && h.s[(size_t)k].fences == f0) h.bad("slot " + std::to_string(k) + "'s queued copy not fenced for its owner");
+                    if (l.avail(k)) h.bad("slot " + std::to_string(k) + " available after set_avail(false)");
+                }
+                for (int k = mark; k < to; ++k) {   /* and gives [mark, to) back */
+                    h.taken[(size_t)k] = 0;
+                    l.set_avail(k, true);
+                }
+                mark = to;
+            }
+            const bool p1 = rng() % 3 == 0;
+            lend_pass(l, h, p1, t);
+            if (p1) l.end_p1(t += 1 + (int64_t)(rng() % 20));
+            t += 1 + (int64_t)(rng() % 20);
+        }
+        for (int k = mark; k < n; ++k) {
+            h.taken[(size_t)k] = 0;
+            l.set_avail(k, true);
+        }
+        t += 1000;
+        for (int i = 0; i < 400 && l.residents() < n && !h.violations; ++i) {
+            h.settle_all();
+            lend_pass(l, h, false, t += 5);
+        }
+        if (l.residents() != n) h.bad("only " + std::to_string(l.residents()) + " of " + std::to_string(n) + " resident after every slot came back");
+        if (h.violations) {
+            CHECK_EQ(h.violations, 0);
+            std::fprintf(stderr, "seed %u: %s\n", seed, h.first.c_str());
+            return;
+        }
+        ++runs;
+    }
+    CHECK_EQ(runs, 300);
+}
+
+/* The KV pool's lent slots (RingLender::set_kv, ..._KV_LEND): a third group no pass takes back, available only while
+ * the cache's loan covers it. An owner mark (the loan, in slots covered from the lowest) moves at random between
+ * passes of every kind, beside a ring, an arena (with or without the split) and a slab. Checks: no pass withdraws a
+ * KV resident or fences its copy; a KV slot is never published while its owner holds it nor from a copy queued
+ * before the owner last took it; a copy queued when the owner takes the slot is fenced; no KV drive read in a pass
+ * that takes slots back; the ring, arena and slab as before; RAM-cache KV units come back under armed passes alone,
+ * and everything at the end. */
+TEST(p1_lend_kv_slots_follow_the_cache_mark_through_every_pass_kind) {
+    int runs = 0, kv_res_armed = 0;
+    for (unsigned seed = 1; seed <= 300; ++seed) {
+        std::mt19937 rng(seed);
+        const int nr = (int)(rng() % 3), na = (int)(rng() % 4), nkv = 1 + (int)(rng() % 8), nk = (int)(rng() % 2);
+        const int n = nr + na + nkv + nk;
+        const bool split = na > 0 && rng() % 2;
+        FakeLend h(seed * 17u + 5u, n);
+        h.land_pct = 20 + (int)(rng() % 70);
+        h.copy_pct = 20 + (int)(rng() % 70);
+        h.bufs = 1 + (int)(rng() % 3);
+        h.keep_from = nr + na + nkv;
+        h.arena_from = split ? nr : 1 << 30;
+        h.kv_from = nr + na;
+        h.kv_to = nr + na + nkv;
+        for (int k = 0; k < n; ++k) h.ram[(size_t)k] = rng() % 3 != 0;
+        RingLender l;
+        const int64_t grace = (int64_t)(rng() % 3) * 40;
+        REQUIRE_EQ(l.init(&h, n, grace, nk), 0);
+        if (split) REQUIRE_EQ(l.set_arena(nr), 0);
+        REQUIRE_EQ(l.set_kv(nr + na, nkv), 0);
+        CHECK_EQ(l.set_kv(nr + na, nkv), -1);
+        for (int k = nr + na; k < nr + na + nkv; ++k) {
+            CHECK(l.kv_slot(k) && !l.avail(k));
+            h.taken[(size_t)k] = 1;   /* nothing lent yet */
+        }
+        int cover = 0;   /* KV slots [kv_from, kv_from + cover) are lent */
+        auto move_mark = [&](int to) {
+            for (int i = to; i < cover; ++i) {   /* the cache takes these back */
+                const int k = h.kv_from + i;
+                const bool queued = h.s[(size_t)k].copying;
+                const int f0 = h.s[(size_t)k].fences;
+                ++h.ep[(size_t)k];
+                l.set_avail(k, false);
+                h.taken[(size_t)k] = 1;
+                if (h.s[(size_t)k].published) h.bad("KV slot " + std::to_string(k) + " still published when the cache takes it");
+                if (queued && h.s[(size_t)k].fences == f0) h.bad("KV slot " + std::to_string(k) + "'s queued copy not fenced for the cache");
+            }
+            for (int i = cover; i < to; ++i) {   /* and lends these */
+                const int k = h.kv_from + i;
+                h.taken[(size_t)k] = 0;
+                l.set_avail(k, true);
+            }
+            cover = to;
+        };
+        int64_t t = 0;
+        for (int step = 0; step < 400 && !h.violations; ++step) {
+            if (rng() % 5 == 0) move_mark((int)(rng() % (unsigned)(nkv + 1)));
+            if (rng() % 17 == 0) h.fail_load_once.insert((int)(rng() % (unsigned)n));
+            if (rng() % 19 == 0) h.fail_copy_once.insert((int)(rng() % (unsigned)n));
+            const unsigned kind = rng() % 10;
+            const bool full = kind < 2, p1 = kind < 7;
+            split_pass(l, h, p1, full, t);
+            if (p1 || full) l.end_p1(t += 1 + (int64_t)(rng() % 30));
+            t += 1 + (int64_t)(rng() % 30);
+        }
+        /* Liveness: everything lent, a full step (failed slots want their units again at its return), then armed
+         * passes alone: every RAM-cache KV unit comes back; then plain passes: everything. */
+        h.fail_load_once.clear();
+        h.fail_copy_once.clear();
+        move_mark(nkv);
+        h.settle_all();
+        split_pass(l, h, true, true, t += 5);
+        l.end_p1(t += 1);
+        for (int i = 0; i < 300 && !h.violations; ++i) {
+            h.settle_all();
+            split_pass(l, h, true, false, t += 5);
+            l.end_p1(t += 1);
+        }
+        for (int k = h.kv_from; k < h.kv_to; ++k) {
+            if (h.ram[(size_t)k] && !h.s[(size_t)k].published && h.s[(size_t)k].loads > 0 && !h.violations) {
+                /* A KV slot whose last load failed stays failed until it is lent again (as any lent slot until its
+                 * return); lend it again and let the armed passes bring it in. */
+                move_mark(k - h.kv_from);
+                move_mark(nkv);
+                for (int i = 0; i < 100; ++i) {
+                    h.settle_all();
+                    split_pass(l, h, true, false, t += 5);
+                    l.end_p1(t += 1);
+                }
+            }
+            if (h.ram[(size_t)k] && !h.s[(size_t)k].published) h.bad("KV slot " + std::to_string(k) + " (RAM-cache unit) not back under armed passes");
+            kv_res_armed += h.s[(size_t)k].published;
+        }
+        t += grace + 1000;
+        for (int i = 0; i < 300 && l.residents() < n && !h.violations; ++i) {
+            h.settle_all();
+            split_pass(l, h, false, false, t += 5);
+        }
+        if (l.residents() != n) h.bad("only " + std::to_string(l.residents()) + " of " + std::to_string(n) + " resident at the end");
+        if (h.violations) {
+            CHECK_EQ(h.violations, 0);
+            std::fprintf(stderr, "seed %u: %s\n", seed, h.first.c_str());
+            return;
+        }
+        ++runs;
+    }
+    CHECK_EQ(runs, 300);
+    CHECK(kv_res_armed > 300);
+}
+
+/* The KV pool's slots in a layer stripe (kv_stripe_slots): inside the stripe, aligned, disjoint, each covered by its
+ * loan and not by one block less, never the whole stripe; the counts for the H57 pool's groups. */
+TEST(p1_kv_stripe_slots_are_covered_exactly_by_their_loan) {
+
+    struct G { int64_t n_blocks, lbpb, bs; int want; };
+    /* The N512 L360448 pool (server log): compressed_r1 1 KiB a token, compressed_r2 1 KiB a 2-token block a layer,
+     * index_r1 256 B a token, index_r2 256 B a 2-token block a layer; and odd shapes. */
+    const G gs[] = { { 360437, 1024, 1, 19 }, { 180218, 1024, 2, 9 }, { 360437, 256, 1, 4 }, { 180218, 256, 2, 2 },
+                     { 10, 4096, 1, 0 }, { 5000, 4100, 3, 1 }, { 1, 1 << 30, 16, 0 } };
+    for (const G& g : gs) {
+        char* const base = (char*)(uintptr_t)0x7f0000001000ull;   /* addresses only: never dereferenced */
+        const std::vector<KvSlot> v = kv_stripe_slots(base, g.n_blocks, g.lbpb, g.bs);
+        if (g.want >= 0) CHECK_EQ((int)v.size(), g.want);
+        char* const top = base + g.n_blocks * g.lbpb;
+        char* prev_lo = top;
+        int64_t prev_need = 0;
+        for (const KvSlot& x : v) {
+            CHECK(((uintptr_t)x.at & 4095) == 0);
+            CHECK(x.at >= base && x.at + ds41p1::kSlotBytes <= prev_lo);
+            CHECK(x.need > prev_need && x.need % g.bs == 0);
+            const int64_t blocks = x.need / g.bs;
+            CHECK(blocks < g.n_blocks);
+            CHECK(blocks * g.lbpb >= top - x.at);                 /* the loan covers every byte of the slot */
+            CHECK((blocks - 1) * g.lbpb < top - x.at);            /* and one block less does not */
+            prev_lo = x.at;
+            prev_need = x.need;
+        }
+    }
+    CHECK(kv_stripe_slots(nullptr, 100, 1 << 20, 1).empty());
+    CHECK(kv_stripe_slots((char*)(uintptr_t)0x1000, 0, 1 << 20, 1).empty());
+
+}
+
 RAD_TEST_MAIN()
+
+/* ---- a failed ring copy keeps its source until the copy event has passed (Mover::ring_copy, queue_one, early) ----
+ * A copy list that fails midway may have queued some of its segments, which read the source later; ring_copy
+ * records the done event all the same, and the stager keeps the source with the slot (RAM lease, pinned ready
+ * slot or, with pack once, the RAM-cache leases of a drive unit) until that event has passed -- before, a failed
+ * copy's unit stayed Ready and end_pass let its source go at once. Over random layers (RAM and drive units) the
+ * Nth copy fails with the card lagging (lag 0: nothing runs until the host waits): the run is refused, end_pass
+ * lets every source go exactly once, none before its queued part ran. */
+TEST(p1_a_failed_ring_copy_keeps_its_source_until_the_copy_event_passes) {
+    int failed = 0;
+    for (unsigned seed = 1; seed <= 60; ++seed) {
+        Sim sim(seed * 131u + 7u, 4);
+        CardExpertStager st;
+        std::string why;
+        sim.st = &st;
+        REQUIRE_EQ(st.init(&sim, g_ring, 4, 1 + (int)(seed % 2), 96, g_alias, 6, &why), 0);
+        st.set_defer((seed & 4) != 0);
+        sim.lag = 0;
+        std::mt19937 rng(seed);
+        sim.fail_copy_at = 1 + (int)(rng() % 12);
+        int uid = 1, rc = 0;
+        for (int layer = 0; layer < 3 && rc >= 0; ++layer) rc = run_layer(sim, st, layer, random_layer(rng, 10, 50, 50), &uid);
+        if (sim.failed_copies) {
+            CHECK(rc < 0);
+            ++failed;
+        }
+        (void)st.end_pass();
+        sim.drain();
+        CHECK_EQ(st.held(), 0);
+        /* Every source handed over was let go once; the drive's still pending were never handed over. */
+        int handed = 0;
+        for (const auto& kv : sim.handle_unit) handed += 1;
+        CHECK_EQ((int)sim.released.size(), handed);
+        CHECK_EQ(sim.violations, 0);
+        if (sim.violations) std::fprintf(stderr, "seed %u: %s\n", seed, sim.first.c_str());
+    }
+    CHECK(failed > 30);
+}
+
+TEST(p1_a_failed_early_copy_leaves_its_lease_with_the_slot) {
+    Sim sim(5, 6);
+    CardExpertStager st;
+    std::string why;
+    sim.st = &st;
+    REQUIRE_EQ(st.init(&sim, g_ring, 6, 2, 96, g_alias, 6, &why), 0);
+    st.set_defer(true);
+    sim.lag = 0;
+    int uid = 1;
+    std::mt19937 rng(9);
+    REQUIRE_EQ(run_layer(sim, st, 0, random_layer(rng, 8, 0, 50), &uid), 0);
+    const int h1 = sim.next_handle++, h2 = sim.next_handle++;
+    sim.handle_unit[{ (int)Kind::Ram, h1 }] = 500;
+    sim.handle_unit[{ (int)Kind::Ram, h2 }] = 501;
+    CHECK_EQ(st.early(500, ram_src(500, true), h1), 0);
+    sim.fail_copy_at = 1;
+    CHECK_EQ(st.early(501, ram_src(501, false), h2), CardExpertStager::kCopyKept);
+    CHECK(!sim.released.count({ (int)Kind::Ram, h2 }));   /* the slot holds it: not let go at once */
+    CHECK(st.held() >= 2);
+    REQUIRE_EQ(st.end_pass(), 0);
+    sim.drain();
+    CHECK_EQ(st.held(), 0);
+    CHECK(sim.released.count({ (int)Kind::Ram, h2 }));
+    CHECK_EQ(sim.released.size(), sim.handle_unit.size());
+    CHECK_EQ(sim.violations, 0);
+    if (sim.violations) std::fprintf(stderr, "%s\n", sim.first.c_str());
+}
+
+/* Pack once (ds41p1::kPackOnceEnv): a 0/1 switch, off by default. */
+TEST(p1_pack_once_switch_is_default_off_and_accepts_only_zero_or_one) {
+    std::map<std::string, std::string> env;
+    auto get = [&](const char* k) -> const char* {
+        const auto it = env.find(k);
+        return it == env.end() ? nullptr : it->second.c_str();
+    };
+    Tunables t;
+    std::string why;
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK(!t.pack_once);
+    for (const char* off : { "", "0" }) {
+        env[ds41p1::kPackOnceEnv] = off;
+        REQUIRE(parse_tunables(get, &t, &why));
+        CHECK(!t.pack_once);
+    }
+    env[ds41p1::kPackOnceEnv] = "1";
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK(t.pack_once);
+    for (const char* bad : { "2", "yes", "-1" }) {
+        env[ds41p1::kPackOnceEnv] = bad;
+        CHECK(!parse_tunables(get, &t, &why));
+        CHECK(why.find(ds41p1::kPackOnceEnv) != std::string::npos);
+    }
+}

@@ -140,11 +140,12 @@ std::vector<uint8_t> relay(const Lib& lib, const uint16_t* w, int64_t N, int64_t
 
 /* One launch of row r: y[M, N] (pitch ldc) = a[M, K] (pitch lda) . b^T. sk / mb 0: the law. */
 int gemm(const RadKernelInfo* r, void* a, void* b, uint32_t bdt, void* y, int64_t M, int64_t N,
-         int64_t K, int64_t lda, int64_t ldc, int sk, int mb, int chain, hipStream_t s) {
+         int64_t K, int64_t lda, int64_t ldc, int sk, int mb, int chain, hipStream_t s, int form = 0) {
     RadTensor t[3] = { view(a, RAD_BF16, M, K, lda), view(b, bdt, N, K, K), view(y, RAD_BF16, M, N, ldc) };
     std::vector<RadParam> p = { pi("M", M), pi("N", N), pi("K", K), ps("dtype", "bf16"), pi("chain", chain) };
     if (sk) p.push_back(pi("sk", sk));
     if (mb) p.push_back(pi("mb", mb));
+    if (form) p.push_back(pi("form", form));   /* gemm_bf16f8_nt_m64: 1 the m64 kernel, 2 the tiled form */
     RadArgs args{};
     args.t = t;
     args.n_t = 3;
@@ -639,17 +640,210 @@ int timing(const Lib& lib) {
     return 0;
 }
 
+/* ------------------------------------------------------------------ dtiled (the tiled form)
+ *
+ * RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED's form (r4d_gemm_bf16f8_nt_m64.hip, r4d_gemm_bf16f8_nt_tiled_kernel) against
+ * the m64 kernel, both through gemm_bf16f8_nt_m64's own entry (`form` 2 and 1), byte for byte: ds41's per-rank shapes
+ * and odd ones, weights of ordinary, extreme (every stored exponent 10..246) and cancelling values, at heights 1 to
+ * MMAX (both block tiles, partial row and column tiles, more than one launch's grid), pitched rows; a rerun; the
+ * bf16 tiled row over the plane; and, with the switch set, the engine's form (`form` 0) at 64 rows (the m64 kernel)
+ * and above (the tiled one). Since the m64 kernel's split depends only on N and K, equality at every height is also
+ * the tiled form's batch invariance. */
+long long dt_pair(const Lib& lib, Dev& a, Dev& w8, Dev& y0, Dev& y1, int64_t M, int64_t N, int64_t K, int64_t lda,
+                  int64_t ldc, int f0, int f1, hipStream_t s) {
+    const size_t yb = (size_t)(M * ldc) * 2;
+    HC(hipMemsetAsync(y0.p, 0xA5, yb, s));
+    HC(hipMemsetAsync(y1.p, 0x5A, yb, s));
+    const int r0 = gemm(lib.f8, a.p, w8.p, R4D_DT_BF16F8, y0.p, M, N, K, lda, ldc, 0, 0, 0, s, f0);
+    const int r1 = gemm(lib.f8, a.p, w8.p, R4D_DT_BF16F8, y1.p, M, N, K, lda, ldc, 0, 0, 0, s, f1);
+    HC(hipStreamSynchronize(s));
+    ++g_runs;
+    if (r0 != RAD_OK || r1 != RAD_OK) return -1;
+    std::vector<uint16_t> h0((size_t)(M * ldc)), h1((size_t)(M * ldc));
+    y0.get(h0.data(), yb);
+    y1.get(h1.data(), yb);
+    long long d = 0;
+    for (int64_t m = 0; m < M; ++m) {
+        for (int64_t n = 0; n < N; ++n) d += h0[(size_t)(m * ldc + n)] != h1[(size_t)(m * ldc + n)];
+        for (int64_t n = N; n < ldc; ++n) d += h1[(size_t)(m * ldc + n)] != 0x5A5A || h0[(size_t)(m * ldc + n)] != 0xA5A5;
+    }
+    return d;
+}
+
+int dtiled(const Lib& lib, int64_t mmax) {
+    const char* env = std::getenv("RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED");
+    const bool on = env && !std::strcmp(env, "1");
+    const char* mark = "the tiled bf16f8 GEMM above 64 rows (exact: the m64 kernel's bits)";
+    const bool says = lib.f8->computes && std::strstr(lib.f8->computes, mark);
+    if (on != says) {
+        ++g_fail;
+        std::printf("FAIL: row table: the switch is %s and gemm_bf16f8_nt_m64's computes %s the form\n", on ? "set" : "unset",
+                    says ? "names" : "does not name");
+    } else if (on) {
+        std::printf("PASS: row table: gemm_bf16f8_nt_m64 names %s (served form: the tiled bf16f8 GEMM)\n", mark);
+    } else {
+        std::printf("row table: the switch is unset (the engine's form not checked; `form` 1 and 2 are)\n");
+    }
+    const Shape sh[] = {
+        { "attn_q_a", 1280, 5120, 0, 0 },          { "attn_q_b (a rank)", 8192, 1280, 0, 0 },
+        { "attn_kv", 512, 5120, 0, 0 },            { "attn_output_a.gK (pitched)", 1024, 4096, 4096, 1024 },
+        { "attn_output_b (a rank)", 5120, 2048, 0, 0 }, { "ffn_gate_up_shexp (rank 0)", 1536, 5120, 0, 0 },
+        { "ffn_gate_up_shexp (ranks 1-3)", 1024, 5120, 0, 0 }, { "ffn_down_shexp (rank 0)", 5120, 768, 0, 0 },
+        { "ffn_down_shexp (ranks 1-3)", 5120, 512, 0, 0 }, { "indexer.attn_q_b", 4096, 1280, 0, 0 },
+        { "engram_kv (a rank, ENGRAM_SPLIT)", 6400, 6144, 0, 0 }, { "engram_kv", 25600, 6144, 0, 0 },
+        { "odd: N 128 K 64", 128, 64, 0, 0 },      { "odd: N 144 K 192", 144, 192, 0, 0 },
+        { "odd: N 400 K 640", 400, 640, 0, 0 }, { "odd: N 4112 K 320", 4112, 320, 8, 16 },
+    };
+    const int64_t Ms[] = { 1, 2, 15, 16, 17, 63, 64, 65, 100, 127, 128, 129, 255, 256, 257, 500, 1000, 1770, 2048,
+                           3001, 4096, 8192 };
+    std::mt19937_64 rng(5151);
+    hipStream_t s;
+    HC(hipStreamCreate(&s));
+    const int fails0 = g_fail;
+    long long pairs = 0, outputs = 0, rows_served = 0;
+    for (const Shape& x : sh)
+        for (int kind = 0; kind < 3; ++kind) {   /* ordinary, extreme exponents, cancelling pairs */
+            const int64_t N = x.N, K = x.K, lda = K + x.lda_pad, ldc = N + x.ldc_pad;
+            /* the big shapes once, with ordinary weights */
+            if (kind && N * K > 16ll * 1024 * 1024) continue;
+            const auto w = kind == 1 ? exact_weight(N, K, rng, 10, 237) : exact_weight(N, K, rng, 100, 20, kind == 2);
+            const auto blob = relay(lib, w.data(), N, K);
+            if (blob.empty()) { ++g_fail; std::printf("  FAIL %s: the relayout refused an exact weight\n", x.what); continue; }
+            Dev w16(w.size() * 2), w8(blob.size());
+            w16.put(w.data(), w.size() * 2);
+            w8.put(blob.data(), blob.size());
+            /* VRAM: at most ~96 MB an output buffer */
+            int64_t mtop = std::min<int64_t>(mmax, std::max<int64_t>(256, (96ll << 20) / (ldc * 2)));
+            const auto ha = random_act(mtop, lda, rng);
+            Dev a(ha.size() * 2), y0((size_t)(mtop * ldc) * 2), y1((size_t)(mtop * ldc) * 2);
+            a.put(ha.data(), ha.size() * 2);
+            long long bad = 0, n_here = 0;
+            for (int64_t M : Ms) {
+                if (M > mtop) continue;
+                const long long d = dt_pair(lib, a, w8, y0, y1, M, N, K, lda, ldc, 1, 2, s);
+                ++pairs;
+                ++n_here;
+                outputs += M * N;
+                if (d) {
+                    ++bad;
+                    if (bad <= 3)
+                        std::printf("  FAIL %s kind %d [%lld, %lld] M %lld: %s\n", x.what, kind, (long long)N,
+                                    (long long)K, (long long)M, d < 0 ? "a launch refused" : (std::to_string(d) + " differing outputs").c_str());
+                }
+                /* the bf16 tiled row over the plane, by contract the same bits, once a shape */
+                if (kind == 0 && lib.tiled && (M == 1770 || (M == mtop && mtop < 1770)) && M > 64) {
+                    const long long d2 = compare(lib, lib.tiled, a, w16, w8, y0, y1, M, N, K, lda, ldc, 0, 0, 0, s);
+                    ++pairs;
+                    if (d2) { ++bad; std::printf("  FAIL %s M %lld: the m64 bf16f8 row against gemm_bf16_nt_tiled: %lld\n", x.what, (long long)M, d2); }
+                }
+            }
+            /* a rerun and the engine's form at 64 rows and at the tallest height */
+            if (kind == 0) {
+                const int64_t M = std::min<int64_t>(mtop, 1770);
+                long long d = dt_pair(lib, a, w8, y0, y1, M, N, K, lda, ldc, 2, 2, s);
+                if (d) { ++bad; std::printf("  FAIL %s M %lld: the tiled form differs from its own rerun (%lld)\n", x.what, (long long)M, d); }
+                if (on) {
+                    d = dt_pair(lib, a, w8, y0, y1, M, N, K, lda, ldc, 0, 2, s);
+                    if (d) { ++bad; std::printf("  FAIL %s M %lld: the engine's form is not the tiled one (%lld)\n", x.what, (long long)M, d); }
+                    d = dt_pair(lib, a, w8, y0, y1, 64, N, K, lda, ldc, 0, 1, s);
+                    if (d) { ++bad; std::printf("  FAIL %s M 64: the engine's form is not the m64 kernel (%lld)\n", x.what, d); }
+                    rows_served += M;
+                }
+                pairs += on ? 3 : 1;
+            }
+            g_fail += (int)bad;
+            std::printf("  %-34s [%5lld, %5lld]%s %s: %lld heights to %lld, %s\n", x.what, (long long)N, (long long)K,
+                        x.lda_pad ? " pitched" : "", kind == 0 ? "ordinary " : kind == 1 ? "extreme  " : "cancelling",
+                        n_here, (long long)mtop, bad ? "DIFFER" : "every byte equal");
+            std::fflush(stdout);
+        }
+    /* The fallbacks the form refuses: K not a multiple of 64, N under 128, a chained launch. */
+    {
+        const int64_t N = 256, K = 96;
+        const auto w = exact_weight(N, K, rng);
+        const auto blob = relay(lib, w.data(), N, K);
+        Dev w8(blob.size()), a((size_t)(256 * K) * 2), y((size_t)(256 * N) * 2);
+        w8.put(blob.data(), blob.size());
+        const int r = gemm(lib.f8, a.p, w8.p, R4D_DT_BF16F8, y.p, 256, N, K, K, N, 0, 0, 0, s, 2);
+        if (r == RAD_OK) { ++g_fail; std::printf("  FAIL: the tiled form took K 96\n"); }
+        const int r2 = gemm(lib.f8, a.p, w8.p, R4D_DT_BF16F8, y.p, 256, N, K, K, N, 0, 0, 0, s, 0);
+        if (r2 != RAD_OK) { ++g_fail; std::printf("  FAIL: K 96 refused by the engine's form (%d)\n", r2); }
+        HC(hipStreamSynchronize(s));
+    }
+    HC(hipStreamDestroy(s));
+    if (g_fail == fails0)
+        std::printf("dtiled: PASS: the tiled form equals the m64 kernel byte for byte in %lld launch pairs (%lld outputs, "
+                    "heights 1..%lld, ordinary / extreme / cancelling weights, pitched rows, a rerun%s)\n",
+                    pairs, outputs, (long long)mmax, on ? ", the engine's form at 64 rows and above" : "");
+    else
+        std::printf("dtiled: FAIL: %d checks differ\n", g_fail - fails0);
+    return g_fail != fails0;
+}
+
+/* dttime: us a launch at prefill heights, the m64 kernel against the tiled form (median of 7 runs of 10). */
+int dttime(const Lib& lib) {
+    const Shape sh[] = {
+        { "attn_q_a", 1280, 5120, 0, 0 }, { "attn_q_b", 8192, 1280, 0, 0 }, { "attn_kv", 512, 5120, 0, 0 },
+        { "attn_output_a.gK", 1024, 4096, 4096, 1024 }, { "attn_output_b", 5120, 2048, 0, 0 },
+        { "gate_up_shexp r0", 1536, 5120, 0, 0 }, { "down_shexp r0", 5120, 768, 0, 0 },
+        { "indexer.attn_q_b", 4096, 1280, 0, 0 }, { "engram_kv split", 6400, 6144, 0, 0 },
+    };
+    std::mt19937_64 rng(10);
+    hipStream_t s;
+    HC(hipStreamCreate(&s));
+    hipEvent_t e0, e1;
+    HC(hipEventCreate(&e0));
+    HC(hipEventCreate(&e1));
+    std::printf("dttime: %-18s %5s %10s %8s %10s %8s %8s\n", "shape", "M", "m64 us", "TF/s", "tiled us", "TF/s", "speedup");
+    for (const Shape& x : sh) {
+        const int64_t N = x.N, K = x.K, lda = K + x.lda_pad, ldc = N + x.ldc_pad;
+        const auto w = exact_weight(N, K, rng);
+        const auto blob = relay(lib, w.data(), N, K);
+        if (blob.empty()) { ++g_fail; continue; }
+        Dev w8(blob.size());
+        w8.put(blob.data(), blob.size());
+        const int64_t mtop = 4096;
+        const auto ha = random_act(mtop, lda, rng);
+        Dev a(ha.size() * 2), y((size_t)(mtop * ldc) * 2);
+        a.put(ha.data(), ha.size() * 2);
+        for (int64_t M : { 128, 512, 1770, 2048, 4096 }) {
+            auto run = [&](int form) {
+                std::vector<float> t;
+                for (int i = 0; i < 3; ++i) (void)gemm(lib.f8, a.p, w8.p, R4D_DT_BF16F8, y.p, M, N, K, lda, ldc, 0, 0, 0, s, form);
+                for (int r = 0; r < 7; ++r) {
+                    HC(hipEventRecord(e0, s));
+                    for (int i = 0; i < 10; ++i)
+                        (void)gemm(lib.f8, a.p, w8.p, R4D_DT_BF16F8, y.p, M, N, K, lda, ldc, 0, 0, 0, s, form);
+                    HC(hipEventRecord(e1, s));
+                    HC(hipEventSynchronize(e1));
+                    float ms = 0;
+                    HC(hipEventElapsedTime(&ms, e0, e1));
+                    t.push_back(100.f * ms);
+                }
+                std::sort(t.begin(), t.end());
+                return (double)t[3];
+            };
+            const double t1 = run(1), t2 = run(2), fl = 2.0 * (double)M * (double)N * (double)K;
+            std::printf("dttime: %-18s %5lld %10.1f %8.1f %10.1f %8.1f %7.2fx\n", x.what, (long long)M, t1, fl / t1 / 1e6, t2,
+                        fl / t2 / 1e6, t1 / t2);
+        }
+        std::fflush(stdout);
+    }
+    HC(hipStreamDestroy(s));
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s LIBR4D.so all [MODEL.rad] | frag | onehot | zeros | shapes | real MODEL.rad | time\n",
+        std::fprintf(stderr, "usage: %s LIBR4D.so all [MODEL.rad] | frag | onehot | zeros | shapes | real MODEL.rad | time | dtiled [MMAX] | dttime\n",
                      argv[0]);
         return 2;
     }
     const std::string what = argv[2];
     const char* model = argc > 3 ? argv[3] : nullptr;
-    static const char* const parts[] = { "all", "frag", "onehot", "zeros", "shapes", "real", "time" };
+    static const char* const parts[] = { "all", "frag", "onehot", "zeros", "shapes", "real", "time", "dtiled", "dttime" };
     if (std::none_of(std::begin(parts), std::end(parts), [&](const char* p) { return what == p; })) {
         std::fprintf(stderr, "unknown part '%s'\n", what.c_str());
         return 2;
@@ -664,6 +858,8 @@ int main(int argc, char** argv) {
     if (what == "shapes" || what == "all") rc |= shapes(lib);
     if ((what == "real" || what == "all") && model) rc |= real(lib, model);
     if (what == "time" || what == "all") rc |= timing(lib);
+    if (what == "dtiled") rc |= dtiled(lib, model ? std::atoll(model) : 4096);
+    if (what == "dttime") rc |= dttime(lib);
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (g_fail || rc)
         std::printf("FAIL: %d of the checks differ (%d launch pairs, %.1f s)\n", g_fail, g_runs, secs);

@@ -3902,6 +3902,44 @@ TEST(a_deepseek_v4_release_is_imported_as_fp8_blocks_and_mxfp4_experts) {
     CHECK(w.trivial && rad_enc_is(&w.enc, "plain"));
 }
 
+/* DeepSeek-V4.1's two Engram tables (layers 1 and 14, `fp8_e4m3*e8m0[1x32]` each, of different
+ * row counts) joined along rows as the deepseek41 plugin maps them: one trivial weight, the same
+ * encoding, its planes the two tables' codes and the two tables' scales in sequence, so rad-convert
+ * writes them straight from the mapping and the gather reads the official bytes. */
+TEST(the_release_engram_tables_join_along_rows_as_stored) {
+    const T a = e4m3_codes("layers.1.engram.embed.weight", { 5, 256 }, 3),
+            as = e8m0("layers.1.engram.embed.scale", { 5, 8 }, 2);
+    const T b = e4m3_codes("layers.14.engram.embed.weight", { 7, 256 }, 8),
+            bs = e8m0("layers.14.engram.embed.scale", { 7, 8 }, 5);
+    const std::string dir = write_checkpoint({ a, as, b, bs }, kDsConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK(ck.imports() == Checkpoint::Import::Fp8Mx);
+    Program prog;
+    prog.name_map.push_back(map("per_layer_token_embd.weight", RAD_MAP_CONCAT,
+                                { "layers.1.engram.embed.weight", "layers.14.engram.embed.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "per_layer_token_embd.weight", false, &w, &why), RAD_OK);
+    REQUIRE(w.trivial);
+    CHECK(!w.imported);
+    CHECK_EQ(w.rows, (int64_t)12);
+    CHECK_EQ(w.cols, (int64_t)256);
+    REQUIRE(rad_enc_is(&w.enc, "affine"));
+    REQUIRE_EQ(w.enc.n_planes, 2);
+    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_F8E4M3);
+    CHECK_EQ(w.enc.plane[1].dtype, (uint32_t)RAD_E8M0);
+    CHECK_EQ(w.enc.plane[1].block[0], (int64_t)1);
+    CHECK_EQ(w.enc.plane[1].block[1], (int64_t)32);
+    std::vector<uint8_t> cp((size_t)(12 * 256)), sp((size_t)(12 * 8));
+    REQUIRE_EQ(ckpt_plane_rows(w, 0, 0, 12, cp.data(), &why), RAD_OK);
+    REQUIRE_EQ(ckpt_plane_rows(w, 1, 0, 12, sp.data(), &why), RAD_OK);
+    CHECK_EQ(std::memcmp(cp.data(), a.bytes.data(), a.bytes.size()), 0);
+    CHECK_EQ(std::memcmp(cp.data() + a.bytes.size(), b.bytes.data(), b.bytes.size()), 0);
+    CHECK_EQ(std::memcmp(sp.data(), as.bytes.data(), as.bytes.size()), 0);
+    CHECK_EQ(std::memcmp(sp.data() + as.bytes.size(), bs.bytes.data(), bs.bytes.size()), 0);
+}
+
 /* A row range of a block-scaled FP8 tensor (DeepSeek-V4.1's grouped output projection read one
  * group at a time) takes its scale plane's rows with it when it starts and ends on a block; one
  * that cuts a block is refused, since its first rows would take another block's scales. */

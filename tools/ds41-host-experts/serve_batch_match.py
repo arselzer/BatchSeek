@@ -7,8 +7,11 @@ serve_batch_test.sh).
       its flags). Prints the serve-batch.sh arguments for it, one a line: --model, --silu-table, --streams,
       --ctx-per-stream (--max-model-len / --max-num-seqs, which must divide), --port, --served-name,
       --radiance-home, --shared-head, --hybrid (..._P1_HYBRID: QyP's P, 0 or unset off; a held share, Qyf, is
-      refused), --tiled / --tail-once / --swiglu-span (Qt / Qz / Qsp: ..._P1_TILED,
-      _P1_TAIL_ONCE, _P1_SWIGLU_SPAN, 0 or unset off), and --profile, --mirror, --reserve-mib, --max-seq-len (SlN) where the launch has them. Exit 1
+      refused), --tiled / --tail-once / --swiglu-span / --fast-prefill / --fast-dense / --fast-attn (Qt / Qz / Qsp / Qw /
+      Dt / Aw: ..._P1_TILED, _P1_TAIL_ONCE, _P1_SWIGLU_SPAN, _P1_WMMA, _DENSE_TILED, _ATTN_WMMA, 0 or unset off), --early (QxK: ..._P1_EARLY, 0 or unset off), --pack (BpW: ..._SCHED_PACK_LOOKAHEAD, 0 or unset off), --pack-once (Qo: ..._P1_PACK_ONCE, 0 or unset off), --hybrid-cal (QycM: ..._P1_HYBRID_CAL, 0 or unset off),
+      --arena-split (Qes: ..._P1_LEND_ARENA_SPLIT, 0 or unset off), --kv-lend (Kvl: ..._KV_LEND), --decode-min (DmN: ..._SCHED_DECODE_MIN, 0 or unset off),
+      --ram-per-seq-mib (mSN: ..._RAM_PER_SEQ_MIB, where set; an LkT pool is --ctx-per-stream, which serve-batch.sh
+      --kv-auto T also gives), and --profile, --mirror, --reserve-mib, --max-seq-len (SlN) where the launch has them. Exit 1
       with the reason when a value is missing or does not fit.
   serve_batch_match.py compare WORDS DRYRUN [FLAG ...]
       DRYRUN: serve-batch.sh --dry-run's output. Each side resolved as the server sees it (every variable at its
@@ -24,9 +27,22 @@ SHEAD = "RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD"
 RESERVE = "RADIANCE_EXPERIMENTAL_DS41_RAM_RESERVE_MIB"
 HYBRID = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID"
 ADAPT = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT"
+HYB_PREFILL = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL"   # Qyp: --hybrid-prefill
+KERNEL_COST = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST"   # Qyk: on with it
+EARLY = "RADIANCE_EXPERIMENTAL_DS41_P1_EARLY"   # QxK: --early K
+PACK = "RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD"   # BpW: --pack W
+PACK_ONCE = "RADIANCE_EXPERIMENTAL_DS41_P1_PACK_ONCE"   # Qo: --pack-once 0|1
+HYB_CAL = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_CAL"   # QycM: --hybrid-cal M
+ARENA_SPLIT = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT"   # Qes: --arena-split 1
+PER_SEQ = "RADIANCE_EXPERIMENTAL_DS41_RAM_PER_SEQ_MIB"   # mSN: --ram-per-seq-mib N
+KV_LEND = "RADIANCE_EXPERIMENTAL_DS41_KV_LEND"   # Kvl: --kv-lend 1
+DECODE_MIN = "RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN"   # DmN: --decode-min N
 P1_SWITCHES = (("--tiled", "RADIANCE_EXPERIMENTAL_DS41_P1_TILED"), ("--tail-once", "RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE"),
-               ("--swiglu-span", "RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN"),   # Qt, Qz, Qsp
-               ("--engram-early", "RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY"))    # Ee (the harness sets it only when on)
+               ("--swiglu-span", "RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN"),
+               ("--engram-early", "RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY"),    # Ee (the harness sets it only when on)
+               ("--fast-prefill", "RADIANCE_EXPERIMENTAL_DS41_P1_WMMA"),
+               ("--fast-dense", "RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED"),
+               ("--fast-attn", "RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA"))   # Qt, Qz, Qsp, Ee, Qw, Dt, Aw
 
 
 def resolve(words):
@@ -98,6 +114,20 @@ def params(words):
     out += ["--hybrid", env.get(HYBRID) or "0"]
     for opt, var in P1_SWITCHES:
         out += [opt, env.get(var) or "0"]
+    hp, kc = env.get(HYB_PREFILL) or "0", env.get(KERNEL_COST) or "0"
+    if (hp != "0") != (kc != "0"):
+        raise ValueError("%s=%s with %s=%s: serve-batch.sh sets kernel costs exactly when hybrid prefill is on"
+                         % (HYB_PREFILL, hp, KERNEL_COST, kc))
+    out += ["--hybrid-prefill", hp]
+    out += ["--early", env.get(EARLY) or "0"]
+    out += ["--pack", env.get(PACK) or "0"]
+    out += ["--pack-once", env.get(PACK_ONCE) or "0"]
+    out += ["--hybrid-cal", env.get(HYB_CAL) or "0"]
+    out += ["--arena-split", env.get(ARENA_SPLIT) or "0"]
+    out += ["--kv-lend", env.get(KV_LEND) or "0"]
+    if env.get(PER_SEQ):
+        out += ["--ram-per-seq-mib", env[PER_SEQ]]
+    out += ["--decode-min", env.get(DECODE_MIN) or "0"]
     if flags.get("--max-seq-len"):
         out += ["--max-seq-len", flags["--max-seq-len"]]
     return out

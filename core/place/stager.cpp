@@ -5,6 +5,7 @@
 #include "../../arch/deepseek41/ds41_index_memory.h"
 #include "place/router_predictor.h"
 #include "ds41_host_experts.h"
+#include "device/device.h"
 
 #include <sys/prctl.h>
 
@@ -765,11 +766,16 @@ bool FileStager::begin_pass(const RadBatch* b) {
      * back as well (its buffers reach the arena's top), its ops behind any reload copy still queued. */
     p1_lend_took_ = false;
     if (p1_on() && p1_->lending()) {
-        p1_lend_took_ = p1_arms || (p1_arena_full_ && p1_arena_full_());
+        /* ..._P1_LEND_ARENA_SPLIT: the lender takes the arena's slots back only at the full plan (its third
+         * argument; without the split it takes every slot with p1_lend_took_, as before). */
+        const bool full = p1_arena_full_ && p1_arena_full_();
+        p1_lend_took_ = p1_arms || full;
         /* ..._P1_LEND_AUDIT: a resident withdrawn at this pass's begin is read back behind the end of the
          * pass before, the residents' last reader. */
         if (p1_tun_.lend_audit) p1_->lend_audit_behind(p1_lend_rec_ ? p1_lend_ev_ : nullptr);
-        (void)p1_->lender().begin_pass(p1_lend_took_, p1_now_ms());
+        /* ..._KV_LEND: the KV pool's slots follow the cache's loan before anything of this pass is issued. */
+        if (!p1_kv_need_.empty()) p1_kv_sync();
+        (void)p1_->lender().begin_pass(p1_lend_took_, p1_now_ms(), full);
         /* The lent slots' heat (..._P1_LEND_HEAT): the policy's turn, here only (residency changes before
          * the weight tables are brought up to date), with the heat counted through the pass before this
          * one; then this pass's rows age it, if it is one that counts. */
@@ -795,8 +801,9 @@ bool FileStager::begin_pass(const RadBatch* b) {
         }
     }
     /* ..._P1_HYBRID (p1_hybrid.h): an armed decode pass may give each layer's cheapest RAM-cache units to the
-     * CPU pool; every other pass, and every pass with the switch off, as before. */
-    p1_hyb_pass_ = p1_armed_ && p1_decode_pass_ && p1_tun_.hybrid > 0 && p1_hyb_ev_ != nullptr;
+     * CPU pool; under ..._P1_HYBRID_PREFILL an armed prefill pass too, with its own share; every other pass, and
+     * every pass with the switches off, as before. */
+    p1_hyb_pass_ = p1_hyb_arms(p1_armed_, p1_decode_pass_, p1_tun_.hybrid, p1_tun_.hybrid_prefill, p1_hyb_ev_ != nullptr);
     pass_level_ = arena_level_fn_ ? arena_level_fn_() : 0;
     p1_hyb_split_ = false;
     p1_hyb_li_ = -1;
@@ -932,14 +939,16 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     /* With the pool, the pass's token rows and sorted order ride the same wait (hx_fetch). */
     const bool hx = !p1 && hx_pool_ && !head_.configured() && (size_t)li < hx_ops_.size() &&
                     hx_ops_[(size_t)li].gu >= 0 && hx_ops_[(size_t)li].x;
-    /* ..._P1_HYBRID: a card-path layer of an armed decode pass may give RAM-cache units to the pool, which
+    /* ..._P1_HYBRID: a card-path layer of an armed decode pass (..._P1_HYBRID_PREFILL: of an armed prefill pass)
+     * may give RAM-cache units to the pool, which
      * needs the layer's rows and sorted order with the counts, as the CPU path's (hx_fetch). A layer whose
      * gate_up was never seen (no addresses yet) stays the card's whole. */
     const bool hyb = p1 && p1_hyb_layer_ok(li);
     if (p1 && p1_hyb_pass_ && !hyb) {
         const bool other = (size_t)li < hx_ops_.size() && hx_ops_[(size_t)li].x &&
                            hx_ops_[(size_t)li].x_level != pass_level_;
-        ++(other ? p1_hyb_st_.other_level : p1_hyb_st_.no_rows);
+        HybStats& hs = p1_hyb_cur();
+        ++(other ? hs.other_level : hs.no_rows);
     }
     /* Never seen at its gate_up (the first pass): nothing to fetch the rows from yet, so the CPU's
      * part waits for the gate_up's operands (hx_deferred) and the card gets aliases for all. */
@@ -1668,6 +1677,10 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
     if (xt && *xt && std::strcmp(xt, "1") != 0)
         why = fmt("%s=%s beside it: large-chunk prefill keeps EXACT_TALL's pins at every height; leave it unset "
                   "(or empty) or 1", kExactTallEnv, xt);
+    else if (ds41p1::dense_tiled_state() < 0)
+        why = fmt("%s=%s: 1 is on, 0 / unset / empty off", ds41p1::kDenseTiledEnv, std::getenv(ds41p1::kDenseTiledEnv));
+    else if (ds41p1::attn_wmma_state() < 0)
+        why = fmt("%s=%s: 1 is on, 0 / unset / empty off", ds41p1::kAttnWmmaEnv, std::getenv(ds41p1::kAttnWmmaEnv));
     else if (T != C)
         why = fmt("--max-num-batched-tokens is %lld: give %lld, the chunk the switch was set for (a step of "
                   "another size would run passes the bands below were not checked at, or fewer rows a chunk)",
@@ -1687,7 +1700,7 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
         RAD_ERR("%s=%lld (large-chunk prefill) refused: %s", kLcpEnv, (long long)C, why.c_str());
         return RAD_E_INVAL;
     }
-    int n_moe = 0, n_twin = 0, n_ops = 0, n_split = 0, n_runs = 0;
+    int n_moe = 0, n_twin = 0, n_ops = 0, n_split = 0, n_runs = 0, n_dense = 0, n_attn = 0;
     int64_t reach = 0;
     /* The multi-kernel ops admitted, by family: ops and the kernels seen. */
     std::map<std::string, std::pair<int, std::vector<std::string>>> fams;
@@ -1702,6 +1715,26 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
          * gemm_nt_f32 over a rank's 96 of 384 columns) and the indexer's runs (row_part > 0). */
         if ((op.op == "gemm_nt_f32" || op.op == "gemm_nt_f32bf16") && N == 96) ++n_split;
         if (op.op == "index_score" && op.base.get_i("row_part", &part) && part > 0) ++n_runs;
+        /* The fast forms (ds41p1::kDenseTiledEnv, exact; ds41p1::kAttnWmmaEnv, inexact by design): libr4d picks
+         * them inside the op's own row, so the row must say it takes the form asked for, every band of it. */
+        const bool want_dense = ds41p1::dense_tiled_state() == 1 && op.op == "gemm_nt_bf16f8";
+        const bool want_attn = ds41p1::attn_wmma_state() == 1 && op.op == "attn_sparse_sink";
+        if (want_dense || want_attn) {
+            const char* env = want_dense ? ds41p1::kDenseTiledEnv : ds41p1::kAttnWmmaEnv;
+            const char* mark = want_dense ? ds41p1::kDenseTiledMark : ds41p1::kAttnWmmaMark;
+            for (const Band& b : op.bands) {
+                const KernelRow* row = b.dom[RAD_DOMAIN_DEVICE].row;
+                const char* says = row && row->info ? row->info->computes : nullptr;
+                if (!says || !std::strstr(says, mark)) {
+                    RAD_ERR("%s=1 refused: op %zu (%s) resolves %s to %s, whose row does not name %s: load a "
+                            "libr4d.so built with the form, with %s=1 in its environment", env, h, op.op.c_str(),
+                            b.span.empty() ? "a band" : b.span.c_str(), row_name(b) ? row_name(b) : "nothing", mark,
+                            env);
+                    return RAD_E_INVAL;
+                }
+            }
+            ++(want_dense ? n_dense : n_attn);
+        }
         const char* ty = op.base.get_s("type");
         if (op.op == "moe_gemm_ggml" && ty && !std::strcmp(ty, "mxfp4")) {
             ++n_moe;
@@ -1733,6 +1766,18 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
                                     "libr4d.so built with the register-tiled twin, with %s=1 and %s=1 in its "
                                     "environment", ds41p1::kTiledEnv, h, ds41p1::kTwinRow, ds41p1::kTiledMark,
                                     ds41p1::kEnv, ds41p1::kTiledEnv);
+                            return RAD_E_INVAL;
+                        }
+                    }
+                    /* The WMMA twin (ds41p1::kWmmaEnv, inexact by design): the row must say it takes that form. */
+                    if (high && ds41p1::wmma_state() == 1) {
+                        const KernelRow* row = b.dom[RAD_DOMAIN_DEVICE].row;
+                        const char* says = row && row->info ? row->info->computes : nullptr;
+                        if (!says || !std::strstr(says, ds41p1::kWmmaMark)) {
+                            RAD_ERR("%s=1 refused: op %zu's %s does not run %s (its row does not name it): load a "
+                                    "libr4d.so built with the WMMA twin, with %s=1 and %s=1 in its environment",
+                                    ds41p1::kWmmaEnv, h, ds41p1::kTwinRow, ds41p1::kWmmaMark, ds41p1::kEnv,
+                                    ds41p1::kWmmaEnv);
                             return RAD_E_INVAL;
                         }
                     }
@@ -1808,6 +1853,14 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
                           (long long)kEpRouteLcpMax).c_str());
         return RAD_E_INVAL;
     }
+    if ((ds41p1::dense_tiled_state() == 1 && n_dense == 0) || (ds41p1::attn_wmma_state() == 1 && n_attn == 0)) {
+        const bool d = ds41p1::dense_tiled_state() == 1 && n_dense == 0;
+        RAD_ERR("%s=1 refused: the program has no %s op", d ? ds41p1::kDenseTiledEnv : ds41p1::kAttnWmmaEnv,
+                d ? "gemm_nt_bf16f8" : "attn_sparse_sink");
+        return RAD_E_INVAL;
+    }
+    lcp_dense_ops_ = n_dense;
+    lcp_attn_ops_ = n_attn;
     /* The compact floor may cross the sparse launcher's internal48-row threshold. LCP's env
      * pin is authoritative only for known untuned index rows from its actual admitted DSO. */
     const char* compact = std::getenv(deepseek41::kIndexCompactEnv);
@@ -1866,6 +1919,12 @@ int FileStager::tall_init(const Program& prog) {
         return RAD_E_INVAL;
     }
     if (lcp > 0) return lcp_init(prog, lcp);
+    lcp_dense_ops_ = lcp_attn_ops_ = 0;
+    for (const char* env : { ds41p1::kDenseTiledEnv, ds41p1::kAttnWmmaEnv })
+        if (const char* v = std::getenv(env); ds41p1::env_state(v) != 0) {
+            RAD_ERR("%s=%s refused: it acts on large-chunk prefill's passes, and %s is not set", env, v, kLcpEnv);
+            return RAD_E_INVAL;
+        }
     const int st = ds41_exact_tall_state();
     if (st < 0) {
         const char* v = std::getenv(kExactTallEnv);
@@ -2072,6 +2131,14 @@ int FileStager::hx_init(const Program& prog) {
             lcp_report();
             lcp_spec_report();
         }
+        if (lcp_dense_ops_)
+            RAD_INFO("%s %d (%s=1): %d gemm_nt_bf16f8 ops above 64 rows on %s -- every output the m64 kernel's bits",
+                     ds41p1::kLogDenseTiled, plan_->rank, ds41p1::kDenseTiledEnv, lcp_dense_ops_,
+                     ds41p1::kDenseTiledMark);
+        if (lcp_attn_ops_)
+            RAD_INFO("%s %d (%s=1): %d attn_sparse_sink ops at every height on %s -- q.k and sum p k summed in "
+                     "another f32 order: NOT the exact kernels' bits (an opt-in fast mode)",
+                     ds41p1::kLogAttnWmma, plan_->rank, ds41p1::kAttnWmmaEnv, lcp_attn_ops_, ds41p1::kAttnWmmaMark);
     }
     return rc;
 }
@@ -4580,6 +4647,7 @@ void FileStager::hx_drain() {
     aux_abandon();
     if (hx_reserved_ && hx_pool_) hx_pool_->unreserve(hx_reserved_);
     hx_reserved_ = 0;
+    p1_hyb_release_pre();
     if (hx_units_)
         for (int k = 0; k < hx_n_; ++k) mover_->release_host_unit(&hx_units_[k]);
     hx_n_ = 0;
@@ -4818,6 +4886,12 @@ int FileStager::end_pass(RadStream s) {
             if (r < 0 && p1_rc >= 0) p1_rc = r;
         }
         p1_lend_took_ = false;
+        /* ..._KV_LEND: every pass's end, behind which a slot the loan covers again reloads (p1_kv_sync). */
+        if (p1_kv_ev_ && !p1_kv_need_.empty()) {
+            const int r = s ? rad_event_record(p1_kv_ev_, s) : RAD_E_STATE;
+            p1_kv_rec_ = r >= 0;
+            if (r < 0 && p1_rc >= 0) p1_rc = r;
+        }
     }
     if (p1_armed_) {
         p1_armed_ = false;
@@ -4850,20 +4924,29 @@ int FileStager::end_pass(RadStream s) {
                 p1_hyb_st_.passes += p1_hyb_split_ ? 1 : 0;
             }
             p1_hyb_pass_ = false;
-        } else if (plan_->rank == 0) {
-            const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - p1_t0_).count();
-            long long avail_kb = -1;
-            if (FILE* f = std::fopen("/proc/meminfo", "r")) {
-                char line[256];
-                while (std::fgets(line, sizeof line, f))
-                    if (std::sscanf(line, "MemAvailable: %lld kB", &avail_kb) == 1) break;
-                std::fclose(f);
+        } else {
+            if (p1_hyb_pass_) {   /* ..._P1_HYBRID_PREFILL: armed prefill passes, and those that split a layer */
+                ++p1_hyb_pf_st_.armed;
+                p1_hyb_pf_st_.passes += p1_hyb_split_ ? 1 : 0;
+                p1_hyb_pf_st_.issue_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - p1_t0_).count();
             }
-            RAD_INFO("%s rows %lld, layers %llu (and %llu cut below %lld rows, on the CPU path), wall %.3f s "
-                     "(issue), rank 0 drive units %llu, %.2f GB/s, MemAvailable %lld MiB", ds41p1::kLogChunk,
-                     (long long)p1_pass_rows_, (unsigned long long)p1_layers_, (unsigned long long)p1_cpu_layers_,
-                     (long long)p1_min_rows_, wall, (unsigned long long)du,
-                     wall > 0 ? (double)db * 1e-9 / wall : 0.0, avail_kb >= 0 ? avail_kb / 1024 : -1);
+            p1_hyb_pass_ = false;
+            if (plan_->rank == 0) {
+                const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - p1_t0_).count();
+                long long avail_kb = -1;
+                if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+                    char line[256];
+                    while (std::fgets(line, sizeof line, f))
+                        if (std::sscanf(line, "MemAvailable: %lld kB", &avail_kb) == 1) break;
+                    std::fclose(f);
+                }
+                RAD_INFO("%s rows %lld, layers %llu (and %llu cut below %lld rows, on the CPU path), wall %.3f s "
+                         "(issue), rank 0 drive units %llu, %.2f GB/s, MemAvailable %lld MiB", ds41p1::kLogChunk,
+                         (long long)p1_pass_rows_, (unsigned long long)p1_layers_, (unsigned long long)p1_cpu_layers_,
+                         (long long)p1_min_rows_, wall, (unsigned long long)du,
+                         wall > 0 ? (double)db * 1e-9 / wall : 0.0, avail_kb >= 0 ? avail_kb / 1024 : -1);
+            }
         }
     }
     /* An early-issued layer whose gather never came is lost too: its card ops ran on aliases. */
@@ -4935,6 +5018,11 @@ int FileStager::p1_init(const Program& prog) {
                     ds41p1::kEnv);
             return RAD_E_INVAL;
         }
+        if (const char* wv = std::getenv(ds41p1::kWmmaEnv); ds41p1::env_state(wv) != 0) {
+            RAD_ERR("%s=%s refused: it chooses the P1 twin's kernel, and %s is not on", ds41p1::kWmmaEnv, wv,
+                    ds41p1::kEnv);
+            return RAD_E_INVAL;
+        }
         return RAD_OK;
     }
     auto refuse = [&](const std::string& why) {
@@ -4954,6 +5042,20 @@ int FileStager::p1_init(const Program& prog) {
     if (t.lend_heat > 0 && t.lend <= 0 && t.lend_arena <= 0 && t.lend_slab <= 0)
         return refuse(fmt("%s=%d moves lent slots between units, and none is lent (%s, %s or %s)", ds41p1::kLendHeatEnv,
                           t.lend_heat, ds41p1::kLendEnv, ds41p1::kLendArenaEnv, ds41p1::kLendSlabEnv));
+    /* The WMMA twin (..._P1_WMMA, inexact by design): gfx12's v_wmma_f32_16x16x16_bf16 on every card, and not
+     * beside the host verify, which would count each rounding difference as a differing row. */
+    if (t.wmma) {
+        if (t.verify > 0)
+            return refuse(fmt("%s=1 beside the host verify (%s=%d): the WMMA twin is not the CPU's bits by design, so "
+                              "every verified row would differ", ds41p1::kWmmaEnv, ds41p1::kVerifyEnv, t.verify));
+        for (int d = 0; d < rad_dev_count(); ++d) {
+            RadDeviceProps dp{};
+            if (rad_dev_props(d, &dp) < 0) continue;
+            if (std::strncmp(dp.arch, "gfx12", 5) != 0)
+                return refuse(fmt("%s=1 needs gfx12's bf16 WMMA (RDNA4), and device %d reports %s", ds41p1::kWmmaEnv,
+                                  d, dp.arch[0] ? dp.arch : "no architecture"));
+        }
+    }
     /* Decode passes on the cards (..._P1_DECODE_ROWS): a pass is at most the chunk, so a threshold above it would
      * never arm; and a split pass (the two-batch overlap, sched/tbo.h) issues each routed layer's expert ops
      * twice, which the card path refuses (it takes a layer's rows in one launch). */
@@ -4961,9 +5063,13 @@ int FileStager::p1_init(const Program& prog) {
     /* Hybrid decode (..._P1_HYBRID, p1_hybrid.h): decode passes the card path takes only; the host verify and the
      * CPU path's verify policy compare card rows the CPU units do not have; speculation, a drafter and the aux
      * expert worker are not covered (refused together for now). */
-    if (t.hybrid > 0) {
+    /* Hybrid prefill (..._P1_HYBRID_PREFILL): the same split in armed prefill passes, under the same refusals but
+     * the decode threshold's. */
+    if (t.hybrid > 0 || t.hybrid_prefill > 0) {
         const char* aux = std::getenv("RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS");
-        const char* no = t.decode_rows <= 0 ? "it splits decode passes the card path takes, and none is armed (..._P1_DECODE_ROWS is 0)"
+        const char* const env = t.hybrid > 0 ? ds41p1::kHybridEnv : ds41p1::kHybridPrefillEnv;
+        const int pct = t.hybrid > 0 ? t.hybrid : t.hybrid_prefill;
+        const char* no = t.hybrid > 0 && t.decode_rows <= 0 ? "it splits decode passes the card path takes, and none is armed (..._P1_DECODE_ROWS is 0)"
                        : t.verify > 0 ? "the host verify (..._P1_VERIFY) compares card rows the CPU's units do not have"
                        : hx_policy_ == kHxVerify ? "..._HOST_EXPERTS_POLICY=verify compares card rows the CPU's units do not have"
                        : prog.ctx.max_spec > 0 || lcp_spec_ ? "speculation is on"
@@ -4971,14 +5077,31 @@ int FileStager::p1_init(const Program& prog) {
                        : aux && *aux && std::strcmp(aux, "0") ? "the aux expert worker (RADIANCE_EXPERIMENTAL_DS41_AUX_EXPERTS) is on"
                        : !hx_pool_ || !hx_units_ ? "no CPU pool"
                        : nullptr;
-        if (no) return refuse(fmt("%s=%d: %s", ds41p1::kHybridEnv, t.hybrid, no));
+        if (no) return refuse(fmt("%s=%d: %s", env, pct, no));
         if (!p1_hyb_ev_ && rad_event_create_local(&p1_hyb_ev_) < 0) {
             p1_hyb_ev_ = nullptr;
-            return refuse(fmt("%s=%d: could not create its event", ds41p1::kHybridEnv, t.hybrid));
+            return refuse(fmt("%s=%d: could not create its event", env, pct));
         }
-        p1_hyb_share_.init(t.hybrid, t.hybrid_adapt);
+        /* ..._P1_HYBRID_CAL (p1_hybrid.h "calibration"): calibrated, the share may grow to 4P (P was chosen against
+         * the model rate); coupled, the process's one share a kind starts there too (every rank inits it the same). */
+        const bool cal = (t.hybrid_cal & ds41p1::kHybridCalRate) != 0, cpl = (t.hybrid_cal & ds41p1::kHybridCalCouple) != 0;
+        const int ceil_dec = cal ? p1hyb::cal_ceiling(t.hybrid, ds41p1::kMaxHybridPct) : 0;
+        const int ceil_pf = cal ? p1hyb::cal_ceiling(t.hybrid_prefill, ds41p1::kMaxHybridPct) : 0;
+        if (t.hybrid > 0) p1_hyb_share_.init(t.hybrid, t.hybrid_adapt, ceil_dec);
+        if (t.hybrid_prefill > 0) p1_hyb_pf_share_.init(t.hybrid_prefill, t.hybrid_adapt, ceil_pf);
+        if (cpl && t.hybrid > 0) p1hyb::coupled_share(0).init(t.hybrid, t.hybrid_adapt, ceil_dec);
+        if (cpl && t.hybrid_prefill > 0) p1hyb::coupled_share(1).init(t.hybrid_prefill, t.hybrid_adapt, ceil_pf);
+        if (cal) p1hyb::rate_cal().init(hx_pool_->cpu_bytes_per_ns());
         p1_hyb_st_ = HybStats{};
+        p1_hyb_pf_st_ = HybStats{};
+        p1_hyb_cal_n_[0] = p1_hyb_cal_n_[1] = 0;
+    } else if (t.hybrid_cal > 0) {
+        return refuse(fmt("%s=%d calibrates the hybrid split, and neither %s nor %s is on", ds41p1::kHybridCalEnv,
+                          t.hybrid_cal, ds41p1::kHybridEnv, ds41p1::kHybridPrefillEnv));
     }
+    if (t.lend_arena_split && t.lend_arena <= 0)
+        return refuse(fmt("%s=1 gives the lent arena's slots a take-back of their own, and none is lent (%s)",
+                          ds41p1::kLendArenaSplitEnv, ds41p1::kLendArenaEnv));
     if (t.lend_audit && t.lend <= 0 && t.lend_arena <= 0 && t.lend_slab <= 0)
         return refuse(fmt("%s=1 reads lent slots back, and none is lent (%s, %s or %s)", ds41p1::kLendAuditEnv,
                           ds41p1::kLendEnv, ds41p1::kLendArenaEnv, ds41p1::kLendSlabEnv));
@@ -5152,6 +5275,33 @@ int FileStager::p1_init(const Program& prog) {
                  ds41p1::kLogHybrid, ds41p1::kDecodeRowsEnv, (long long)p1_decode_rows_, t.hybrid, ds41p1::kHybridEnv,
                  t.hybrid, hx_pool_->cpu_bytes_per_ns(), hx_pool_->link_bytes_per_ns(),
                  t.hybrid_adapt ? "adapts per rank from each layer's outcome, at most that" : "held (..._P1_HYBRID_ADAPT=0)");
+    if (plan_->rank == 0 && t.hybrid_prefill > 0)
+        RAD_INFO("%s: in a prefill pass armed for the cards (%lld rows or more), each card-path routed layer gives the CPU "
+                 "pool the RAM-cache units with the fewest rows while the pool's predicted time stays within %d%% of the "
+                 "card's predicted link time for the rest (%s=%d; pool %.1f GB/s, link %.1f GB/s, a share of its own that "
+                 "%s); the pool is shared, so a rank with more to stage keeps more of it; those units are skipped by the "
+                 "card's ops and in no wave, their rows copied over the owning card's before its gather; drive misses and "
+                 "every other pass as without it; counts in the shutdown stats line",
+                 ds41p1::kLogHybridPrefill, (long long)p1_min_rows_, t.hybrid_prefill, ds41p1::kHybridPrefillEnv,
+                 t.hybrid_prefill, hx_pool_->cpu_bytes_per_ns(), hx_pool_->link_bytes_per_ns(),
+                 t.hybrid_adapt ? "adapts per rank from each layer's outcome, at most that" : "is held (..._P1_HYBRID_ADAPT=0)");
+    if (plan_->rank == 0 && t.hybrid_cal > 0 && (t.hybrid > 0 || t.hybrid_prefill > 0))
+        RAD_INFO("ds41 p1: hybrid calibration on (%s=%d): %s; %s; selection only (which side computes a unit, never its "
+                 "rows' bytes); counts in the shutdown stats line",
+                 ds41p1::kHybridCalEnv, t.hybrid_cal,
+                 (t.hybrid_cal & ds41p1::kHybridCalRate)
+                     ? "the split's CPU rate learnt from each split layer's completion (an EWMA a pass kind over every rank, "
+                       "from the pool's model rate), the share's ceiling 4P"
+                     : "the pool's model rate",
+                 (t.hybrid_cal & ds41p1::kHybridCalCouple)
+                     ? "one share a pass kind for every rank, and the choice with its reservation under the pool's decide lock"
+                     : "a share a rank");
+    if (plan_->rank == 0 && t.early > 0)
+        RAD_INFO("ds41 p1: early ring copies on (%s=%d): behind each card-path layer's waves, up to %d RAM-cache units "
+                 "of the pass's next card-path layer, the profile's likeliest first, are copied into the ring before its "
+                 "routing counts; a selected one is a wave's from its early slot, the rest go unread; counts in the "
+                 "shutdown stats line",
+                 ds41p1::kEarlyEnv, t.early, std::min(t.early, p1_->ring_slots()));
     if (plan_->rank == 0 && lcp_spec_)
         RAD_INFO("ds41 p1: prompt-lookup speculation admitted (--num-speculative-tokens %d, no draft head): a verify "
                  "step of at most %lld decode rows never arms the card path; its residents run in the plugin's own ops "
@@ -5263,9 +5413,27 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
                        t.lend_arena, cand.size(), std::max(k, 0));
         return RAD_E_INVAL;
     }
-    /* The lent slots' units in the lender's order: the ring's, the arena's, the slab's. */
-    const int nk = std::max(k, 0), nra = nk + std::max(ka, 0), ns = (int)slab_units.size(), n = nra + ns;
-    std::vector<int32_t> lent(cand.begin(), cand.begin() + nra);
+    /* The KV pool's lent slots (p1_kv_set): the next hottest units after the arena's, as many as are left and the
+     * lender holds (the slots come ordered by their covering loan, so the hottest go where the loan reaches first). */
+    const int nra0 = std::max(k, 0) + std::max(ka, 0);
+    const int nkv = p1_kv_at_.empty() ? 0
+        : std::max(0, std::min({ (int)p1_kv_at_.size(), (int)cand.size() - nra0, 2 * ds41p1::kMaxLend - nra0 }));
+    if (!p1_kv_at_.empty() && nkv <= 0) {
+        if (why) *why = fmt("%s=1: no file-tier unit left for the KV pool's %zu slots, or the lender is full", ds41p1::kKvLendEnv,
+                            p1_kv_at_.size());
+        return RAD_E_INVAL;
+    }
+    p1_kv_at_.resize((size_t)nkv);
+    p1_kv_need_.resize((size_t)nkv);
+    if (nkv > 0 && !p1_kv_ev_ && rad_event_create_local(&p1_kv_ev_) < 0) {
+        p1_kv_ev_ = nullptr;
+        if (why) *why = "could not create the KV pool's lent slots' event";
+        return RAD_E_DEVICE;
+    }
+    p1_kv_rec_ = false;
+    /* The lent slots' units in the lender's order: the ring's, the arena's, the KV pool's, the slab's. */
+    const int nk = std::max(k, 0), nra = nk + std::max(ka, 0), ns = (int)slab_units.size(), n = nra + nkv + ns;
+    std::vector<int32_t> lent(cand.begin(), cand.begin() + nra + nkv);
     lent.insert(lent.end(), slab_units.begin(), slab_units.end());
     std::vector<p1::CardExpertPath::LendUnit> units((size_t)n);
     for (int i = 0; i < n; ++i) {
@@ -5310,7 +5478,7 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
                 prior_rows_lendable += heat->heat(u);
             }
     }
-    RAD_TRY(p1_->lend_init(units, slots, at, slab_at, t.grace_ms, t.lend_audit, why));
+    RAD_TRY(p1_->lend_init(units, slots, at, slab_at, t.grace_ms, t.lend_audit, why, p1_kv_at_));
     /* The rest after a long prefill (..._P1_LEND_REST_MS; by default with the heat or the slab only). */
     p1_->lend_set_rest(t.lend_rest_ms);
     if (plan_->rank == 0 && t.lend_rest_ms > 0)
@@ -5385,6 +5553,13 @@ int FileStager::p1_lend_init(const p1::Tunables& t, const std::vector<char*>& ar
                  ds41p1::kLogLendArena, ka, ds41p1::kLendArenaEnv, t.lend_arena, arena.size(),
                  (long long)p1_arena_rows_, ka, share, (long long)p1_arena_rows_, t.grace_ms, ds41p1::kGraceEnv);
     }
+    if (plan_->rank == 0 && !at.empty() && t.lend_arena_split)
+        RAD_INFO("%s: on (%s=1): the %d arena slots are taken back only by a step at the full plan (above %lld "
+                 "tokens), the only step whose buffers reach them; a card-path pass below it (an armed decode pass "
+                 "among them) takes the ring's %d slots alone and leaves the arena's residents published, as the "
+                 "slab's; the arena's slots return %d ms after the last full step, and in a pass that takes the ring "
+                 "an arena slot's reload begins only from the RAM cache; counts in the shutdown stats line",
+                 ds41p1::kLogLendArenaSplit, ds41p1::kLendArenaSplitEnv, ka, (long long)p1_arena_rows_, nk, t.grace_ms);
     if (plan_->rank == 0 && p1_heat_) {
         /* What the heat starts from: the prior's rows and where its shares came from, or none. */
         const std::string prior =
@@ -5469,6 +5644,52 @@ void FileStager::p1_heat_policy() {
                         owner);
 }
 
+/* ..._KV_LEND, at a pass's begin on the issuing thread, before the lender's begin_pass and the pass's first op:
+ * the cache's target loan (the scheduler lowered it before it handed out any block above it, and this pass is the
+ * first that can write such a block) withdraws every slot it no longer covers, a queued copy fenced on the compute
+ * stream; then, only behind the end of the pass before (the last that could have read or written a block the loan
+ * covers again), the DMA lane waits on that end and the slots the target covers become available. */
+void FileStager::p1_kv_sync() {
+    p1::CardExpertPath& path = *p1_;
+    const int first = path.lend_kv_first(), nkv = path.lend_kv_slots();
+    if (first < 0 || nkv <= 0 || !p1_kv_target_) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    p1::RingLender& l = path.lender();
+    p1::CardExpertPath::Counts& c = path.counts_mut();
+    const int64_t target = std::max<int64_t>(p1_kv_target_(), 0);
+    c.kv_target_max = std::max<uint64_t>(c.kv_target_max, (uint64_t)target);
+    bool grow = false, shrank = false;
+    for (int i = 0; i < nkv && (size_t)i < p1_kv_need_.size(); ++i) {
+        const int k = first + i;
+        const bool covered = p1_kv_need_[(size_t)i] <= target;
+        if (!covered && l.avail(k)) {
+            (void)l.set_avail(k, false);
+            ++c.kv_withdrawn;
+            shrank = true;
+        } else if (covered && !l.avail(k)) {
+            grow = true;
+        }
+    }
+    if (shrank) ++c.kv_reclaims;
+    if (grow && p1_kv_rec_ && p1_kv_ev_ && mover_->mover_wait(p1_kv_ev_) >= 0)
+        for (int i = 0; i < nkv && (size_t)i < p1_kv_need_.size(); ++i) {
+            const int k = first + i;
+            if (p1_kv_need_[(size_t)i] <= target && !l.avail(k)) {
+                (void)l.set_avail(k, true);
+                ++c.kv_given;
+            }
+        }
+    int avail = 0;
+    for (int i = 0; i < nkv; ++i) avail += l.avail(first + i);
+    c.kv_avail_peak = std::max<uint64_t>(c.kv_avail_peak, (uint64_t)avail);
+    int res = 0;
+    for (int i = 0; i < nkv; ++i) res += l.resident(first + i);
+    c.kv_res_peak = std::max<uint64_t>(c.kv_res_peak, (uint64_t)res);
+    c.kv_res_sum += (uint64_t)res;
+    ++c.kv_passes;
+    c.kv_sync_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+
 /* The lent arena: the engine bound the arena's smallest level (steps of up to `rows` tokens) and hands
  * over the top above its buffers and guard; the lending starts with as many whole slots as fit there
  * (at most ..._P1_LEND_ARENA), the ring's (..._P1_LEND) beside them. */
@@ -5535,6 +5756,12 @@ int FileStager::p1_layer(int32_t li, RadStream s, bool hyb) {
                 L.layer, (int)hx_li_, hx_n_, (long long)hx_reserved_);
         return RAD_E_STATE;
     }
+    /* ..._P1_HYBRID_CAL's couple bit: what the choice reserved and no borrow drew goes back after the borrows, or
+     * on any early return. */
+    struct PreBack {
+        FileStager* fs;
+        ~PreBack() { fs->p1_hyb_release_pre(); }
+    } pre_back{ this };
     const bool split = hyb && p1_hyb_pick(li) > 0;
     for (size_t i = 0; i < want_.size(); ++i) {
         const int32_t u = want_[i];
@@ -5556,6 +5783,7 @@ int FileStager::p1_layer(int32_t li, RadStream s, bool hyb) {
         p1_ram_.push_back(hit ? 1 : 0);
         ++p1_units_;
     }
+    p1_hyb_release_pre();
     /* The layer's selected units pinned in the host pool: copied from their pool slots as a RAM-cache
      * unit is, and published skipped like the others until the layer is released. */
     p1_pool_sel_.clear();
@@ -5584,7 +5812,7 @@ int FileStager::p1_layer(int32_t li, RadStream s, bool hyb) {
     pending_[b] = false;
     if (!staged_[b].empty()) holds_[b] = li;
     if (hx_n_ > 0) RAD_TRY(p1_hyb_submit(li));
-    if (hyb) p1_hyb_st_.card_units += (uint64_t)p1_units_;
+    if (hyb) p1_hyb_cur().card_units += (uint64_t)p1_units_;
     RAD_TRY(p1_->start());
     /* The next routed layer's likely misses: its file-tier units neither in the slab nor in the RAM
      * cache, by the sealed profile's share (best first). */
@@ -5604,10 +5832,25 @@ int FileStager::p1_layer(int32_t li, RadStream s, bool hyb) {
     return RAD_OK;
 }
 
+int FileStager::p1_early(int32_t li) {
+    const int32_t nx = li + 1;
+    if ((size_t)nx >= layers_.size() || !will_issue(nx) || !p1_layer_on(nx)) return RAD_OK;
+    const std::vector<int32_t>* pooled = (size_t)nx < p1_pool_.size() ? &p1_pool_[(size_t)nx] : nullptr;
+    p1_early_.clear();
+    for (int32_t u : layers_[(size_t)nx].units) {
+        if (mover_->ring_resident(u) || mover_->file_unit_in_slab(u) || !mover_->unit_cached(u)) continue;
+        if (pooled && std::find(pooled->begin(), pooled->end(), u) != pooled->end()) continue;
+        p1_early_.push_back(u);
+    }
+    std::stable_sort(p1_early_.begin(), p1_early_.end(), [&](int32_t a, int32_t c) {
+        return plan_->units[(size_t)a].profile_share > plan_->units[(size_t)c].profile_share;
+    });
+    return p1_->early(nx, p1_early_);
+}
+
 /* ..._P1_HYBRID (p1_hybrid.h): the layer's selected units (want_) as candidates, slab units neither side's,
  * and the pool's cost model's choice into p1_hyb_to_. Returns the units chosen. */
 int FileStager::p1_hyb_pick(int32_t li) {
-    (void)li;
     const size_t n = want_.size();
     p1_hyb_cand_.assign(n, p1hyb::Cand{});
     p1_hyb_to_.assign(n, 0);
@@ -5618,16 +5861,45 @@ int FileStager::p1_hyb_pick(int32_t li) {
         p1hyb::Cand& c = p1_hyb_cand_[i];
         c.rows = e >= 0 && e < counts_cap_ ? counts_host_[e] : 0;
         c.bytes = plan_->units[(size_t)u].bytes;
-        c.cached = mover_->unit_cached(u);
+        /* An early copy waits in the ring for this unit (p1_early): the card's, as any ring unit. */
+        c.cached = mover_->unit_cached(u) && !(p1_ && p1_->early_for(li, u));
     }
-    const p1hyb::Split sp = p1hyb::choose(p1_hyb_cand_.data(), (int)n, hx_pool_->backlog(), hx_pool_->cpu_bytes_per_ns(),
-                                          hx_pool_->link_bytes_per_ns(), p1_hyb_share_.share(), p1_hyb_to_.data(),
-                                          &p1_hyb_order_);
+    p1_hyb_release_pre();
+    /* ..._P1_HYBRID_CAL's couple bit: the backlog read, the choice and the reservation of its whole cost under the
+     * pool's decide lock, so a rank deciding at the same time sees this choice whole (p1_hybrid.h "calibration"). */
+    std::unique_lock<std::mutex> lk;
+    if (p1_hyb_coupled()) lk = std::unique_lock<std::mutex>(hx_pool_->decide_mu());
+    const int64_t backlog = hx_pool_->backlog();
+    const p1hyb::Split sp = p1hyb::choose(p1_hyb_cand_.data(), (int)n, backlog, p1_hyb_cpu_rate(),
+                                          hx_pool_->link_bytes_per_ns(), p1_hyb_share_now(), p1_hyb_to_.data(),
+                                          &p1_hyb_order_, HostExpertPool::kernel_cost());
+    if (lk.owns_lock() && sp.n_cpu > 0) {
+        hx_pool_->reserve(sp.cpu_cost);
+        p1_hyb_pre_ = sp.cpu_cost;
+    }
+    if (lk.owns_lock()) lk.unlock();
+    p1_hyb_seen_ = std::max<int64_t>(backlog, 0);
     if (sp.n_cpu > 0) {
-        p1_hyb_st_.pred_cpu_ns += sp.cpu_ns;
-        p1_hyb_st_.pred_card_ns += sp.card_ns;
+        p1_hyb_cur().pred_cpu_ns += sp.cpu_ns;
+        p1_hyb_cur().pred_card_ns += sp.card_ns;
     }
     return sp.n_cpu;
+}
+
+/* ..._P1_HYBRID_CAL's couple bit: the choice's reservation that no borrow drew (units the cache no longer gave, which
+ * went to the ring) goes back once the layer's borrows are done. */
+void FileStager::p1_hyb_release_pre() {
+    if (p1_hyb_pre_ > 0 && hx_pool_) hx_pool_->unreserve(p1_hyb_pre_);
+    p1_hyb_pre_ = 0;
+}
+
+/* The CPU rate the split charges: RateCal's for the pass kind under ..._P1_HYBRID_CAL's rate bit, else the model's. */
+double FileStager::p1_hyb_cpu_rate() const {
+    if (p1_hyb_calibrated()) {
+        const double r = p1hyb::rate_cal().bytes_per_ns(p1_hyb_kind());
+        if (r > 0) return r;
+    }
+    return hx_pool_->cpu_bytes_per_ns();
 }
 
 /* ..._P1_HYBRID: unit u (rows this pass; the admission's touch) leased into the pool's next unit, as the CPU path
@@ -5646,14 +5918,18 @@ bool FileStager::p1_hyb_borrow(int32_t u, int rows, bool admit) {
                 ++hx_n_;
                 p1_hyb_cpu_.push_back(u);
                 const int64_t c = HostExpertPool::cost_rows(std::max(rows, 1));
-                hx_pool_->reserve(c);
+                /* Coupled: drawn from the choice's reservation (p1_hyb_pick), the rest reserved here. */
+                const int64_t pre = std::min(p1_hyb_pre_, c);
+                p1_hyb_pre_ -= pre;
+                if (c > pre) hx_pool_->reserve(c - pre);
                 hx_reserved_ += c;
+                p1_hyb_cur().cost_bytes += c;
                 return true;
             }
             mover_->release_host_unit(&hu);
         }
     }
-    ++p1_hyb_st_.fell_back;
+    ++p1_hyb_cur().fell_back;
     return false;
 }
 
@@ -5665,11 +5941,14 @@ int FileStager::p1_hyb_submit(int32_t li) {
     hx_stage_ = 1;
     p1_hyb_li_ = li;
     p1_hyb_split_ = true;
+    hx_ticket_.last_ns.store(0, std::memory_order_relaxed);   /* p1_hyb_done reads the pool's finish */
+    p1_hyb_drain_ = p1_hyb_seen_ + hx_reserved_;               /* ..._P1_HYBRID_CAL: the cost the pool drains for it */
     p1_hyb_t_sub_ = std::chrono::steady_clock::now();
     RAD_TRY(hx_submit());
-    ++p1_hyb_st_.layers;
-    p1_hyb_st_.cpu_units += (uint64_t)p1_hyb_cpu_.size();
-    p1_hyb_st_.cpu_rows += (uint64_t)hx_rows_.size();
+    HybStats& hs = p1_hyb_cur();
+    ++hs.layers;
+    hs.cpu_units += (uint64_t)p1_hyb_cpu_.size();
+    hs.cpu_rows += (uint64_t)hx_rows_.size();
     return RAD_OK;
 }
 
@@ -5677,16 +5956,31 @@ int FileStager::p1_hyb_submit(int32_t li) {
  * the pool was done before the thread came, late when the card had also run the layer's waves (the event
  * after_op recorded behind them has passed); the share adapts from it. */
 void FileStager::p1_hyb_done(bool early, uint64_t waited_ns) {
-    p1_hyb_st_.cpu_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             std::chrono::steady_clock::now() - p1_hyb_t_sub_).count();
-    p1_hyb_st_.wait_ns += waited_ns;
-    const bool late = !early && p1_hyb_rec_ && rad_event_query(p1_hyb_ev_) == 1;
-    if (early) ++p1_hyb_st_.early;
-    if (late) {
-        ++p1_hyb_st_.late;
-        p1_hyb_st_.late_wait_ns += waited_ns;
+    HybStats& hs = p1_hyb_cur();
+    hs.cpu_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now() - p1_hyb_t_sub_).count();
+    hs.wait_ns += waited_ns;
+    /* The pool's own finish (the ticket is done: hx_finish waited for it). */
+    const int64_t sub = (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            p1_hyb_t_sub_.time_since_epoch()).count();
+    const int64_t fin = hx_ticket_.last_ns.load(std::memory_order_relaxed);
+    if (fin > 0) {
+        hs.pool_ns += (uint64_t)std::max<int64_t>(fin - sub, 0);
+        ++hs.pool_layers;
+        /* ..._P1_HYBRID_CAL's rate bit: the pool's real rate on what it drained for this layer. */
+        if (p1_hyb_calibrated() && fin > sub) {
+            p1hyb::rate_cal().sample(p1_hyb_kind(), p1_hyb_drain_, fin - sub);
+            ++p1_hyb_cal_n_[p1_hyb_kind()];
+        }
     }
-    p1_hyb_share_.layer(early, late);
+    const bool late = !early && p1_hyb_rec_ && rad_event_query(p1_hyb_ev_) == 1;
+    if (early) ++hs.early;
+    if (late) {
+        ++hs.late;
+        hs.late_wait_ns += waited_ns;
+    }
+    if (p1_hyb_coupled()) p1hyb::coupled_share(p1_hyb_kind()).layer(early, late);
+    else p1_hyb_shr().layer(early, late);
     p1_hyb_li_ = -1;
     p1_hyb_rec_ = false;
 }
@@ -5743,6 +6037,7 @@ int FileStager::after_op(rad_op h, RadStream s) {
     /* ..._P1_HYBRID: an event behind the layer's waves, which hx_finish queries once the CPU's rows are in:
      * passed means the card had nothing left of the layer and waited for them (a late layer). */
     if (p1_hyb_li_ == li && hx_li_ == li && hx_stage_ == 2 && rad_event_record(p1_hyb_ev_, s) >= 0) p1_hyb_rec_ = true;
+    if (p1_->tunables().early > 0) RAD_TRY(p1_early(li));
     if (p1_->tunables().verify > 0) return p1_verify(li, s);
     return RAD_OK;
 }
@@ -5854,7 +6149,7 @@ std::string FileStager::p1_stats_line() const {
     std::string line = p1_->stats_line(plan_ ? plan_->rank : 0);
     const auto& sc = p1_->sched();
     const uint64_t ring = sc.ram + sc.drive + sc.pool;
-    const uint64_t cpu = p1_hyb_st_.cpu_units;   /* ..._P1_HYBRID's units: neither residents nor the ring's */
+    const uint64_t cpu = p1_hyb_st_.cpu_units + p1_hyb_pf_st_.cpu_units;   /* ..._P1_HYBRID(_PREFILL)'s units: neither residents nor the ring's */
     line += fmt("; touched experts %llu: VRAM residents %llu, slab %llu, ring %llu%s; admission orders moved %llu",
                 (unsigned long long)p1_touched_,
                 (unsigned long long)(p1_touched_ >= ring + p1_slab_ + cpu ? p1_touched_ - ring - p1_slab_ - cpu : 0),
@@ -5880,13 +6175,50 @@ std::string FileStager::p1_stats_line() const {
         line += fmt("; hybrid: passes split %llu of %llu armed, layers %llu, units CPU %llu / card %llu (fell back %llu, "
                     "layers without rows %llu, rows at the other arena level %llu), CPU rows %llu, CPU %.3f s (%.4f s a pass) against issue %.4f s a pass, "
                     "predicted CPU %.3f s / card %.3f s, gather wait %.3f s, late layers %llu (wait %.3f s), early layers "
-                    "%llu, share %.1f%% (lowest %.1f%%)",
+                    "%llu, share %.1f%% (lowest %.1f%%), pool done %.3f s after the submits (%.4f s a pass, %llu layers), "
+                    "cost %.1f GB",
                     (unsigned long long)h.passes, (unsigned long long)h.armed, (unsigned long long)h.layers,
                     (unsigned long long)h.cpu_units, (unsigned long long)h.card_units, (unsigned long long)h.fell_back,
                     (unsigned long long)h.no_rows, (unsigned long long)h.other_level, (unsigned long long)h.cpu_rows, (double)h.cpu_ns * 1e-9,
                     (double)h.cpu_ns * per, (double)p1_dec_ns_ * per, h.pred_cpu_ns * 1e-9, h.pred_card_ns * 1e-9,
                     (double)h.wait_ns * 1e-9, (unsigned long long)h.late, (double)h.late_wait_ns * 1e-9,
-                    (unsigned long long)h.early, 100.0 * p1_hyb_share_.share(), 100.0 * p1_hyb_share_.min_seen());
+                    (unsigned long long)h.early, 100.0 * p1_hyb_share_.share(), 100.0 * p1_hyb_share_.min_seen(),
+                    (double)h.pool_ns * 1e-9, (double)h.pool_ns * per, (unsigned long long)h.pool_layers,
+                    (double)h.cost_bytes * 1e-9);
+    }
+    /* ..._P1_HYBRID_PREFILL: the same for armed prefill passes (ab_window.sh's Qyp arm is measured only if some rank
+     * split one); the issue time is the armed prefill passes' own. */
+    if (p1_tun_.hybrid_prefill > 0) {
+        const HybStats& h = p1_hyb_pf_st_;
+        const double per = h.armed ? 1e-9 / (double)h.armed : 0;
+        line += fmt("; hybrid prefill: passes split %llu of %llu armed, layers %llu, units CPU %llu / card %llu (fell back "
+                    "%llu, layers without rows %llu, rows at the other arena level %llu), CPU rows %llu, CPU %.3f s (%.4f s "
+                    "a pass) against issue %.4f s a pass, predicted CPU %.3f s / card %.3f s, gather wait %.3f s, late "
+                    "layers %llu (wait %.3f s), early layers %llu, share %.1f%% (lowest %.1f%%), pool done %.3f s after "
+                    "the submits (%.4f s a pass, %llu layers), cost %.1f GB",
+                    (unsigned long long)h.passes, (unsigned long long)h.armed, (unsigned long long)h.layers,
+                    (unsigned long long)h.cpu_units, (unsigned long long)h.card_units, (unsigned long long)h.fell_back,
+                    (unsigned long long)h.no_rows, (unsigned long long)h.other_level, (unsigned long long)h.cpu_rows,
+                    (double)h.cpu_ns * 1e-9, (double)h.cpu_ns * per, (double)h.issue_ns * per, h.pred_cpu_ns * 1e-9,
+                    h.pred_card_ns * 1e-9, (double)h.wait_ns * 1e-9, (unsigned long long)h.late,
+                    (double)h.late_wait_ns * 1e-9, (unsigned long long)h.early, 100.0 * p1_hyb_pf_share_.share(),
+                    100.0 * p1_hyb_pf_share_.min_seen(), (double)h.pool_ns * 1e-9, (double)h.pool_ns * per,
+                    (unsigned long long)h.pool_layers, (double)h.cost_bytes * 1e-9);
+    }
+    /* ..._P1_HYBRID_CAL: the calibrated rates (process-wide) and this rank's samples, and the coupled shares; the
+     * share fields above are this rank's own, which a coupled split does not move. ab_window.sh's Qyc gate reads it. */
+    if (p1_tun_.hybrid_cal > 0 && (p1_tun_.hybrid > 0 || p1_tun_.hybrid_prefill > 0)) {
+        const bool cal = p1_hyb_calibrated();
+        line += fmt("; hybrid calibration %d: pool rate decode %.1f GB/s (%llu samples), prefill %.1f GB/s (%llu samples), "
+                    "model %.1f GB/s; shares %s",
+                    p1_tun_.hybrid_cal, cal ? p1hyb::rate_cal().bytes_per_ns(0) : hx_pool_->cpu_bytes_per_ns(),
+                    (unsigned long long)p1_hyb_cal_n_[0], cal ? p1hyb::rate_cal().bytes_per_ns(1) : hx_pool_->cpu_bytes_per_ns(),
+                    (unsigned long long)p1_hyb_cal_n_[1], hx_pool_->cpu_bytes_per_ns(),
+                    p1_hyb_coupled()
+                        ? fmt("coupled, decode %.1f%% (lowest %.1f%%), prefill %.1f%% (lowest %.1f%%)",
+                              100.0 * p1hyb::coupled_share(0).share(), 100.0 * p1hyb::coupled_share(0).min_seen(),
+                              100.0 * p1hyb::coupled_share(1).share(), 100.0 * p1hyb::coupled_share(1).min_seen()).c_str()
+                        : "a rank's own");
     }
     return line;
 }
