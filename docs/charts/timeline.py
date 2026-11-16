@@ -19,7 +19,7 @@ Panels (each column):
     and "decoding" (first token received while decode steps run). Without --steps the lower band is "first token
     received".
   2 output tokens/s while decoding (with --steps): decode tokens/s reconstructed by decode_steps.py from per-request
-    timings (run it with a Python that has numpy and scipy: python3 -I decode_steps.py RESULT.json --grid 5
+    timings (run it with a numpy/scipy python: venv-vision/bin/python -I decode_steps.py RESULT.json --grid 5
     --out STEPS.json); faint 5 s cells, 25 s centred mean, a value-only label at the top of the curve,
     the server's average while decoding (output tokens / stats.step_ns_decode) as a dashed line over the decoding
     phase, and the --tps-ref line (default 300). The server's /stats decode_tps is not used: it reads 0 here.
@@ -122,6 +122,51 @@ def load_stats(path, start, end):
         if -3 <= t <= end - start + 3:
             out.append((t, o))
     return out
+
+
+def hover_layer(r, c, xspan, y0, y1, step=2.0):
+    """Crosshair + readout over every panel (inline use only; an <img> ignores the script). Series are sampled every
+    `step` seconds (nearest earlier sample) and embedded as JSON."""
+    def sample(pts, idx=1):
+        out, j = [], 0
+        k = 0
+        while k * step <= xspan:
+            t = k * step
+            while j + 1 < len(pts) and pts[j + 1][0] <= t:
+                j += 1
+            out.append(round(pts[j][idx]) if pts and pts[0][0] <= t else None)
+            k += 1
+        return out
+    occ = r["occ"]
+    ser = {"dec": sample([(t, d) for t, d, _, _ in occ]),
+           "wait": sample([(t, w or 0) for t, _, _, w in occ]),
+           "pre": sample([(t, p - (w or 0)) for t, _, p, w in occ]),
+           "tps": sample(r["tps_s"]) if r.get("tps_s") else [],
+           "kv": sample([(t, u) for t, u, _ in r["kv"]]) if r["kv"] else [],
+           "gpu": sample(r["gpu_s"]), "cpu": sample(r["cpu_s"]) if r["cpu_s"] else []}
+    g = (f"<g class='th' style='display:none;pointer-events:none'><line class='thl' y1='{y0:.1f}' y2='{y1:.1f}' "
+         f"stroke='var(--ink2)' stroke-width='1' stroke-dasharray='3 3'/><rect class='thb' rx='4' width='206' "
+         f"height='114' fill='var(--surf)' stroke='var(--grid)'/>"
+         + "".join(f"<text class='tht{i}' font-size='{SMALL}' fill='var({'--ink' if i == 0 else '--ink2'})'"
+                   f"{' font-weight="600"' if i == 0 else ''}></text>" for i in range(7)) + "</g>"
+         f"<rect class='thz' x='{c.x0:.1f}' y='{y0:.1f}' width='{c.x1 - c.x0:.1f}' height='{y1 - y0:.1f}' fill='transparent'/>")
+    js = ("<script><![CDATA[(function(){var S=" + json.dumps(ser) + f",ST={step},X0={c.x0:.1f},X1={c.x1:.1f},SPAN={xspan:.1f},"
+          f"Y0={y0:.1f};" + """
+var s=document.currentScript.closest('svg'),q=function(c){return s.querySelector('.'+c)};
+function f(v){return v==null?'-':Math.round(v).toLocaleString('en')}
+function mv(e){var r=s.getBoundingClientRect(),vb=s.viewBox.baseVal,x=(e.clientX-r.left)*vb.width/r.width-8;
+ var u=Math.max(0,Math.min(1,(x-X0)/(X1-X0))),t=u*SPAN,i=Math.min(Math.round(t/ST),S.dec.length-1),px=X0+u*(X1-X0);
+ q('th').style.display='';q('thl').setAttribute('x1',px);q('thl').setAttribute('x2',px);
+ var bx=px+12>X1-210?px-218:px+12,by=Y0+40,b=q('thb');b.setAttribute('x',bx);b.setAttribute('y',by);
+ var L=[Math.round(t)+' s',
+  'waiting '+f(S.wait[i])+', reading prompt '+f(S.pre[i]),'decoding '+f(S.dec[i])+' requests',
+  S.tps.length?'output \u2248'+f(S.tps[i])+' tokens/s':'',S.kv.length?'KV cache '+f(S.kv[i]/1000)+'k tokens':'',
+  'GPUs '+f(S.gpu[i])+' W',S.cpu.length?'CPU '+f(S.cpu[i])+' W':''].filter(function(z){return z});
+ for(var k=0;k<7;k++){var el=q('tht'+k);el.textContent=L[k]||'';el.setAttribute('x',bx+10);el.setAttribute('y',by+17+k*14.5)}
+ b.setAttribute('height',14+L.length*14.5)}
+var z=q('thz');z.addEventListener('pointermove',mv);z.addEventListener('pointerdown',mv);
+z.addEventListener('pointerleave',function(){q('th').style.display='none'});})();]]></script>""")
+    return g + js
 
 
 def occupancy(iv, span, samples, step=1.0):
@@ -347,6 +392,7 @@ def render(a):
         y = top + PH + 34
         return top
 
+    y_top = y - 16
     # phase strip: reading prompts / decoding, from the reconstructed step rate (needs --steps)
     if any(r["phases"] for _, r in runs):
         for (_, r), c in zip(runs, cols):
@@ -553,6 +599,8 @@ def render(a):
             t += step
         body.append(text((c.x0 + c.x1) / 2, bottom + 34, "seconds since the run's first request", SMALL, "ink2", "middle"))
     H = bottom + 44
+    if not two:
+        body.append(hover_layer(runs[0][1], cols[0], xspan, y_top, bottom))
 
     descs = []
     for lab, r in runs:
@@ -566,11 +614,8 @@ def render(a):
             f"Decode batch peak {r['peak']} at {r['peak_t']:.0f} s, time-weighted mean {r['mean']:.0f} while decoding"
             + (f", {r['tok_per_step']:.0f} tokens per decode step" if r["tok_per_step"] else "") +
             f". Decode-step mean {rr['step_mean'] or 0:.0f} tok/s; whole-run average {rr['tokens'] / r['span']:.0f} tok/s; "
-            + (f"reconstructed decode tok/s peak {max(v for _, v in r['tps']):.0f}, mean {r['tps_mean']:.0f} while decode steps run"
-               if r["tps"] else "")
             + ". "
-            f"GPU power avg {gm:.0f} W over cards {', '.join(r['cards'])}"
-            + (f" (left out: {', '.join(r['idle'])})" if r["idle"] else "") + f"; CPU package avg {cm:.0f} W.")
+            f"GPU power avg {gm:.0f} W over the {len(r['cards'])} cards; CPU package avg {cm:.0f} W.")
     desc = " ".join(descs)
     # pad the viewBox left so the y tick labels and panel titles share one left edge
     svg = doc(W, H, f"<g transform='translate(8,0)'>{''.join(body)}</g>", a.title or "Run timeline", desc)
