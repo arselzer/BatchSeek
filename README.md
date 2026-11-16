@@ -7,11 +7,11 @@ RDNA4 cards and 256 GB of RAM.
 
 BatchSeek is a small kit around an engine written by other people:
 
-- **[radiance](https://codeberg.org/StillDeadcode/radiance)** by Deadcode and contributors: the inference server,
+- **[radiance](https://codeberg.org/StillDeadcode/radiance)** by [Deadcode](https://codeberg.org/StillDeadcode) and contributors: the inference server,
   the HIP kernels and everything around them, including tcclaviger's and keptn42's all-reduce kernels and
   slydlake's and ggz14's MXFP4 matrix kernels. The full list is in radiance's
   [NOTICE](https://codeberg.org/StillDeadcode/radiance/src/branch/main/NOTICE).
-- **baKon**: DeepSeek-V4.1 in radiance ([pull request 266](https://codeberg.org/StillDeadcode/radiance/pulls/266)):
+- **[baKon](https://codeberg.org/bakon)**: DeepSeek-V4.1 in radiance ([pull request 266](https://codeberg.org/StillDeadcode/radiance/pulls/266)):
   the model across cards, the MXFP4 import, the Engram tables, and streaming experts from RAM and disk.
 - **[radiance-ramcache](https://github.com/arselzer/radiance-ramcache)**, a fork of radiance for this setup. It
   holds the engine changes: the RAM expert cache with the CPU computing part of each step, batch admission and
