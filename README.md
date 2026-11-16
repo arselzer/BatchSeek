@@ -78,6 +78,7 @@ mini-dev set (official prompts, replies up to 2048 tokens) in one batch, default
 
 | BIRD 2026 questions at once | Peak output tokens/s | Whole job, tokens/s | Power (avg, W) | Wh per 1,000 tokens |
 |---:|---:|---:|---:|---:|
+| 1 | ~20 | 17 | 587 | 9.4 |
 | 500 | ~340 | 112 | 589 | 1.45 |
 
 The job takes 49 minutes from the first request to the last reply and produces 328,110 output tokens: six minutes of
