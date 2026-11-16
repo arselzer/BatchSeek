@@ -38,6 +38,9 @@
 #   - --early K (QxK, ..._P1_EARLY): up to K of the next card-path layer's units copied into the ring before its routing
 #     counts, so the link works through attention and the router; exact (scheduling only). OFF (0) until window H55
 #     measures it (OVERLAP-20261115.md).
+#   - --decode-min N (DmN, RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN=N): with N or more streams ready to decode, a step
+#     carries their decode rows ahead of waiting prompts (continuous serving keeps large decode batches instead of
+#     prefilling every new prompt first); exact (step order only). OFF (0) until window H61 measures it.
 #   - --served-model-name ds41 (a name only; --served-name sets another) and --radiance-home only when given
 #     (RADIANCE_HOME otherwise).
 #
@@ -45,7 +48,7 @@
 #                       [--ctx-per-stream 1152] [--profile FILE] [--mirror DIR] [--shared-head 32] [--served-name ds41]
 #                       [--radiance-home DIR] [--hybrid 60] [--max-seq-len N] [--tiled 0|1] [--tail-once 0|1]
 #                       [--swiglu-span 0|1] [--engram-early 0|1] [--hybrid-prefill 60] [--fast-prefill 0|1]
-#                       [--fast-dense 0|1] [--fast-attn 0|1] [--early K] [--dry-run]
+#                       [--fast-dense 0|1] [--fast-attn 0|1] [--early K] [--decode-min N] [--dry-run]
 #                       [-- more radiance flags, e.g. --expert-stats FILE to record a profile; outside the measured set]
 #   RADIANCE_BIN (default: radiance on PATH, else build/bin/radiance), RADIANCE_HOME as for any radiance run.
 # --dry-run prints the environment and the command and starts nothing. Otherwise the script becomes the server (exec:
@@ -53,7 +56,7 @@
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
-EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=0 FASTDN=1 FASTAT=0 EARLY=0
+EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=0 FASTDN=1 FASTAT=0 EARLY=0 DECMIN=0
 while (( $# )); do
   case $1 in
     --model) MODEL=${2:?}; shift ;;
@@ -78,6 +81,7 @@ while (( $# )); do
     --fast-dense) FASTDN=${2:?}; shift ;;
     --fast-attn) FASTAT=${2:?}; shift ;;
     --early) EARLY=${2:?}; shift ;;
+    --decode-min) DECMIN=${2:?}; shift ;;
     --dry-run) DRY=1 ;;
     --) shift; EXTRA=("$@"); break ;;
     -h|--help) sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -94,6 +98,7 @@ num --hybrid "$HYBRID" 0; (( 10#$HYBRID <= 400 )) || die "--hybrid takes 0 (off)
 num --hybrid-prefill "$HYBPF" 0; (( 10#$HYBPF <= 400 )) || die "--hybrid-prefill takes 0 (off) or a share of 1-400 percent, not '$HYBPF'"
 [[ -z "$SEQLEN" ]] || num --max-seq-len "$SEQLEN" 64
 num --early "$EARLY" 0; (( 10#$EARLY <= 64 )) || die "--early takes 0 (off) or 1-64 units, not '$EARLY'"
+num --decode-min "$DECMIN" 0; (( 10#$DECMIN <= 1048576 )) || die "--decode-min takes 0 (off) or 1-1048576 streams, not '$DECMIN'"
 for v in "--tiled $TILED" "--tail-once $TAILONCE" "--swiglu-span $SPAN" "--engram-early $ENGEARLY" "--fast-prefill $FASTPF" "--fast-dense $FASTDN" "--fast-attn $FASTAT"; do
   [[ ${v#* } == [01] ]] || die "${v% *} takes 0 or 1, not '${v#* }'"
 done
@@ -148,6 +153,7 @@ ENV=(
   RADIANCE_EXPERIMENTAL_SCHED_TBO=0
   RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT=2048
   RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT=1
+  RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN=$((10#$DECMIN))   # DmN: decode first at N ready streams, exact (--decode-min N)
   RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE=int8
   RADIANCE_EXPERIMENTAL_DS41_PREFETCH_RESCORE=12
   RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE_CHECK=0

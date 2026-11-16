@@ -62,7 +62,12 @@ SH=$R-L1024-Pf-N32-C32-Pmr8-Pc-Pch
 SH128=$R-L1024-Pf-N32-C32-Pmr8-Ba2048-Pc-Pch128
 SHNOPC=$R-$N8-Pch
 SHLOW=$R-$N8-Pc-Pch8
-ARMS="$BASE $BA $BA128 $KLDOK $NOPF $NOLC $ONE $PC $PCN $BIG $BIGNOP1 $BIGLC $BIG4K $BIG4KPC $BIG4KLC $BIG4KNOP1 $BS $BSNOBA $BSNOPC $KLD $LOW $HIGH $TWICE $SH $SH128 $SHNOPC $SHLOW"
+DM=$R-L1024-Pf-N32-C32-Pmr8-Ba2048-Pc-Pch-Bs-Dm24
+DM0=$R-$N8-Ba-Dm0
+DMNOPF=$R-L1024-N8-C8-Pmr8-Dm4
+DMBAD=$R-$N8-Ba-Dm4x
+DMTWICE=$R-$N8-Ba-Dm4-Dm8
+ARMS="$BASE $BA $BA128 $KLDOK $NOPF $NOLC $ONE $PC $PCN $BIG $BIGNOP1 $BIGLC $BIG4K $BIG4KPC $BIG4KLC $BIG4KNOP1 $BS $BSNOBA $BSNOPC $KLD $LOW $HIGH $TWICE $SH $SH128 $SHNOPC $SHLOW $DM $DM0 $DMNOPF $DMBAD $DMTWICE"
 (
   set +u
   log() { echo "LOG: $*"; }
@@ -174,6 +179,37 @@ else
     if [[ "$n" == "$want" && "$on" == "$ARM_BS" ]]; then ok "guard: $what"; else bad "guard: $what (pattern '$pat', on '$on', $n matches)"; fi
   done
 fi
+# DmN (RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN): N beside Pf, 0 in every other arm (Dm0 too); skipped without Pf,
+# with a value not a number, and twice; arm()'s Dm row matches the scheduler's "decode min: on" line for its N only.
+sec=$(section "$DM")
+if [[ -z "$sec" ]]; then bad "Dm24 not launched: $(grep -m3 "arm $DM" "$T/loop.txt")"
+else
+  has "Dm24" "$sec" RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN 24
+  has "Dm24" "$sec" RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT 1
+fi
+sec=$(section "$DM0")
+if [[ -z "$sec" ]]; then bad "Dm0 not launched: $(grep -m3 "arm $DM0" "$T/loop.txt")"
+else has "Dm0" "$sec" RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN 0; fi
+for a in "$BASE" "$BA" "$BIG" "$BS"; do
+  sec=$(section "$a"); [[ -n "$sec" ]] && has "no Dm part" "$sec" RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN 0
+done
+skipped "$DMNOPF" "Dm4 needs Pf" "Dm without Pf"
+skipped "$DMBAD" "DmN takes 0-1048576" "Dm4x"
+skipped "$DMTWICE" "two DmN parts" "Dm twice"
+row=$(grep -E '^Dm\$\{ARM_DMIN' "$W")
+if [[ -z "$row" ]]; then bad "no Dm row in arm()'s switch table"
+else
+  dmline="I decode min: on (RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN=384) -- a step with 384 or more sequences ..."
+  for spec in "384|1|a Dm384 arm's pattern matches the line" "24|0|a Dm24 arm's pattern does not match the 384 line" \
+              "|1|an arm without Dm flags the line"; do
+    IFS='|' read -r ARM_DMIN want what <<< "$spec"
+    eval "r=\"$row\""
+    IFS='|' read -r part on pat <<< "$r"
+    n=$(grep -cE "$pat" <<< "$dmline")
+    if [[ "$n" == "$want" && "$on" == "$ARM_DMIN" ]]; then ok "guard: $what"; else bad "guard: $what (pattern '$pat', on '$on', $n matches)"; fi
+  done
+fi
+grep -qF 'decode min: [0-9]+ decode steps taken' "$W" && ok "Dm: the shutdown line is logged" || bad "Dm: no shutdown line grep"
 
 # ---- 2. the startup-line guard: arm()'s Ba row of its switch table, as the heredoc expands it
 row=$(grep -E '^Ba\$\{ARM_BA' "$W")

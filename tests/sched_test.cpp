@@ -10775,6 +10775,156 @@ ShRun sh_run(const char* floor, int n, int conc, std::string* log = nullptr) {
 
 }  /* namespace */
 
+/* ================================================================== decode first above N ready rows */
+/* RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN (Scheduler::decode_min_) beside prefill alone and batch admission
+ * in DeepSeek-V4.1's shape (lcp_fixture, C = 2,048, R = 256), under continuous serving: more prompts than
+ * --max-num-seqs, each slot refilled from the queue as a request ends. Each request's token at a position
+ * is a function of the request and the position only (as the exact kernels make it), so a reply depends
+ * on the step order only if the policy moved a chunk or a token. */
+namespace {
+
+struct DmRun {
+    std::map<uint64_t, std::vector<int32_t>> out;                               /* replies */
+    std::map<uint64_t, std::vector<std::pair<int32_t, int32_t>>> chunks;        /* (ctx_len, n_tokens) */
+    std::vector<std::pair<int, int>> steps;                                     /* (prefill, decode) entries */
+    bool pure = true;                                                           /* no step carries both */
+    int decode_before_last_admit = 0;   /* decode-only steps run while a prompt still waited */
+    SchedMetrics m{};
+    std::string report;
+};
+
+int dm_start(Fixture& f, const char* dm, int64_t seqs, bool alone = true) {
+    f.cfg.max_seqs = seqs;
+    if (alone) setenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE", "1", 1);
+    setenv(Scheduler::kBatchAdmitEnv, "256", 1);
+    if (dm) setenv(Scheduler::kDecodeMinEnv, dm, 1);
+    else unsetenv(Scheduler::kDecodeMinEnv);
+    const int rc = f.start();
+    unsetenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE");
+    unsetenv(Scheduler::kBatchAdmitEnv);
+    unsetenv(Scheduler::kDecodeMinEnv);
+    return rc;
+}
+
+/* 24 prompts (the held-out wave three times) at --max-num-seqs `seqs`, request i asking 3 + i % 7 tokens. */
+DmRun dm_run(const char* dm, int64_t seqs) {
+    DmRun r;
+    LcpOn on(2048, 1);
+    Fixture f;
+    lcp_fixture(f, 2048, 2048);
+    REQUIRE_EQ(dm_start(f, dm, seqs), RAD_OK);
+    std::vector<uint64_t> ids;
+    for (int w = 0; w < 3; ++w)
+        for (size_t i = 0; i < kHeldOut.size(); ++i) {
+            auto q = f.request(kHeldOut[i], 3 + (int)(ids.size() % 7));
+            ids.push_back(f.add(std::move(q)));
+        }
+    for (int k = 0; k < 2000; ++k) {
+        const bool waiting = f.sch.metrics().queue_depth > 0;
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        const StepPlan& p = f.sch.plan();
+        int pf = 0, dec = 0;
+        std::vector<int32_t> t(p.e.size());
+        for (size_t i = 0; i < p.e.size(); ++i) {
+            const StepEntry& e = p.e[i];
+            if (e.is_prefill) { ++pf; r.chunks[e.seq].emplace_back(e.ctx_len, e.n_tokens); }
+            else ++dec;
+            t[i] = (int32_t)(100 + (e.seq * 131 + (uint64_t)(e.ctx_len + e.n_tokens) * 17) % 5000);
+        }
+        if (pf && dec) r.pure = false;
+        if (!pf && waiting) ++r.decode_before_last_admit;
+        r.steps.emplace_back(pf, dec);
+        std::vector<int32_t> a(p.e.size(), 0);
+        std::vector<uint8_t> eos(p.e.size(), 0);
+        Scheduler::StepResult res;
+        res.n_seq = (int)p.e.size();
+        res.n_accepted = a.data();
+        res.token = t.data();
+        res.eos = eos.data();
+        for (uint64_t id : ids)
+            if (const Request* q = f.sch.find(id)) r.out[id] = q->output;
+        CHECK_OK(f.sch.commit(res));
+        for (uint64_t id : ids)
+            if (const Request* q = f.sch.find(id)) r.out[id] = q->output;
+    }
+    for (size_t i = 0; i < ids.size(); ++i) CHECK_EQ(r.out[ids[i]].size(), (size_t)(3 + i % 7));
+    r.m = f.sch.metrics();
+    r.report = info_of([&] { f.sch.decode_min_report(); });
+    return r;
+}
+
+}  /* namespace */
+
+/* Off, a decode step runs only when no prompt can be admitted; at N = 4 of --max-num-seqs 8 decode steps
+ * run while prompts wait, and every one of them is one the policy chose. Each prompt's chunks (its whole
+ * prompt from 0) and every reply are the same; every step is prefill-only or decode-only. At N above
+ * --max-num-seqs (or unset, or 0) the steps are the unset run's, one for one. */
+TEST(decode_min_runs_decode_ahead_of_waiting_prompts_with_the_same_replies) {
+    const DmRun off = dm_run(nullptr, 8);
+    const DmRun zero = dm_run("0", 8);
+    const DmRun big = dm_run("9", 8);
+    const DmRun on = dm_run("4", 8);
+    CHECK(off.pure);
+    CHECK(on.pure);
+    CHECK(zero.steps == off.steps);
+    CHECK(big.steps == off.steps);
+    CHECK_EQ(off.m.decode_min_forced, (int64_t)0);
+    CHECK_EQ(big.m.decode_min_forced, (int64_t)0);
+    CHECK(on.m.decode_min_forced > 0);
+    CHECK(on.decode_before_last_admit > off.decode_before_last_admit);
+    CHECK(on.steps != off.steps);
+    CHECK(on.out == off.out);
+    CHECK(on.chunks == off.chunks);
+    CHECK(big.out == off.out);
+    for (const auto& kv : on.chunks) {
+        REQUIRE_EQ(kv.second.size(), (size_t)1);      /* whole, from position 0, as alone */
+        CHECK_EQ(kv.second[0].first, 0);
+    }
+    CHECK_EQ(on.m.steps_mixed, (int64_t)0);
+    int64_t rows = 0, dsteps = 0;
+    for (const auto& s : on.steps) if (!s.first) { rows += s.second; ++dsteps; }
+    CHECK_EQ(on.m.decode_step_rows, rows);
+    CHECK_EQ(on.m.steps_decode, dsteps);
+    CHECK(has(on.report, "decode min: "));
+    CHECK(has(on.report, "decode steps taken ahead of ready prefill work"));
+    CHECK(off.report.empty());
+}
+
+/* The switch's values: 0 / unset off, a bad value refuses to start, and without prefill alone it is
+ * refused with the reason and nothing changes. */
+TEST(decode_min_switch_values_and_refusal) {
+    for (const char* bad : { "-1", "x", "4x" }) {
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        int rc = 0;
+        const std::string err = info_of([&] { rc = dm_start(f, bad, 8); });
+        CHECK_EQ(rc, (int)RAD_E_INVAL);
+        CHECK(has(err, Scheduler::kDecodeMinEnv));
+    }
+    {
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        int rc = 0;
+        const std::string err = info_of([&] { rc = dm_start(f, "4", 8, /*alone=*/false); });
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(has(err, "decode min: refused"));
+        CHECK_EQ(f.sch.decode_min(), (int64_t)0);
+    }
+    {
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        int rc = 0;
+        const std::string err = info_of([&] { rc = dm_start(f, "384", 512); });
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(has(err, "decode min: on (RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN=384)"));
+        CHECK_EQ(f.sch.decode_min(), (int64_t)384);
+    }
+}
+
 /* Without the switch (as measured: prompts that find their head's blocks and no snapshot), and with it
  * at 64 tokens: each prompt's chunks are its prefill from where its hit resumes to its end, split only
  * at its own keep point. With the switch every prompt after the first two of its system prompt resumes

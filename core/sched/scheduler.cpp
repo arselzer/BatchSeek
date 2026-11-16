@@ -1067,6 +1067,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     /* Whole prompts admitted together (batch_rows_): after prefill alone, large-chunk prefill and the
      * consumer skip, whose decisions it reads. */
     RAD_TRY(batch_admit_init(cfg));
+    /* Decode first above N ready rows (decode_min_): after prefill alone, which it stands beside. */
+    RAD_TRY(decode_min_init(cfg));
     /* Shared heads (sh_floor_): after the geometry and the prefix cache it reads. */
     RAD_TRY(shared_head_init(cfg));
 
@@ -2460,6 +2462,57 @@ void Scheduler::batch_admit_report() const {
                  (long long)m.batch_split_head_waits, kBatchSplitEnv);
 }
 
+/* RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN=<N> (decode_min_). Prefill alone (prefill_alone_) gives a ready
+ * prefill chunk or admission the step whenever there is one, so under continuous serving (more prompts
+ * than --max-num-seqs, refilled as requests finish) new prompts keep the steps and the decode rows wait.
+ * With N: a step whose running set holds at least N sequences ready to decode (prompt computed, no row
+ * left before the next token) is planned as a --prefill-interleave hold plans it: the running walk skips
+ * every prefill chunk and the admission pass is skipped, so the step carries those decode rows and
+ * nothing else; below N, or with no prefill work ready, the step is planned exactly as before. Not while
+ * a preempted request waits overdue (its recompute is the step's). Every step stays one of the two pure
+ * kinds prefill alone already runs (a prefill-only step, a decode-only step), each row computed as in a
+ * step of that kind today: only which steps run, and in which order, changes. Each prompt's chunks are
+ * still the ones it takes alone (batch admission and split decide them from the prompt and the prefix
+ * cache's hit, never from the step's neighbours), and the exact kernels give a row the same bytes
+ * whatever else shares its pass (batch invariance), so every reply is byte for byte the same. Refused,
+ * with the reason, without prefill alone (a step there may carry a chunk beside decode rows already). */
+int Scheduler::decode_min_init(const Config& cfg) {
+    decode_min_ = 0;
+    const char* v = std::getenv(kDecodeMinEnv);
+    if (!v || !*v || !std::strcmp(v, "0")) return RAD_OK;
+    char* end = nullptr;
+    const long long n = std::strtoll(v, &end, 10);
+    if (end == v || *end || n < 1 || n > (1ll << 20)) {
+        RAD_ERR("%s=%s: the decode-ready sequences that take a step ahead of prefill, 1 or more (0 or unset: "
+                "off)", kDecodeMinEnv, v);
+        return RAD_E_INVAL;
+    }
+    if (!prefill_alone_) {
+        RAD_WARN("decode min: refused (%s=%s) -- it needs RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1 (without "
+                 "it a step carries a chunk beside decode rows already); nothing changes", kDecodeMinEnv, v);
+        return RAD_OK;
+    }
+    decode_min_ = n;
+    RAD_INFO("decode min: on (%s=%lld) -- a step with %lld or more sequences ready to decode carries their "
+             "decode rows only, ahead of any prefill chunk or admission; below it steps are planned as "
+             "before (prefill first). Steps stay pure (prefill-only or decode-only); replies are unchanged%s",
+             kDecodeMinEnv, n, n,
+             n > cfg.max_seqs ? fmt(" (above --max-num-seqs %lld: it never applies)", (long long)cfg.max_seqs).c_str()
+                              : "");
+    return RAD_OK;
+}
+
+void Scheduler::decode_min_report() const {
+    if (decode_min_ <= 0) return;
+    const SchedMetrics m = metrics();
+    RAD_INFO("decode min: %lld decode steps taken ahead of ready prefill work (%s=%lld); %lld decode steps of "
+             "%lld rows in all (mean %.1f), %lld prefill steps, %lld mixed",
+             (long long)m.decode_min_forced, kDecodeMinEnv, (long long)decode_min_, (long long)m.steps_decode,
+             (long long)m.decode_step_rows,
+             m.steps_decode > 0 ? (double)m.decode_step_rows / (double)m.steps_decode : 0.0,
+             (long long)m.steps_prefill, (long long)m.steps_mixed);
+}
+
 /* ------------------------------------------------------------------ admission */
 /* Admission checks the KV budget before a request enters running; a request admitted without the
  * blocks to run would be preempted on its first step, a full recompute for nothing. */
@@ -2973,6 +3026,7 @@ const RadBatch* Scheduler::step_locked() {
      * a chunk of the quantum needs; if no chunk could be planned after all (the pool refused the
      * admission), the step is planned again as it is without the switch. */
     bool pf_alone_tried = false;
+    bool dm_tried = false;   /* RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN: its decode-only plan came out empty */
 replan:
     plan_.reset();
     plan_.spec_is_tree = tree_;
@@ -3079,6 +3133,25 @@ replan:
         }
         if (!any_decoding) interleave_left_ = 0;
         hold_prefill = interleave_left_ > 0;
+    }
+    /* RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN (decode_min_init): N or more sequences ready to decode take
+     * this step, decode rows only, ahead of the prefill work that is ready; held as above. */
+    bool dm_forced = false;
+    if (decode_min_ > 0 && !dm_tried && !hold_prefill && !overdue) {
+        int64_t ready = 0;
+        bool pf_running = false;
+        for (int32_t slot : running_) {
+            const SchedReq& g = *reqs_[(size_t)slot];
+            if (!g.req || !g.running) continue;
+            const Request& gr = *g.req;
+            if (gr.n_computed < (int64_t)gr.prompt.size() || gr.n_computed + 1 < g.seq_len())
+                pf_running = true;
+            else
+                ++ready;
+        }
+        const bool admit_possible = !waiting_.empty() && !free_cards_.empty() &&
+                                    (int64_t)running_.size() < cfg_.max_seqs;
+        if (ready >= decode_min_ && (pf_running || admit_possible)) hold_prefill = dm_forced = true;
     }
 
     /* A span is for a prefill alone in its step (ChunkGeometry::span). A spanned step takes as
@@ -3613,6 +3686,11 @@ replan:
         pf_alone_tried = true;
         goto replan;
     }
+    /* Decode min found no decode row to run after all (the pool refused them): planned as before. */
+    if (dm_forced && plan_.e.empty()) {
+        dm_tried = true;
+        goto replan;
+    }
 
     /* Budget the held-back chunk reserved for others but they did not use goes back to it. The
      * reserve is a forecast: a decode row drafts less than its window, an admission is refused,
@@ -3683,7 +3761,9 @@ replan:
     switch (plan_.phase) {
         case RAD_PHASE_PREFILL: ++m_.steps_prefill; break;
         case RAD_PHASE_MIXED:   ++m_.steps_mixed;   break;
-        default:                ++m_.steps_decode;  break;
+        default:                ++m_.steps_decode;  m_.decode_step_rows += n_dec;
+                                if (dm_forced) ++m_.decode_min_forced;
+                                break;
     }
     if (cfg_.prefill_interleave > 0) {
         /* Armed only while a prompt continues past this step: after a last chunk nothing is left
@@ -4075,6 +4155,7 @@ void Scheduler::promote_next() {
         }
     }
     ++m_.steps_decode;
+    m_.decode_step_rows += (int64_t)plan_.e.size();
     /* A step issued ahead during a hold is one of its decode-only steps. */
     if (interleave_left_ > 0) {
         --interleave_left_;
