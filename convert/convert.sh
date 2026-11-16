@@ -41,7 +41,7 @@ case $WORK in /*) ;; *) WORK=$PWD/$WORK ;; esac
 
 # ------------------------------------------------------------------------------------------ pins
 RADIANCE_URL=https://codeberg.org/StillDeadcode/radiance
-RADIANCE_FALLBACK_URL=https://github.com/arselzer/radiance-ramcache   # branch ds41-stable contains the base
+RADIANCE_FALLBACK_URL=https://github.com/arselzer/radiance-ramcache   # its main branch contains the base commit
 RADIANCE_REV=bd65d4e58f7c4233de09ad5245a82c9510eb8962
 OFFICIAL_REPO=deepseek-ai/DeepSeek-V4.1-Flash-1017
 OFFICIAL_REV=1bae0e1088993b9b82de08f59de5be5a34e42170
@@ -233,11 +233,11 @@ else
         note "if $RADIANCE_REV is not in the clone, fetch it, trying in turn:"
         run git -C "$SRC" fetch origin refs/pull/266/head
         run git -C "$SRC" fetch origin "$RADIANCE_REV"
-        run git -C "$SRC" fetch "$RADIANCE_FALLBACK_URL" ds41-stable
+        run git -C "$SRC" fetch "$RADIANCE_FALLBACK_URL" main
     elif ! git -C "$SRC" cat-file -e "$RADIANCE_REV^{commit}" 2>/dev/null; then
         git -C "$SRC" fetch origin refs/pull/266/head || true
         git -C "$SRC" cat-file -e "$RADIANCE_REV^{commit}" 2>/dev/null || git -C "$SRC" fetch origin "$RADIANCE_REV" || true
-        git -C "$SRC" cat-file -e "$RADIANCE_REV^{commit}" 2>/dev/null || git -C "$SRC" fetch "$RADIANCE_FALLBACK_URL" ds41-stable || true
+        git -C "$SRC" cat-file -e "$RADIANCE_REV^{commit}" 2>/dev/null || git -C "$SRC" fetch "$RADIANCE_FALLBACK_URL" main || true
         git -C "$SRC" cat-file -e "$RADIANCE_REV^{commit}" 2>/dev/null ||
             die "radiance commit $RADIANCE_REV not found in $RADIANCE_URL (pull request 266) or $RADIANCE_FALLBACK_URL"
     fi
