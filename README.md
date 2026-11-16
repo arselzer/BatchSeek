@@ -43,7 +43,8 @@ behaves at hundreds of concurrent requests:
   busiest on the GPUs (`--expert-profile`). The fork also fills the RAM cache from the profile, adds `calibrate.sh`
   and profile tools, and makes profiles portable: the server then matches them to a container by its size and the
   sha256 of its metadata header, not by its path.
-- **Kernels.** Faster prompt processing (prefill; register tiling) and the GPUs' matrix units for the FP8 dense layers, both
+- **Kernels.** Faster prompt processing (prefill; register tiling) and a tiled form of the FP8 dense layers' matrix-unit kernel (based on radiance's
+  tiled GEMM), both
   with unchanged results. Optionally, prompt processing and attention on the matrix units in another summation order: faster, but replies can then
   depend on the batch (see "Reproducible mode").
 - **Reproducibility checks and measurement harness.** `tools/ds41-host-experts/ab_window.sh` runs A/B measurement
