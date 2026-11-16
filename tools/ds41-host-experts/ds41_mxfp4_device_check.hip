@@ -5100,8 +5100,135 @@ int attnwm_check(const Lib& L, int mmax) {
     return ok ? 0 : 1;
 }
 
+/* `p1shape ROUTES M[,M...] FORM[,FORM...] [REPS]`: the register-tiled twin's tile shapes (the _form export's forms:
+ * 1 the served shape, 2 the WMMA twin (inexact: its "exact" lines then differ), 100 + i shape i of kP1tShapes, 164 + j
+ * split j of kP1tSplits, r4d_ds41_mxfp4.hip) at the given
+ * heights over real routing (layers 12, 36 on rank 0, 25 on rank 2). Each case: every form's gate_up and down bytes
+ * against the twin's own kernel (form 0) over a table mixing block_mxfp4, packed and skipped entries with edge
+ * values on every 11th token, then each form timed (hipEvent, median of REPS) on an all-block and an all-packed
+ * table. Last line "p1shape: PASS ..." or "p1shape: FAIL ...". */
+int p1_shape(const Lib& L, const char* routes_path, const std::vector<int>& Ms, const std::vector<int>& forms_req,
+             int reps) {
+    P1Ctx c;
+    c.L = &L;
+    if (!L.moe_p1_form) { std::printf("p1shape: FAIL: no _form export\n"); return 1; }
+    HC(hipStreamCreate(&c.s));
+    c.noread = (const void*)(uintptr_t)0x1000;
+    {
+        FILE* f = std::fopen(routes_path, "rb");
+        int32_t h[3];
+        if (f && std::fread(h, 4, 3, f) == 3 && h[2] == kTop && h[0] > 0 && h[1] > 0) {
+            g_p1_layers = h[0];
+            g_p1_rows = h[1];
+            g_p1_routes.resize((size_t)h[0] * h[1] * kTop);
+            if (std::fread(g_p1_routes.data(), 2, g_p1_routes.size(), f) != g_p1_routes.size()) g_p1_routes.clear();
+        }
+        if (f) std::fclose(f);
+        if (g_p1_routes.empty()) { std::printf("p1shape: FAIL: cannot read the routes %s\n", routes_path); return 1; }
+    }
+    std::mt19937_64 rng(1717);
+    p1_bank(&c.gu, 2 * kFf, kEmbd, rng);
+    p1_bank(&c.dn, kEmbd, kFf, rng);
+    size_t bad = 0, nans = 0, vals = 0;
+    int refused = 0;
+    for (int M : Ms)
+        for (int lr = 0; lr < 3; ++lr) {
+            const int layer = lr == 0 ? 12 : lr == 1 ? 25 : 36, rank = lr == 1 ? 2 : 0;
+            const P1Routing r = p1_routing("real", M, rank, layer, rng);
+            const P1Pass p = p1_pass(r, 0, M);
+            const int T = M * kTop;
+            std::vector<int> hist(5, 0);   /* live experts by rows: 1-2, 3-4, 5-8, 9-32, 33+ */
+            for (int e = 0; e < kNe; ++e) {
+                const int n = p.off[(size_t)e + 1] - p.off[(size_t)e];
+                if (n > 0) ++hist[(size_t)(n <= 2 ? 0 : n <= 4 ? 1 : n <= 8 ? 2 : n <= 32 ? 3 : 4)];
+            }
+            std::printf("p1shape case: M %4d %s rank %d local %5d live %2d busiest %4d; live experts by rows 1-2 %d, "
+                        "3-4 %d, 5-8 %d, 9-32 %d, 33+ %d\n", M, r.name.c_str(), rank, p.local, p.live, p.busiest,
+                        hist[0], hist[1], hist[2], hist[3], hist[4]);
+            Dev d_so((size_t)T * 4), d_of((kNe + 1) * 4), d_x((size_t)M * kEmbd * 2), d_a((size_t)T * kFf * 2);
+            Dev gy((size_t)T * 2 * kFf * 2), dy((size_t)T * kEmbd * 2), tg(kNe * sizeof(void*)), td(kNe * sizeof(void*));
+            d_so.put(p.sorted.data());
+            d_of.put(p.off.data());
+            {
+                std::vector<uint16_t> x((size_t)M * kEmbd), a((size_t)T * kFf);
+                for (int t = 0; t < M; ++t) {
+                    const auto row = make_x(kEmbd, rng, t % 11 == 4);
+                    std::copy(row.begin(), row.end(), x.begin() + (size_t)t * kEmbd);
+                }
+                for (int t = 0; t < T; ++t) {
+                    const auto row = make_x(kFf, rng, t % 11 == 4);
+                    std::copy(row.begin(), row.end(), a.begin() + (size_t)t * kFf);
+                }
+                d_x.put(x.data());
+                d_a.put(a.data());
+            }
+            auto run = [&](int form, bool gate) {
+                return gate ? p1_form(c, form, 0, d_x.p, M, kEmbd, tg.p, 2 * kFf, d_so.p, d_of.p, T, gy.p, false)
+                            : p1_form(c, form, 0, d_a.p, T, kFf, td.p, kEmbd, d_so.p, d_of.p, T, dy.p, true);
+            };
+            /* Exactness on the mixed table. */
+            {
+                std::vector<int> fm(kNe);
+                for (int e = 0; e < kNe; ++e) fm[(size_t)e] = e % 6 == 5 ? 2 : e % 3 == 1 ? 1 : 0;
+                std::vector<void*> a = p1_table(c.gu, fm, c.noread), b = p1_table(c.dn, fm, c.noread);
+                tg.put(a.data());
+                td.put(b.data());
+                std::vector<uint16_t> rg(gy.n / 2), rd(dy.n / 2), og(gy.n / 2), od(dy.n / 2);
+                /* The same fill before every form: a skipped expert's rows stay untouched. */
+                HC(hipMemset(gy.p, 0x55, gy.n));
+                HC(hipMemset(dy.p, 0x55, dy.n));
+                if (run(0, true) || run(0, false)) { std::printf("p1shape: FAIL: the twin refused\n"); return 1; }
+                HC(hipStreamSynchronize(c.s));
+                gy.get(rg.data());
+                dy.get(rd.data());
+                for (int form : forms_req) {
+                    HC(hipMemset(gy.p, 0x55, gy.n));
+                    HC(hipMemset(dy.p, 0x55, dy.n));
+                    const int r1 = run(form, true), r2 = run(form, false);
+                    if (r1 || r2) {
+                        ++refused;
+                        std::printf("p1shape exact: form %d refused (%d %d)\n", form, r1, r2);
+                        continue;
+                    }
+                    HC(hipStreamSynchronize(c.s));
+                    gy.get(og.data());
+                    dy.get(od.data());
+                    size_t n1 = 0;
+                    const size_t d = p1_diff(rg.data(), og.data(), rg.size(), &n1) + p1_diff(rd.data(), od.data(), rd.size(), &n1);
+                    /* Byte for byte, NaNs included (one kernel family, one NaN rule). */
+                    const size_t raw = (size_t)(std::memcmp(rg.data(), og.data(), rg.size() * 2) != 0) +
+                                       (size_t)(std::memcmp(rd.data(), od.data(), rd.size() * 2) != 0);
+                    bad += d + raw;
+                    nans += n1;
+                    vals += rg.size() + rd.size();
+                    if (d || raw) std::printf("p1shape exact: M %d %s form %d: %zu values differ (bytes %s)\n", M,
+                                              r.name.c_str(), form, d, raw ? "differ" : "equal");
+                }
+            }
+            /* Timing on all-block and all-packed tables. */
+            for (int tf = 0; tf < 2; ++tf) {
+                std::vector<int> fm(kNe, tf);
+                std::vector<void*> a = p1_table(c.gu, fm, c.noread), b = p1_table(c.dn, fm, c.noread);
+                tg.put(a.data());
+                td.put(b.data());
+                for (int form : forms_req) {
+                    const double g = p1_time(c, [&] { return run(form, true); }, reps);
+                    const double d = p1_time(c, [&] { return run(form, false); }, reps);
+                    std::printf("p1shape time: M %4d %-8s rank %d %-6s form %3d: gate_up %9.1f down %9.1f us = %7.2f us "
+                                "an expert-row\n", M, r.name.c_str(), rank, tf ? "packed" : "block", form, g, d,
+                                p.local ? (g + d) / p.local : 0.0);
+                    std::fflush(stdout);
+                }
+            }
+        }
+    const bool ok = bad == 0 && refused == 0;
+    std::printf("p1shape: %s: %zu values against the twin's own kernel, %zu differ, %zu NaN pairs, %d refused\n",
+                ok ? "PASS" : "FAIL", vals, bad, nans, refused);
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | lsparse [C] [W:r...] | bal [C] [ROUTES] | p1 [MMAX] [ROUTES] | p1tiled [MMAX] [ROUTES] | p1wmma [MMAX] [ROUTES] | attnwm [MMAX] | sweep [trials] | sweep0 [trials] | aux OUT [trials] | auxtall OUT [MMAX] [trials] | auxrt [jobs] | auxswap [rounds]\n", argv[0]); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | lsparse [C] [W:r...] | bal [C] [ROUTES] | p1 [MMAX] [ROUTES] | p1tiled [MMAX] [ROUTES] | p1wmma [MMAX] [ROUTES] | p1shape ROUTES M,.. FORM,.. [REPS] | attnwm [MMAX] | sweep [trials] | sweep0 [trials] | aux OUT [trials] | auxtall OUT [MMAX] [trials] | auxrt [jobs] | auxswap [rounds]\n", argv[0]); return 2; }
     /* `tall`: the switch before the plugin's row table and its sparse launchers first read it, and
      * the routed GEMM as the A/B's servers run it (no live tail); the other modes as the loop's
      * measured runs ran it. */
@@ -5109,7 +5236,8 @@ int main(int argc, char** argv) {
      * `sweep` keeps an LCP already in the environment (its heights) instead of setting EXACT_TALL. */
     /* Every mode but `p1` runs without prefill Phase 1's switch (its twin replaces the LCP twin `lcp` checks). */
     if (std::strcmp(argv[2], ds41p1::kCheckMode) && std::strcmp(argv[2], ds41p1::kTiledCheckMode) &&
-        std::strcmp(argv[2], ds41p1::kWmmaCheckMode) && std::strcmp(argv[2], "auxtall"))
+        std::strcmp(argv[2], ds41p1::kWmmaCheckMode) && std::strcmp(argv[2], "auxtall") &&
+        std::strcmp(argv[2], "p1shape"))
         unsetenv(ds41p1::kEnv);
     /* The WMMA twin (inexact): on for `p1wmma` only, beside the tiled switch as a Qw arm has it. */
     if (!std::strcmp(argv[2], ds41p1::kWmmaCheckMode)) setenv(ds41p1::kWmmaEnv, "1", 1);
@@ -5136,7 +5264,7 @@ int main(int argc, char** argv) {
         unsetenv("RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE");
         g_lcp = 2048;
     } else if (!std::strcmp(argv[2], ds41p1::kCheckMode) || !std::strcmp(argv[2], ds41p1::kTiledCheckMode) ||
-               !std::strcmp(argv[2], ds41p1::kWmmaCheckMode)) {
+               !std::strcmp(argv[2], ds41p1::kWmmaCheckMode) || !std::strcmp(argv[2], "p1shape")) {
         /* `p1 [MMAX] [ROUTES]`: LCP=2048 and the switch, as a P1 arm's server has them (`p1tiled`: and kTiledEnv). */
         setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "2048", 1);
         setenv(ds41p1::kEnv, "1", 1);
@@ -5248,6 +5376,20 @@ int main(int argc, char** argv) {
             return 2;
         }
         return p1w_check(lib, mmax, argc > 4 ? argv[4] : nullptr);
+    }
+    if (!std::strcmp(argv[2], "p1shape")) {
+        if (argc < 5) { std::fprintf(stderr, "p1shape ROUTES M[,M...] FORM[,FORM...] [REPS]\n"); return 2; }
+        auto list = [](const char* t) {
+            std::vector<int> v;
+            for (const char* q = t; *q;) {
+                v.push_back(std::atoi(q));
+                while (*q && *q != ',') ++q;
+                if (*q == ',') ++q;
+            }
+            return v;
+        };
+        return p1_shape(lib, argv[3], list(argv[4]), argc > 5 ? list(argv[5]) : std::vector<int>{ 1 },
+                        argc > 6 ? std::max(1, std::atoi(argv[6])) : 5);
     }
     if (!std::strcmp(argv[2], ds41p1::kCheckMode) || !std::strcmp(argv[2], ds41p1::kTiledCheckMode)) {
         const int mmax = argc > 3 ? std::atoi(argv[3]) : ds41p1::kTwinMaxRows;

@@ -323,6 +323,9 @@ int p1(const Split* sp, const uint16_t* x, int AR, int K, const std::vector<cons
     const bool served = form < 0 && (!sp || sp->served());
     const char* const want = form == 2 || (served && g_wmma) ? "mx_p1w_kernel"
                              : form == 1 || (served && g_tiled) ? "mx_p1t_kernel" : "mx_vp2_kernel";
+    /* The register-tiled twin's served shape is a split by an expert's rows (kP1tServed, r4d_ds41_mxfp4.hip): two
+     * launches of mx_p1t_kernel; the twin's own kernel and the WMMA one are one. */
+    const int kn = std::string(want) == "mx_p1t_kernel" ? 2 : 1;
     const int rc = form >= 0 ? moe_form(form, grid, x, AR, K, table, N, p, sorted_order, y)
                              : moe(r4d_rad_moe_gemm_mxfp4_gemv_tall_p1, sp, x, AR, K, table, N, p, sorted_order, y);
     const int n = emu_grids - g0;
@@ -331,15 +334,16 @@ int p1(const Split* sp, const uint16_t* x, int AR, int K, const std::vector<cons
     if (rc != RAD_OK) { *why = "refused (" + std::to_string(rc) + ")"; return 1; }
     /* Without the tail fill (a wave under ds41p1::kTailOnceEnv): the form's kernel alone. */
     if (g_no_tail && form < 0) {
-        if (n != 1 || last.find(want) == std::string::npos) {
-            *why = std::to_string(n) + " launches, the last " + last + " (wanted " + want + " alone)";
+        if (n != kn || last.find(want) == std::string::npos || (kn == 2 && prev.find(want) == std::string::npos)) {
+            *why = std::to_string(n) + " launches, the last " + last + " (wanted " + std::to_string(kn) + " of " +
+                   want + " alone)";
             return 1;
         }
         return 0;
     }
-    /* The form's kernel, then the tail's zero fill: two launches, the fill last. */
-    if (n != 2 || last.find("mx_zero_tail_kernel") == std::string::npos || prev.find(want) == std::string::npos) {
-        *why = std::to_string(n) + " launches, " + prev + " then " + last + " (wanted " + want + " first)";
+    /* The form's kernel, then the tail's zero fill: kn + 1 launches, the fill last. */
+    if (n != kn + 1 || last.find("mx_zero_tail_kernel") == std::string::npos || prev.find(want) == std::string::npos) {
+        *why = std::to_string(n) + " launches, " + prev + " then " + last + " (wanted " + std::to_string(kn) + " of " + want + " first)";
         return 1;
     }
     return 0;
