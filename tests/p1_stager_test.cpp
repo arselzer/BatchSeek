@@ -5338,14 +5338,12 @@ int arena_split_run(unsigned seed, bool wrong, int steps, std::string* why) {
     RingLender l;
     if (l.init(&h, n, (int64_t)(rng() % 3) * 20) < 0 || l.set_arena(0) < 0) return -1;
     int64_t t = 0;
-    int took_before_use = 0;
     auto pass = [&](int s, int kind) {   /* 0 full, 1 armed below it, 2 neither */
         const bool full = kind == 0, armed = kind <= 1;
         l.begin_pass(armed, t, full && !wrong);
         if (full) {
             for (int k = 0; k < n; ++k)
                 if (l.resident(k)) {
-                    ++took_before_use;
                     h.bad("arena slot " + std::to_string(k) + " still resident when full step " + std::to_string(s) +
                           " writes the arena's top");
                 }
