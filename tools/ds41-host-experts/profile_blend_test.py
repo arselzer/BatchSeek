@@ -113,6 +113,138 @@ class Blend(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("exists", err)
 
+    def fake_rad(self, name, salt=b""):
+        """A .rad header the tool reads: magic, size, model name "deepseek41" in the string blob, data_off 512."""
+        import struct
+        head = bytearray(1024)
+        struct.pack_into("<IIQ", head, 0, 0x31444152, 2, len(head))
+        struct.pack_into("<Q", head, 24, 1)                     # model_name: offset 1 in the string blob
+        struct.pack_into("<QQ", head, 56, 256, 64)              # str_off, str_bytes
+        struct.pack_into("<Q", head, 168, 512)                  # data_off: the metadata the server hashes
+        head[257:268] = b"deepseek41\0"
+        head[300:300 + len(salt)] = salt
+        path = os.path.join(self.dir, name)
+        with open(path, "wb") as f:
+            f.write(head)
+        return path
+
+    def test_portable(self):
+        rad = self.fake_rad("m.rad")
+        ident, model = pb.container_identity(rad)
+        self.assertEqual(model, "deepseek41")
+        self.assertEqual((ident["file_bytes"], ident["metadata_bytes"]), (1024, 512))
+        import hashlib
+        with open(rad, "rb") as f:
+            self.assertEqual(ident["sha256"], hashlib.sha256(f.read(512)).hexdigest())
+        capture = self.put("cap.json", record(10, 0, container=rad))
+        # A raw capture is sealed by --container: strict (this machine) or portable.
+        strict = os.path.join(self.dir, "strict.json")
+        rc, text, err = self.run_tool("write", "--container", rad, strict, "1:" + capture)
+        self.assertEqual(rc, 0, err)
+        with open(strict) as f:
+            doc = json.load(f)
+        self.assertEqual(doc["source_identity"], ident)
+        self.assertEqual(doc["container"], rad)
+        self.assertFalse(pb.is_portable(doc))
+        shared = os.path.join(self.dir, "shared.json")
+        rc, text, err = self.run_tool("write", "--portable", "--container", rad, shared, "1:" + capture)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("(portable)", text)
+        with open(shared) as f:
+            doc = json.load(f)
+        self.assertTrue(pb.is_portable(doc))
+        self.assertEqual(doc["container"], "")
+        self.assertEqual({k: doc["source_identity"][k] for k in pb.STAT}, dict.fromkeys(pb.STAT, 0))
+        self.assertEqual({k: doc["source_identity"][k] for k in pb.PORTABLE_KEYS},
+                         {k: ident[k] for k in pb.PORTABLE_KEYS})
+        # A portable base blends with a capture of the same container (checked through --container) ...
+        other = self.put("cap2.json", record(4, 100, container="/inside/docker/m.rad"))
+        out = os.path.join(self.dir, "blend.json")
+        rc, text, err = self.run_tool("write", out, "2:" + shared, "1:" + other)
+        self.assertEqual(rc, 1)
+        self.assertIn("give --container", err)
+        rc, text, err = self.run_tool("write", "--portable", "--container", rad, out, "2:" + shared, "1:" + other)
+        self.assertEqual((rc, err), (0, ""))
+        with open(out) as f:
+            doc = json.load(f)
+        self.assertTrue(pb.is_portable(doc))
+        self.assertEqual(doc["tokens"]["decode"], 24)
+        self.assertEqual(doc["counts"]["decode"][0][100], 4)
+        # ... and with a profile sealed strictly on another machine for the same generation.
+        os.unlink(out)
+        rc, text, err = self.run_tool("write", out, "1:" + shared, "1:" + strict)
+        self.assertEqual((rc, err), (0, ""))
+        rc, text, err = self.run_tool("match", rad, shared)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("portable profile for", text)
+        self.assertEqual(self.run_tool("match", rad, strict)[0], 0)
+        # Another container generation is refused.
+        rc, text, err = self.run_tool("match", self.fake_rad("m3.rad", salt=b"x"), shared)
+        self.assertEqual(rc, 1)
+        self.assertIn("another container generation", err)
+        rad2 = self.fake_rad("m2.rad", salt=b"another")
+        os.unlink(out)
+        rc, text, err = self.run_tool("write", "--container", rad2, out, "1:" + shared)
+        self.assertEqual(rc, 1)
+        self.assertIn("another container generation", err)
+        rc, text, err = self.run_tool("write", "--portable", "--container", rad2, out, "1:" + capture)
+        self.assertEqual(rc, 0, err)
+        os.unlink(out)
+        rc, text, err = self.run_tool("write", out, "1:" + shared, "1:" + self.put(
+            "g.json", record(5, 0, source_identity=dict(IDENTITY))))
+        self.assertEqual(rc, 1)
+        self.assertIn("another container generation", err)
+        # Not a container at all.
+        rc, text, err = self.run_tool("write", "--container", capture, out, "1:" + capture)
+        self.assertEqual(rc, 1)
+        self.assertIn("not a", err)
+
+    def test_allow_mixed(self):
+        base = self.put("base.json", record(10, 0, sealed=True))
+        mixed = record(5, 0)
+        mixed["tokens"]["mixed"], mixed["mixed_decode_tokens"] = 40, 3
+        m = self.put("m.json", mixed)
+        out = os.path.join(self.dir, "out.json")
+        self.assertEqual(self.run_tool("write", out, "1:" + base, "1:" + m)[0], 1)
+        rc, text, err = self.run_tool("write", "--allow-mixed", out, "1:" + base, "1:" + m)
+        self.assertEqual((rc, err), (0, ""))
+        with open(out) as f:
+            self.assertEqual(json.load(f)["tokens"]["decode"], 15)
+        rc, text, err = self.run_tool("show", m)
+        self.assertIn("40 mixed-step tokens left out (3 of them decode rows)", text)
+
+    def test_mixed_share(self):
+        base = self.put("base.json", record(10, 0, sealed=True))
+        mixed = record(5, 0)
+        # 4 mixed steps of 50 rows (48 prefill + 2 decode each): 300 selections a layer, half on experts 200..205.
+        mixed["tokens"]["mixed"], mixed["steps"]["mixed"], mixed["mixed_decode_tokens"] = 200, 4, 8
+        row = [0] * 384
+        for e in range(200, 206):
+            row[e] = 25
+        for e in range(300, 306):
+            row[e] = 25
+        mixed["counts"]["mixed"] = [list(row) for _ in range(40)]
+        mixed["selections"]["mixed"] = [300] * 40
+        mixed["observed_tokens"]["mixed"] = [200] * 40
+        mixed["histograms"]["mixed"] = [4] * 40
+        mixed["passes"]["mixed"] = [4] * 40
+        m = self.put("m.json", mixed)
+        out = os.path.join(self.dir, "out.json")
+        rc, text, err = self.run_tool("write", "--mixed-share", "0.5", out, "1:" + base, "1:" + m)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("4 decode tokens of mixed steps folded in at share 0.5 (approximate)", err)
+        with open(out) as f:
+            doc = json.load(f)
+        self.assertEqual(doc["tokens"]["decode"], 10 + 5 + 4)       # half of the 8 mixed-step decode rows
+        self.assertEqual(sum(doc["counts"]["decode"][0][200:206]) + sum(doc["counts"]["decode"][0][300:306]), 24)
+        self.assertEqual(pb.check(doc, out), 19)
+        # The folded capture's mixed sections are zero: blending it again folds nothing twice.
+        folded = json.loads(json.dumps(mixed))
+        self.assertEqual(pb.fold_mixed(folded, 0.5), 4)
+        self.assertEqual(pb.fold_mixed(folded, 0.5), 0)
+        self.assertEqual(folded["mixed_folded"]["folded_tokens"], 4)
+        self.assertEqual(self.run_tool("write", "--mixed-share", "2", out + "2", "1:" + base)[0], 1)
+
     def test_show_overlap(self):
         a = self.put("a.json", record(10, 10, sealed=True))      # experts 10..15: rank 0
         b = self.put("b.json", record(20, 150))                   # experts 150..155: rank 1
