@@ -28,7 +28,14 @@
  *    only when its gate_up operands were last seen at this pass's level (p1_hyb_layer_ok): the pass sequence
  *    full-plan prefill -> 256-row-level decode declines (counted), its gate_up records that level's addresses,
  *    the next decode pass splits; at the 1024-row level and back at the full plan it declines again; and the live check that failed on the
- *    card refuses the moved operands as it did there. */
+ *    card refuses the moved operands as it did there.
+ *  - ..._P1_HYBRID_CAL (p1_hybrid.h "calibration"): RateCal learns a pass kind's rate from completions on a fake clock
+ *    (and ignores the other kind, empty samples and the bulk of a stall), choose() at the calibrated rate keeps the
+ *    real CPU time within the share where the model rate overcommits, a calibrated share grows to 4P and still backs
+ *    off, the coupled share moves with every rank's outcomes (none lost across threads), the mask's tunable (0-3), a
+ *    coupled choice reserves its whole cost so the next rank's choice sees it (choose-then-reserve did not) and gives
+ *    back what no borrow drew, and the hybrid decode and prefill layers stay byte-identical to the base under every
+ *    mask with each split layer a sample of its own kind. */
 #include "rad_test.h"
 
 #include "rad_internal.h"
