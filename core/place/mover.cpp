@@ -1025,11 +1025,19 @@ int Mover::relay_packed_unit_block(const HostUnit& hu, uint8_t* dst, int64_t cap
 
 int Mover::ring_copy(const RadCopySeg* segs, int n, const RadEvent* waits, int n_waits, RadEvent done) {
     if (!mover_ || n < 0 || (n > 0 && !segs) || !done) return RAD_E_INVAL;
-    for (int i = 0; i < n_waits; ++i)
-        if (waits && waits[i]) RAD_TRY(rad_event_wait(mover_, waits[i]));
-    if (n > 0) RAD_TRY(rad_memcpy_list_async(segs, n, RAD_COPY_YIELD, mover_));
-    for (int i = 0; i < n; ++i) stats_.h2d_bytes += (uint64_t)segs[i].bytes;
-    return rad_event_record(done, mover_);
+    int rc = RAD_OK;
+    for (int i = 0; i < n_waits && rc >= 0; ++i)
+        if (waits && waits[i]) rc = rad_event_wait(mover_, waits[i]);
+    if (rc >= 0 && n > 0) {
+        rc = rad_memcpy_list_async(segs, n, RAD_COPY_YIELD, mover_);
+        if (rc >= 0)
+            for (int i = 0; i < n; ++i) stats_.h2d_bytes += (uint64_t)segs[i].bytes;
+    }
+    /* `done` is recorded even when a wait or the list failed: a list that failed midway may have queued some of
+     * its segments, and the caller lets the sources go once this event has passed (CardExpertStager keeps the
+     * source with the slot then), so it must come after whatever was queued. */
+    const int r = rad_event_record(done, mover_);
+    return rc < 0 ? rc : r;
 }
 
 int Mover::mover_wait(RadEvent ev) {
@@ -1106,6 +1114,75 @@ int Mover::pack_unit_for_ring(const HostPlanes& p, uint8_t* dst, int64_t cap, bo
         bytes[klass[k]] = w.stored_bytes;
     }
     return RAD_OK;
+}
+
+int Mover::pack_unit_into_cache(const HostPlanes& p, HostUnit* out) {
+    using S = NativeMappedFileCache::Status;
+    if (!out || out->n != 0) return RAD_E_INVAL;
+    if (!prog_ || !plan_ || !mapped_file_cache_on_ || !mapped_file_cache_.packed() || p.n != 2 || p.unit < 0 ||
+        (size_t)p.unit >= unit_.size())
+        return 0;
+    const MoveUnit& mu = plan_->units[(size_t)p.unit];
+    if (mu.weights.size() != 2) return 0;
+    int klass[2] = { -1, -1 };
+    ds41hx::PackInfo plan[2];
+    for (int k = 0; k < 2; ++k) {
+        const WeightInfo& w = prog_->weights[p.w[k]];
+        const int c = w.stored_bytes == (int64_t)NativeMappedFileCache::GU ? 0
+                    : w.stored_bytes == (int64_t)NativeMappedFileCache::DN ? 1 : -1;
+        if (c < 0 || p.w[k] != mu.weights[(size_t)k] || !mapped_file_eligible(w) || p.rows[k] != kPackedShape[c][0] ||
+            p.cols[k] != kPackedShape[c][1] || !p.codes[k] || !p.scales[k] ||
+            !ds41hx::pack_plan(p.scales[k], kPackedShape[c][0], kPackedShape[c][1], &plan[k]))
+            return 0;
+        klass[k] = c;
+    }
+    if (klass[0] == klass[1]) return 0;
+    /* Over its raw budget: the insert threads refuse it (and count it) as without the switch. */
+    if (plan[0].n_exc > packed_raw_[klass[0]] || plan[1].n_exc > packed_raw_[klass[1]]) return 0;
+    const auto slots = mapped_file_cache_.slot_bytes();
+    auto fail = [&](NativeMappedFileCache::Lease* l) {
+        if (l) (void)l->release();
+        release_host_unit(out);
+        return 0;
+    };
+    for (int k = 0; k < 2; ++k) {
+        /* The check-insert-check bracket of read_native_file: never admit another epoch's bytes. */
+        if (!source_file_epoch()) return fail(nullptr);
+        const WeightInfo& w = prog_->weights[p.w[k]];
+        const size_t key = (size_t)(&w - prog_->weights.data());
+        const int c = klass[k], N = kPackedShape[c][0], K = kPackedShape[c][1];
+        NativeMappedFileCache::Lease& l = out->lease[k];
+        NativeMappedFileCache::Write write;
+        const auto reserved = mapped_file_cache_.reserve_packed(key, c, &write);
+        if (reserved == S::Ok) {
+            if (!write.packed() || !write.host() || write.bytes() != slots[(size_t)c]) return fail(nullptr);
+            ds41hx::Mx view;
+            const int rc = ds41hx::pack_planes(p.codes[k], p.scales[k], N, K, packed_raw_[c], plan[k], write.host(),
+                                               write.bytes(), nullptr);
+            if (rc != ds41hx::kPackOk || !ds41hx::packed_view(write.host(), write.bytes(), N, K, &view) ||
+                !ds41hx::packed_scales_equal(view, p.scales[k])) {
+                packed_round_trip_failed_.fetch_add(1, std::memory_order_relaxed);
+                return fail(nullptr);   /* unpublished: the Write's destructor gives the slot back */
+            }
+            if (!source_file_epoch()) return fail(nullptr);
+            if (write.publish(&l) != S::Ok) return fail(&l);
+            packed_inserts_.fetch_add(1, std::memory_order_relaxed);
+            host_plane_inserts_.fetch_add(1, std::memory_order_relaxed);
+        } else if (reserved == S::Existing) {
+            if (mapped_file_cache_.borrow_packed(key, c, &l) != S::Hit) return fail(&l);
+        } else {
+            return fail(nullptr);
+        }
+        if (!l.active() || !l.packed() || !l.host() || l.bytes() != slots[(size_t)c]) return fail(&l);
+        out->host[k] = l.host();
+        out->dev[k] = l.device() ? l.device() : (const void*)l.host();
+        out->bytes[k] = w.stored_bytes;
+        out->slot[k] = (int64_t)l.bytes();
+        ++out->n;
+    }
+    out->unit = p.unit;
+    out->packed = true;
+    return 1;
 }
 
 bool Mover::borrow_host_unit(int32_t u, HostUnit* out, bool touch) {

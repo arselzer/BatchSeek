@@ -126,6 +126,13 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         return false;
     }
     r.tail_once = os == 1;
+    const char* po = get(ds41p1::kPackOnceEnv);
+    const int ps = ds41p1::env_state(po);
+    if (ps < 0) {
+        if (why) *why = std::string(ds41p1::kPackOnceEnv) + "=" + po + ": 1 is on, 0 / unset / empty off";
+        return false;
+    }
+    r.pack_once = ps == 1;
     *t = r;
     return true;
 }
@@ -401,7 +408,14 @@ int CardExpertStager::early(int32_t unit, const Source& s, int32_t handle) {
      * event passes. Never a host wait here: the issuing thread goes on to the next layer's ops. */
     if (const int r = retire(k); r < 0) return r;
     const int rc = dev_->copy(k, s, sl.free_rec ? sl.free_ev : -1, sl.copy_ev);
-    if (rc < 0) return rc;
+    if (rc < 0) {
+        /* As queue_one: the source stays with the slot until the copy event (recorded all the same) has passed;
+         * kCopyKept tells the caller it no longer owns the handle. */
+        sl.held = true;
+        sl.kind = Kind::Ram;
+        sl.handle = handle;
+        return kCopyKept;
+    }
     sl.held = true;
     sl.kind = Kind::Ram;
     sl.handle = handle;
@@ -455,7 +469,17 @@ int CardExpertStager::queue_one(int i) {
      * stream reached the wave that read it, which the free event below orders before this copy. */
     if (const int r = defer_ ? retire(s) : let_go(s, true); r < 0) return r;
     const int rc = dev_->copy(s, u.src, sl.free_rec ? sl.free_ev : -1, sl.copy_ev);
-    if (rc < 0) return rc;
+    if (rc < 0) {
+        /* A failed copy may have queued part of its segments (Device::copy records the done event all the same):
+         * the source stays with the slot, let go once that event has passed (end_pass), never at once. */
+        if (u.kind != Kind::Pool && u.handle >= 0) {
+            sl.held = true;
+            sl.kind = u.kind;
+            sl.handle = u.handle;
+            u.handle = -1;
+        }
+        return rc;
+    }
     sl.held = u.kind != Kind::Pool;   /* a pool unit is read in place: nothing to let go */
     sl.pending = true;
     sl.kind = u.kind;
@@ -1022,6 +1046,9 @@ CardExpertPath::~CardExpertPath() {
             if (ev_host_[i]) (void)rad_event_sync(ev_[i]);
             rad_event_destroy(ev_[i]);
         }
+    /* Pack once: the cache leases of ready slots still held (their copies have passed: the events are synced). */
+    for (auto& h : rlease_)
+        if (h && h->n && mover_) mover_->release_host_unit(h.get());
     for (uint8_t* r : ready_)
         if (r) rad_dev_free(r, RAD_MEM_HOST_PINNED);
     if (tab_pin_) rad_dev_free(tab_pin_, RAD_MEM_HOST_PINNED);
@@ -1055,8 +1082,12 @@ int CardExpertPath::init(Mover* mover, const Tunables& t, int rank, PlanesGet pl
         if (!r) return no("no pinned memory for " + std::to_string(t_.ready) + " ready slots of " +
                           std::to_string(ds41p1::kSlotBytes) + " bytes");
         ready_.push_back(r);
+        rlease_.emplace_back(new Mover::HostUnit());
         ready_free_.push_back(k);
     }
+    if (t_.pack_once && !mover_->packed_cache())
+        return no(std::string(ds41p1::kPackOnceEnv) + "=1 packs admitted drive misses into the packed RAM cache, which is "
+                  "off (RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1)");
     std::string w;
     if (st_.init(this, ring_, n, t_.wave, 96, alias_, t_.ready, &w) < 0) return no(w);
     st_.set_defer(t_.early > 0);   /* early copies: no release syncs in queue_one either */
@@ -1064,6 +1095,11 @@ int CardExpertPath::init(Mover* mover, const Tunables& t, int rank, PlanesGet pl
     reader_ = std::thread(&CardExpertPath::reader_loop, this);
     packer_ = std::thread(&CardExpertPath::packer_loop, this);
     on_ = true;
+    if (t_.pack_once && rank_ == 0)
+        RAD_INFO("%s (%s=1): an admitted drive miss is packed once, into the packed RAM cache, and its ring copy reads "
+                 "the cache slots under their lease until the copy has passed; one the cache does not take whole is "
+                 "packed for the ring and handed to the insert threads as before; counts in the stats line",
+                 ds41p1::kLogPackOnce, ds41p1::kPackOnceEnv);
     if (t_.tail_once)
         RAD_INFO("%s %d (%s=1): the wave relaunches of gate_up and down skip the tail fill (%s=0); the layer's own "
                  "launches fill it", ds41p1::kLogTailOnce, rank_, ds41p1::kTailOnceEnv, ds41p1::kTailParam);
@@ -1182,9 +1218,16 @@ void CardExpertPath::release(Kind k, int32_t handle) {
     }
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (handle >= 0 && (size_t)handle < ready_.size()) ready_free_.push_back(handle);
+        if (handle >= 0 && (size_t)handle < ready_.size()) give_back(handle);
     }
     cv_pack_.notify_all();
+}
+
+void CardExpertPath::give_back(int32_t k) {
+    if (k < 0 || (size_t)k >= ready_.size()) return;
+    if ((size_t)k < rlease_.size() && rlease_[(size_t)k] && rlease_[(size_t)k]->n)
+        mover_->release_host_unit(rlease_[(size_t)k].get());
+    ready_free_.push_back(k);
 }
 
 int CardExpertPath::capture(int which, const RadArgs* a, LaunchFn fn, bool swiglu_span_ok) {
@@ -1258,7 +1301,7 @@ int CardExpertPath::begin_layer(int32_t li, int parity, const int32_t* counts, i
                 ++it;
             }
         }
-        for (const Done& d : done_q_) ready_free_.push_back(d.handle);
+        for (const Done& d : done_q_) give_back(d.handle);
         done_q_.clear();
         owed_ = 0;
     }
@@ -1437,6 +1480,10 @@ int CardExpertPath::early(int32_t next_li, const std::vector<int32_t>& units) {
         }
         src.packed = hu.packed;
         const int rc = hu.n == 2 ? st_.early(u, src, h) : 1;
+        if (rc == CardExpertStager::kCopyKept) {   /* the slot keeps the lease until the copy event has passed */
+            RAD_ERR("ds41 p1: rank %d could not copy routed layer %d's unit %d early", rank_, (int)next_li, (int)u);
+            return RAD_E_STATE;
+        }
         if (rc != 0) {
             mover_->release_host_unit(&hu);
             hu_free_.push_back(h);
@@ -1483,9 +1530,10 @@ int CardExpertPath::wait_drive() {
         owed_ -= (int)got.size();
     }
     c_.wait_drive_ns += ns_since(t0);
-    for (const Done& d : got)
-        if (st_.drive_ready(d.unit, d.src, d.handle) < 0) {
-            release(Kind::Drive, d.handle);
+    for (size_t i = 0; i < got.size(); ++i)
+        if (st_.drive_ready(got[i].unit, got[i].src, got[i].handle) < 0) {
+            /* Refused: this one and the rest never reach the ring; their slots (and leases) go back. */
+            for (size_t j = i; j < got.size(); ++j) release(Kind::Drive, got[j].handle);
             return RAD_E_STATE;
         }
     return 1;
@@ -1502,7 +1550,7 @@ int CardExpertPath::drop_all() {
     cv_idle_.wait(lk, [&] { return (!reading_ && !packing_) || stop_; });
     for (auto& kv : by_unit_) kv.second->planes.reset();
     by_unit_.clear();
-    for (const Done& d : done_q_) ready_free_.push_back(d.handle);
+    for (const Done& d : done_q_) give_back(d.handle);
     done_q_.clear();
     owed_ = 0;
     return error_;
@@ -2151,9 +2199,29 @@ void CardExpertPath::packer_loop() {
         const auto t0 = std::chrono::steady_clock::now();
         bool packed = false;
         int64_t bytes[2] = { 0, 0 };
-        const int rc = d->planes ? mover_->pack_unit_for_ring(*d->planes, ready_[(size_t)k], ds41p1::kSlotBytes,
-                                                              &packed, bytes)
-                                 : RAD_E_STATE;
+        /* Pack once (ds41p1::kPackOnceEnv): an admitted miss straight into the RAM cache, its ring copy from the
+         * cache slots under the leases ready slot k carries (rlease_[k], let go with k once the copy has passed).
+         * d->admit is the issuing thread's, set before the unit was demanded (add_drive, under mu_). */
+        Mover::HostUnit& hu = *rlease_[(size_t)k];
+        bool admit_now;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            admit_now = d->admit && !d->dropped;
+        }
+        const bool once = t_.pack_once && admit_now && insert_ && d->planes &&
+                          mover_->pack_unit_into_cache(*d->planes, &hu) == 1;
+        int rc;
+        if (once) {
+            packed = true;
+            for (int i = 0; i < 2; ++i) bytes[hu.bytes[i] == ds41p1::kGuBlockBytes ? 0 : 1] = hu.slot[i];
+            rc = hu.n == 2 && bytes[0] > 0 && bytes[1] > 0 && bytes[0] <= ds41p1::kDnOff &&
+                         bytes[1] <= ds41p1::kSlotBytes - ds41p1::kDnOff
+                     ? RAD_OK
+                     : RAD_E_STATE;
+        } else {
+            rc = d->planes ? mover_->pack_unit_for_ring(*d->planes, ready_[(size_t)k], ds41p1::kSlotBytes, &packed, bytes)
+                           : RAD_E_STATE;
+        }
         const uint64_t took = ns_since(t0);
         std::shared_ptr<Mover::HostPlanes> planes;
         bool admit = false;
@@ -2162,7 +2230,7 @@ void CardExpertPath::packer_loop() {
             std::lock_guard<std::mutex> lk(mu_);
             c_.pack_ns += took;
             if (rc < 0 || d->dropped) {
-                ready_free_.push_back(k);
+                give_back(k);   /* with its leases, never copied */
                 if (rc < 0 && !d->dropped) {
                     error_ = rc;
                     RAD_ERR("ds41 p1: rank %d could not pack missed unit %d for the ring (%d)", rank_, d->unit, rc);
@@ -2172,13 +2240,24 @@ void CardExpertPath::packer_loop() {
                 Done x;
                 x.unit = d->unit;
                 x.handle = k;
-                x.src.gu = ready_[(size_t)k];
+                if (once) {
+                    for (int i = 0; i < 2; ++i) {
+                        const bool gu = hu.bytes[i] == ds41p1::kGuBlockBytes;
+                        (gu ? x.src.gu : x.src.dn) = hu.dev[i];
+                    }
+                    ++c_.once_units;
+                    c_.once_bytes += (uint64_t)(bytes[0] + bytes[1]);
+                } else {
+                    x.src.gu = ready_[(size_t)k];
+                    x.src.dn = ready_[(size_t)k] + ds41p1::kDnOff;
+                    if (t_.pack_once && admit_now) ++c_.once_fallback;
+                }
                 x.src.gu_bytes = bytes[0];
-                x.src.dn = ready_[(size_t)k] + ds41p1::kDnOff;
                 x.src.dn_bytes = bytes[1];
                 x.src.packed = packed;
                 done_q_.push_back(x);
-                admit = d->admit;
+                /* Packed once: in the cache already, nothing for the insert threads. */
+                admit = d->admit && !once;
                 rows = d->rows;
             }
             planes = std::move(d->planes);
@@ -2224,6 +2303,13 @@ std::string CardExpertPath::stats_line(int rank) const {
     }
     if (t_.tail_once) {
         std::snprintf(buf, sizeof buf, "; wave tail fills skipped %" PRIu64, c_.tail_skipped);
+        line += buf;
+    }
+    if (t_.pack_once) {
+        std::snprintf(buf, sizeof buf,
+                      "; packed once into the RAM cache %" PRIu64 " (%.2f GB, ring copies from the cache slots), %" PRIu64
+                      " admitted misses the cache did not take whole (packed for the ring and inserted as before)",
+                      c_.once_units, (double)c_.once_bytes * 1e-9, c_.once_fallback);
         line += buf;
     }
     if (t_.early > 0) {

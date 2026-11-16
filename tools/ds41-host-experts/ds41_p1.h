@@ -248,6 +248,16 @@ constexpr const char* kHybridPrefillEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_
  * wave computes, from which bytes, and every row it writes are as without it. */
 constexpr const char* kEarlyEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_EARLY";
 constexpr int kMaxEarly = 64;
+/* Pack once (kPackOnceEnv=1; 0 / unset off, the default): a drive miss the RAM cache admits (the prompt's last
+ * rows select it) is packed by the card path's packer straight into reserved slots of the packed RAM cache
+ * (Mover::pack_unit_into_cache: pack_plan, pack_planes and the round-trip check, the insert's own steps), published
+ * there, and its ring copy reads the cache slots under the cache's lease until the copy has passed -- instead of
+ * being packed into a pinned ready slot for the ring and packed a second time from its planes by the background
+ * insert threads. The same bytes end up in the cache and on the card (both are pack_planes of the same planes with
+ * the cache's raw budgets). A unit the cache does not take whole (over its raw budget, no room, a busy key, another
+ * epoch) is packed for the ring and handed to the insert threads as without it. Needs the packed RAM cache. */
+constexpr const char* kPackOnceEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_PACK_ONCE";
+constexpr const char* kLogPackOnce = "ds41 p1: pack once on";
 constexpr const char* kLendRestEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_REST_MS";
 constexpr int kDefLendRestMs = 5000, kMaxLendRestMs = 600000;
 constexpr int kDefWave = 2, kDefInflight = 16, kDefReady = 6, kDefAhead = 8, kDefMinRows = 320;

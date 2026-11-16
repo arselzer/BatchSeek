@@ -246,8 +246,15 @@ struct Sim final : Device {
         host.push_back(h ? 1 : 0);
         return (int)rec.size() - 1;
     }
+    /* A failing copy (fail_copy_at: the Nth call from now, 0 never): part of it queued -- the wait, the slot taken,
+     * the bytes read from the source -- and the done event recorded after it (Mover::ring_copy's contract on
+     * failure), then -1. The source must not be let go before that queued part has run. */
+    int fail_copy_at = 0;
+    int failed_copies = 0;
     int copy(int slot, const Source& src, int wait, int d) override {
         progress();
+        const bool fail = fail_copy_at > 0 && --fail_copy_at == 0;
+        if (fail) ++failed_copies;
         const int u = unit_of(src.gu);
         if (unit_of(src.dn) != u || src.dn != src_dn(u)) bad("a copy's two weights name different units");
         if (!host[(size_t)d]) bad("a copy's done event cannot be queried");
@@ -272,7 +279,7 @@ struct Sim final : Device {
         c.ev = d;
         c.gen = ++rec[(size_t)d];
         q[1].push_back(c);
-        return 0;
+        return fail ? -1 : 0;
     }
     int compute_wait(int ev) override {
         Cmd c;
@@ -5075,3 +5082,95 @@ TEST(p1_card_path_is_decided_per_layer_under_the_per_row_cut) {
 }
 
 RAD_TEST_MAIN()
+
+/* ---- a failed ring copy keeps its source until the copy event has passed (Mover::ring_copy, queue_one, early) ----
+ * A copy list that fails midway may have queued some of its segments, which read the source later; ring_copy
+ * records the done event all the same, and the stager keeps the source with the slot (RAM lease, pinned ready
+ * slot or, with pack once, the RAM-cache leases of a drive unit) until that event has passed -- before, a failed
+ * copy's unit stayed Ready and end_pass let its source go at once. Over random layers (RAM and drive units) the
+ * Nth copy fails with the card lagging (lag 0: nothing runs until the host waits): the run is refused, end_pass
+ * lets every source go exactly once, none before its queued part ran. */
+TEST(p1_a_failed_ring_copy_keeps_its_source_until_the_copy_event_passes) {
+    int failed = 0;
+    for (unsigned seed = 1; seed <= 60; ++seed) {
+        Sim sim(seed * 131u + 7u, 4);
+        CardExpertStager st;
+        std::string why;
+        sim.st = &st;
+        REQUIRE_EQ(st.init(&sim, g_ring, 4, 1 + (int)(seed % 2), 96, g_alias, 6, &why), 0);
+        st.set_defer((seed & 4) != 0);
+        sim.lag = 0;
+        std::mt19937 rng(seed);
+        sim.fail_copy_at = 1 + (int)(rng() % 12);
+        int uid = 1, rc = 0;
+        for (int layer = 0; layer < 3 && rc >= 0; ++layer) rc = run_layer(sim, st, layer, random_layer(rng, 10, 50, 50), &uid);
+        if (sim.failed_copies) {
+            CHECK(rc < 0);
+            ++failed;
+        }
+        (void)st.end_pass();
+        sim.drain();
+        CHECK_EQ(st.held(), 0);
+        /* Every source handed over was let go once; the drive's still pending were never handed over. */
+        int handed = 0;
+        for (const auto& kv : sim.handle_unit) handed += 1;
+        CHECK_EQ((int)sim.released.size(), handed);
+        CHECK_EQ(sim.violations, 0);
+        if (sim.violations) std::fprintf(stderr, "seed %u: %s\n", seed, sim.first.c_str());
+    }
+    CHECK(failed > 30);
+}
+
+TEST(p1_a_failed_early_copy_leaves_its_lease_with_the_slot) {
+    Sim sim(5, 6);
+    CardExpertStager st;
+    std::string why;
+    sim.st = &st;
+    REQUIRE_EQ(st.init(&sim, g_ring, 6, 2, 96, g_alias, 6, &why), 0);
+    st.set_defer(true);
+    sim.lag = 0;
+    int uid = 1;
+    std::mt19937 rng(9);
+    REQUIRE_EQ(run_layer(sim, st, 0, random_layer(rng, 8, 0, 50), &uid), 0);
+    const int h1 = sim.next_handle++, h2 = sim.next_handle++;
+    sim.handle_unit[{ (int)Kind::Ram, h1 }] = 500;
+    sim.handle_unit[{ (int)Kind::Ram, h2 }] = 501;
+    CHECK_EQ(st.early(500, ram_src(500, true), h1), 0);
+    sim.fail_copy_at = 1;
+    CHECK_EQ(st.early(501, ram_src(501, false), h2), CardExpertStager::kCopyKept);
+    CHECK(!sim.released.count({ (int)Kind::Ram, h2 }));   /* the slot holds it: not let go at once */
+    CHECK(st.held() >= 2);
+    REQUIRE_EQ(st.end_pass(), 0);
+    sim.drain();
+    CHECK_EQ(st.held(), 0);
+    CHECK(sim.released.count({ (int)Kind::Ram, h2 }));
+    CHECK_EQ(sim.released.size(), sim.handle_unit.size());
+    CHECK_EQ(sim.violations, 0);
+    if (sim.violations) std::fprintf(stderr, "%s\n", sim.first.c_str());
+}
+
+/* Pack once (ds41p1::kPackOnceEnv): a 0/1 switch, off by default. */
+TEST(p1_pack_once_switch_is_default_off_and_accepts_only_zero_or_one) {
+    std::map<std::string, std::string> env;
+    auto get = [&](const char* k) -> const char* {
+        const auto it = env.find(k);
+        return it == env.end() ? nullptr : it->second.c_str();
+    };
+    Tunables t;
+    std::string why;
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK(!t.pack_once);
+    for (const char* off : { "", "0" }) {
+        env[ds41p1::kPackOnceEnv] = off;
+        REQUIRE(parse_tunables(get, &t, &why));
+        CHECK(!t.pack_once);
+    }
+    env[ds41p1::kPackOnceEnv] = "1";
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK(t.pack_once);
+    for (const char* bad : { "2", "yes", "-1" }) {
+        env[ds41p1::kPackOnceEnv] = bad;
+        CHECK(!parse_tunables(get, &t, &why));
+        CHECK(why.find(ds41p1::kPackOnceEnv) != std::string::npos);
+    }
+}
