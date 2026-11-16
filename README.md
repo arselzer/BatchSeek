@@ -126,7 +126,7 @@ python3 batch_client.py questions.jsonl answers.jsonl --concurrency 512
 ```
 
 `--engram-file` reads the release's official FP8 Engram tables (203 GB extra download). Leave it out to use the IQ4_NL
-tables built into `model.rad` and save the space; both performed about the same in our tests.
+IQ4_NL tables bundled in `model.rad` and save the space; both ran at the same speed with similar accuracy in our tests.
 
 `questions.jsonl` has one `{"prompt": "...", "system": "...", "id": "..."}` a line; put text that prompts share (a
 schema, instructions) in `system`, so the prefix cache prefills it once. `batch_client.py --help` lists the rest.
@@ -137,9 +137,9 @@ A profile recorded on prompts like yours places experts better. One command star
 your prompts, stops it and writes a portable profile:
 
 ```sh
-./calibrate.sh --model ds41.rad --silu-table silu_table_gfx1201.bin my-prompts.jsonl my.profile.json \
+./calibrate.sh --model model.rad --silu-table silu_table_gfx1201.bin my-prompts.jsonl my.profile.json \
   [--base profiles/bird-train.profile.json]
-./serve-batch.sh --model ds41.rad --silu-table silu_table_gfx1201.bin --profile my.profile.json
+./serve-batch.sh --model model.rad --silu-table silu_table_gfx1201.bin --profile my.profile.json
 ```
 
 `--base` blends a shipped profile in. Portable profiles carry no path; the server accepts them on any copy of the
