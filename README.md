@@ -115,10 +115,14 @@ vs 0.692 with IQ4_NL).
 
 ## Quick start
 
+The model (`model.rad`) and the release's FP8 Engram shards (`engram-fp8/`) are on Hugging Face:
+[aselzer/DeepSeek-V4.1-Flash-1017-radiance](https://huggingface.co/aselzer/DeepSeek-V4.1-Flash-1017-radiance).
+
 ```sh
 export RADIANCE_HOME=/path/to/radiance-ramcache/build/radiance_home
-./serve-batch.sh --model ds41.rad --silu-table silu_table_gfx1201.bin --streams 512 \
-  --profile profiles/bird-train.profile.json
+./serve-batch.sh --model model.rad --silu-table silu_table_gfx1201.bin --streams 512 \
+  --profile profiles/bird-train.profile.json \
+  --engram-file engram-fp8/model-00047-of-00048.safetensors,engram-fp8/model-00048-of-00048.safetensors
 python3 batch_client.py questions.jsonl answers.jsonl --concurrency 512
 ```
 

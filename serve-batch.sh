@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The measured best four-card batch configuration of DeepSeek-V4.1-Flash (README "Batch jobs: quickstart"):
-# four 16 GB RDNA4 cards at TP4 and nothing else, many concurrent streams of short prompts that share long heads.
+# four 16 GB RDNA4 cards at TP4, no fifth card, many concurrent streams of short prompts that share long heads.
 # The environment and flags are the window harness's for the arm (ab_window.sh, 12 November)
 #
 #   all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-
@@ -10,9 +10,8 @@
 # (the harness passes a few twice; the server keeps the last). What differs, on purpose:
 #   - the shared-head floor is RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=32 (--shared-head), the pending default; the
 #     measured rows used 64 (Pch64). 32 ran in the same windows' Pch32 arms.
-#   - the placement profile: --profile names one (profiles/nlsql-agent3.profile.json is the arm's, counts only;
-#     profiles/bird-train.profile.json was recorded on public BIRD training questions). Without it the server ranks
-#     experts by the container's own activation profile (slower for batches).
+#   - the placement profile: the arm's (agent3) holds private captures and is not shipped. --profile names yours;
+#     without it the server ranks experts by the container's own activation profile (unmeasured for batches).
 #   - the plane mirror (R, Rd13) only with --mirror; the measured arm had one on a second drive.
 #   - hybrid decode (Qy60, RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=60, the share adapting) is the default: exact and +28%
 #     decode at 256 streams (window ab-20261113T014719Z); --hybrid 0 turns it off (the arm without Qy).
@@ -37,6 +36,9 @@
 #   - --fast-attn (Aw, ..._ATTN_WMMA): the sparse attention at every height on the matrix cores, ON by default. NOT
 #     exact: q.k and sum p k summed in another f32 order (the softmax's exp, max and normaliser the exact kernel's), so
 #     replies are not byte-identical to the exact engine's. --exact (or --fast-attn 0) turns it off (FASTDENSE-20261115.md).
+#   - --engram-file A,B (Ef, ..._DS41_ENGRAM_FILE): the Engram tables read from the release's own FP8 shards
+#     (model-00047/48-of-00048.safetensors) instead of the container's IQ4_NL conversion: the official weights, same
+#     speed (BIRD 256 170.2 vs 172.2 s), NLL 0.688 vs 0.692 (window ab-20261116T114113Z). Recommended; off when not given.
 #   - --reproducible (alias --exact): both batch-dependent modes off (--fast-prefill 0 --fast-attn 0): replies byte-identical whatever the batch.
 #   - --hybrid-cal M (QycM, ..._P1_HYBRID_CAL): the hybrid split's CPU rate learnt from completions (1), one share for
 #     every rank with the choice reserved under one lock (2), or both (3); exact (selection only). OFF (0) until window
@@ -88,7 +90,7 @@
 #                       [--ctx-per-stream 1152] [--profile FILE] [--mirror DIR] [--shared-head 32] [--served-name ds41]
 #                       [--radiance-home DIR] [--hybrid 60] [--max-seq-len N] [--tiled 0|1] [--tail-once 0|1]
 #                       [--swiglu-span 0|1] [--engram-early 0|1] [--hybrid-prefill 60] [--fast-prefill 0|1]
-#                       [--fast-dense 0|1] [--fast-attn 0|1] [--reproducible] [--early K] [--pack W] [--pack-once 0|1] [--hybrid-cal M]
+#                       [--fast-dense 0|1] [--fast-attn 0|1] [--reproducible] [--engram-file A,B] [--early K] [--pack W] [--pack-once 0|1] [--hybrid-cal M]
 #                       [--arena-split 0|1] [--kv-auto T] [--ram-per-seq-mib N] [--kv-lend 0|1] [--decode-min N]
 #                       [--capture FILE] [--auto-profile DIR] [--dry-run]
 #                       [-- more radiance flags, e.g. --expert-stats FILE to record a profile; outside the measured set]
@@ -98,7 +100,7 @@
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
-EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=1 FASTDN=1 FASTAT=1 EARLY=0 PACK=0 PACKONCE=0 HYBCAL=0 ASPLIT=0 KVAUTO=0 PERSEQ="" KVLEND=0 DECMIN=0 CAPTURE="" STREAMS_SET=0 AUTO="" FAST_SET=0
+EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=1 FASTDN=1 FASTAT=1 EARLY=0 PACK=0 PACKONCE=0 HYBCAL=0 ASPLIT=0 KVAUTO=0 PERSEQ="" KVLEND=0 DECMIN=0 CAPTURE="" STREAMS_SET=0 AUTO="" FAST_SET=0 ENGFILE=""
 while (( $# )); do
   case $1 in
     --model) MODEL=${2:?}; shift ;;
@@ -124,6 +126,7 @@ while (( $# )); do
     --fast-prefill) FASTPF=${2:?}; FAST_SET=1; shift ;;
     --fast-dense) FASTDN=${2:?}; shift ;;
     --fast-attn) FASTAT=${2:?}; FAST_SET=1; shift ;;
+    --engram-file) ENGFILE=${2:?}; shift ;;
     --reproducible|--exact) FASTPF=0; FASTAT=0; FAST_SET=1 ;;
     --early) EARLY=${2:?}; shift ;;
     --pack) PACK=${2:?}; shift ;;
@@ -338,6 +341,8 @@ ENV=(
 [[ -n "$RESERVE" ]] && ENV+=(RADIANCE_EXPERIMENTAL_DS41_RAM_RESERVE_MIB=$((10#$RESERVE)))
 # Ee: the next Engram layer's rows read ahead (exact; window ab-20261115T173507Z: -6.1%); the harness states it only when on.
 (( ENGEARLY == 1 )) && ENV+=(RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY=1)
+# Ef: the release's FP8 Engram tables (--engram-file A,B); the harness states it only for Ef arms.
+[[ -n "$ENGFILE" ]] && ENV+=(RADIANCE_EXPERIMENTAL_DS41_ENGRAM_FILE=$ENGFILE)
 
 # The KV pool: --max-model-len is the pool the streams share, streams x tokens a stream (prompt plus reply). The
 # measured arms: 256 x 1152 = 294912 and 128 x 1152 = 147456 for prompts of about 1K tokens and 128-token replies.
