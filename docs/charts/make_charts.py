@@ -19,8 +19,9 @@ def wrap(body):
 
 
 def throughput():
-    pts = data["throughput"]["points"]
-    H, L, R, T, B = 380, 46, 24, 70, 50
+    # one series as in the post's table: one request (chat configuration), then the batch configuration
+    pts = [p for p in data["throughput"]["points"] if (p["kind"] == "chat" and p["streams"] == 1) or p["kind"] == "batch"]
+    H, L, R, T, B = 360, 46, 24, 50, 50
     xmax = 512
     def X(n): return L + (math.log2(n) / math.log2(xmax)) * (W - 2 * PAD - L - R)
     vmax = max(p["tok_s"] for p in pts if p["tok_s"] is not None)
@@ -28,8 +29,6 @@ def throughput():
     def Y(v): return H - B - v / ymax * (H - T - B)
     b = [text(0, 20, "Decode throughput, all streams together", TITLE, "ink", weight="600"),
          text(0, 39, "output tokens per second, four RX 9070 XT", LABEL, "ink2")]
-    k, _ = key([("batch configuration", "s1", "line"), ("chat configuration (1-8 streams)", "neutral", "line")], 0, 60)
-    b.append(k)
     v = 0.0
     while v <= ymax:
         b.append(hline(L, W - 2 * PAD - R, Y(v), "axis" if v == 0 else "grid"))
@@ -38,12 +37,10 @@ def throughput():
     for n in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512):
         b.append(text(X(n), H - B + 18, str(n), SMALL, "muted", "middle"))
     b.append(text((L + W - 2 * PAD - R) / 2, H - 12, "concurrent streams (log scale)", SMALL, "ink2", "middle"))
-    for kind, col in (("chat", "neutral"), ("batch", "s1")):
-        s = [p for p in pts if p["kind"] == kind and p["tok_s"] is not None]
-        if len(s) > 1:
-            b.append(line([(X(p["streams"]), Y(p["tok_s"])) for p in s], col, 2))
-        for p in s:
-            b.append(dot(X(p["streams"]), Y(p["tok_s"]), col))
+    s = sorted((p for p in pts if p["tok_s"] is not None), key=lambda p: p["streams"])
+    b.append(line([(X(p["streams"]), Y(p["tok_s"])) for p in s], "s1", 2))
+    for p in s:
+        b.append(dot(X(p["streams"]), Y(p["tok_s"]), "s1"))
     for p in pts:   # selective direct labels: the batch points and the single-stream anchor
         if p["tok_s"] is None:
             x = X(p["streams"])
