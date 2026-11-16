@@ -159,7 +159,7 @@ function mv(e){var r=s.getBoundingClientRect(),vb=s.viewBox.baseVal,x=(e.clientX
  q('th').style.display='';q('thl').setAttribute('x1',px);q('thl').setAttribute('x2',px);
  var bx=px+12>X1-210?px-218:px+12,by=Y0+40,b=q('thb');b.setAttribute('x',bx);b.setAttribute('y',by);
  var L=[Math.round(t)+' s',
-  'waiting '+f(S.wait[i])+', reading prompt '+f(S.pre[i]),'decoding '+f(S.dec[i])+' requests',
+  'waiting '+f(S.wait[i])+', reading prompt '+f(S.pre[i]),'generating '+f(S.dec[i]),
   S.tps.length?'output \u2248'+f(S.tps[i])+' tokens/s':'',S.kv.length?'KV cache '+f(S.kv[i]/1000)+'k tokens':'',
   'GPUs '+f(S.gpu[i])+' W',S.cpu.length?'CPU '+f(S.cpu[i])+' W':''].filter(function(z){return z});
  for(var k=0;k<7;k++){var el=q('tht'+k);el.textContent=L[k]||'';el.setAttribute('x',bx+10);el.setAttribute('y',by+17+k*14.5)}
@@ -401,7 +401,7 @@ def render(a):
                 col, op = ("s1", 0.30) if st else ("neutral", 0.30)
                 body.append(f"<rect x='{x0:.1f}' y='{y-13:.1f}' width='{max(x1-x0-1.5, 1):.1f}' height='19' rx='3' "
                             f"fill='var(--{col})' fill-opacity='{op}'/>")
-                name = "decoding" if st else "reading prompts"
+                name = "generating" if st else "reading prompts"
                 if text_w(name, SMALL) + 10 < x1 - x0:
                     body.append(text((x0 + x1) / 2, y + 1, name, SMALL, "ink", "middle", "600"))
         y += 30
@@ -420,8 +420,8 @@ def render(a):
             def act(t):
                 i = min(max(bisect.bisect_left(ts, t - g / 2), 0), len(ts) - 1)
                 return r["dec_active"][i][1]
-            base = [("decoding", "s1", [(t, v if act(t) else 0) for t, v in dec], zero),
-                    ("prompt read, waiting to decode", "neutral", [(t, 0 if act(t) else v) for t, v in dec], zero)]
+            base = [("generating", "s1", [(t, v if act(t) else 0) for t, v in dec], zero),
+                    ("prompt read, waiting", "neutral", [(t, 0 if act(t) else v) for t, v in dec], zero)]
         else:
             base = [("first token received", "s1", dec, zero)]
         # queued and prefilling together: requests whose prompt is not read yet
@@ -452,7 +452,8 @@ def render(a):
 
     # 2b decode tokens/s reconstructed from per-request timings (decode_steps.py output via --steps)
     if any(r["tps"] for _, r in runs):
-        ymaxt, stt = nice_max(max([v for _, r in runs for _, v in r["tps"]] + [a.tps_ref or 0]) * 1.15, 3)
+        meas = [float(x) for x in a.measured.split(",")] if a.measured else None   # t0,t1,tok/s from the server's KV counter
+        ymaxt, stt = nice_max(max([v for _, r in runs for _, v in r["tps"]] + [a.tps_ref or 0] + ([meas[2]] if meas else [])) * 1.15, 3)
         def drawt(c, r, top):
             Y = lambda v: top + PH - min(v, ymaxt) / ymaxt * PH
             b = yaxis(c, top, PH, ymaxt, stt, lambda v: f"{v:,.0f}", c is cols[0])
@@ -488,7 +489,7 @@ def render(a):
             d0, d1 = (dsegs[0][0], dsegs[-1][1]) if dsegs else (0, r["span"])
             ym = Y(sm_)
             b.append(hline(c.X(d0), c.X(d1), ym, "ink2", 1.25, "6 4"))
-            ml = f"{sm_:,.0f} tok/s average while decoding"
+            ml = f"{sm_:,.0f} tok/s average while generating"
             mw = text_w(ml, SMALL)
             for bx in [(c.X(d0) - 6 - mw, ym - 7, mw, 14), (c.X(d0) - 6 - mw, ym + 1, mw, 14), (c.x0 + 4, ym - 17, mw, 14), (c.x0 + 4, ym + 3, mw, 14),
                        (c.x1 - 4 - mw, ym + 3, mw, 14)]:
@@ -496,6 +497,11 @@ def render(a):
                        for o in boxes) and bx[1] + bx[3] < top + PH:
                     break
             b.append(text(bx[0], bx[1] + 11, ml, SMALL, "ink2", weight="600", extra=HALO))
+            if meas and c is cols[0]:   # measured: all requests generating, none finished (KV-cache growth)
+                mx0, mx1, my = c.X(meas[0]), c.X(meas[1]), Y(meas[2])
+                b.append(f"<line x1='{mx0:.1f}' x2='{mx1:.1f}' y1='{my:.1f}' y2='{my:.1f}' stroke='var(--ink)' stroke-width='3' stroke-linecap='round'/>")
+                ml2 = f"measured: {meas[2]:,.0f} tok/s"
+                b.append(text(mx1 + 6, my + 4, ml2, SMALL, "ink", "start", "600", extra=HALO))
             return b
         capst = []
         for _, r in runs:
@@ -506,7 +512,7 @@ def render(a):
             if r["tps_check"] is not None:
                 it.append(f"matches the server's step count within {r['tps_check']:.1f}%")
             capst.append(it)
-        panel("Output tokens/s while decoding", drawt, capst)
+        panel("Output tokens/s while generating", drawt, capst)
 
     if a.decode_batch:
         # 2 tokens per decode step
@@ -588,7 +594,7 @@ def render(a):
         gm = sum(v for _, v in r["gpu"]) / len(r["gpu"])
         cm = sum(v for _, v in r["cpu"]) / max(1, len(r["cpu"]))
         caps4.append([(f"GPUs, {len(r['cards'])} cards (avg {gm:,.0f} W)", "s1", "line"),
-                      (f"CPU package (avg {cm:,.0f} W)", "s2", "line"), "10 s mean over 1 s samples"])
+                      (f"CPU (avg {cm:,.0f} W)", "s2", "line"), "10 s mean over 1 s samples"])
     top4 = panel("Power (W)", draw4, caps4)
     bottom = top4 + PH
     for c in cols:
@@ -615,7 +621,7 @@ def render(a):
             + (f", {r['tok_per_step']:.0f} tokens per decode step" if r["tok_per_step"] else "") +
             f". Decode-step mean {rr['step_mean'] or 0:.0f} tok/s; whole-run average {rr['tokens'] / r['span']:.0f} tok/s; "
             + ". "
-            f"GPU power avg {gm:.0f} W over the {len(r['cards'])} cards; CPU package avg {cm:.0f} W.")
+            f"GPU power avg {gm:.0f} W over the {len(r['cards'])} cards; CPU avg {cm:.0f} W.")
     desc = " ".join(descs)
     # pad the viewBox left so the y tick labels and panel titles share one left edge
     svg = doc(W, H, f"<g transform='translate(8,0)'>{''.join(body)}</g>", a.title or "Run timeline", desc)
@@ -636,6 +642,7 @@ def main():
     ap.add_argument("--label", default="run")
     ap.add_argument("--ref", type=float, help="full-batch reference line on panel 2 (default: the run's concurrency; 0 hides it)")
     ap.add_argument("--show-run-average", action="store_true", help="also print the whole-run average tok/s in panel 2's caption")
+    ap.add_argument("--measured", help="t0,t1,tok/s measured directly (KV-cache growth) drawn on the tokens/s panel")
     ap.add_argument("--steps", help="decode_steps.py output JSON for this run (enables the decode tokens/s panel)")
     ap.add_argument("--compare-steps", help="decode_steps.py output JSON for the compare run")
     ap.add_argument("--decode-batch", action="store_true", help="also draw the tokens-per-decode-step panel")
