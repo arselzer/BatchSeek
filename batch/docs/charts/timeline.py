@@ -24,7 +24,7 @@ Panels (each column):
     the server's average while decoding (output tokens / stats.step_ns_decode) as a dashed line over the decoding
     phase, and the --tps-ref line (default 300). The server's /stats decode_tps is not used: it reads 0 here.
   (--decode-batch) tokens per decode step = requests decoding, with time-weighted mean and full batch.
-  3 KV tokens used vs the pool (only with --stats).
+  3 KV cache memory in use, % of the pool (kv_util; only with --stats).
   4 power: GPU total (selected cards) and CPU package; a 10 s rolling mean over the faint 1 s trace.
 Alignment: the request phase ends at the window log's "arm NAME: requests exit" line and starts max(wall_s) earlier.
 """
@@ -212,8 +212,9 @@ def prepare(result, window_log, power, stats, arm, gpus, steps=None):
     active = [d for _, d in dec if d > 0]
     gpu = [(min(max(t, 0), span), g) for t, g, _ in pw]
     cpu = [(min(max(t, 0), span), c) for t, _, c in pw if c is not None]
-    kv = [(min(max(t, 0), span), o.get("kv_tokens_used"), o.get("kv_tokens_total")) for t, o in samples
-          if o.get("kv_tokens_used") is not None]
+    # KV cache by memory (kv_util: the share of the pool's bytes in use), in %: each request also holds a fixed block of
+    # state besides its tokens, so the token count alone understates how full the pool is
+    kv = [(min(max(t, 0), span), 100.0 * o["kv_util"], 100.0) for t, o in samples if o.get("kv_util") is not None]
     peak = max(d for _, d in dec)
     return dict(run=run, start=start, end=end, span=span, occ=occ, dec=dec, samples=samples,
                 have_wait=any(w is not None for *_, w in occ), peak=peak,
@@ -560,22 +561,17 @@ def render(a):
 
     # 3 KV cache
     if any(r["kv"] for _, r in runs):
-        pool = max(r["pool"] or 0 for _, r in runs) or max(u for _, r in runs for _, u, _ in r["kv"])
-        ymax3, st3 = nice_max(pool * 1.12, 3)
+        ymax3, st3 = 100, 25
         def draw3(c, r, top):
             Y = lambda v: top + PH - v / ymax3 * PH
-            b = yaxis(c, top, PH, ymax3, st3, lambda v: f"{v/1e6:g}M" if v >= 1e6 else f"{v/1000:,.0f}k", c is cols[0])
+            b = yaxis(c, top, PH, ymax3, st3, lambda v: f"{v:.0f}%", c is cols[0])
             if not r["kv"]:
                 return b + [text((c.x0 + c.x1) / 2, top + PH / 2, "no /stats samples for this run", SMALL, "muted", "middle")]
-            if r["pool"]:
-                yp = Y(r["pool"])
-                b.append(hline(c.x0, c.x1, yp, "muted", 1, "2 3"))
-                b.append(text(c.x0 + 4, yp - 5, "KV pool", SMALL, "muted", extra=HALO))
             pts = [(c.X(t), Y(u)) for t, u, _ in r["kv"]]
             b.append(area(pts, [(pts[0][0], Y(0)), (pts[-1][0], Y(0))], "s1", 0.10))
             b.append(line(pts, "s1", 2))
             return b
-        panel("KV cache (tokens)", draw3, [[] for _ in runs])
+        panel("KV cache memory (% of the pool)", draw3, [[] for _ in runs])
 
     # 4 power
     pmax = max(max(v for _, v in r["gpu"]) for _, r in runs)
