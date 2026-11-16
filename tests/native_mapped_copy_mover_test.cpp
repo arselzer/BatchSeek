@@ -13,6 +13,7 @@
 #include "place/stager.h"
 #include "tiny_model.h"
 #include "../tools/ds41-host-experts/ds41_host_experts.h"
+#include "../tools/ds41-host-experts/ds41_p1.h"
 #ifdef RAD_NATIVE_CACHE_ENGINE_CASE
 #include "engine.h"
 #endif
@@ -1087,6 +1088,104 @@ TEST(mapped_packed_insert_by_streaming_stores_in_pieces_writes_the_same_slots){
     t.mover->release_host_unit(&hu);
     CHECK_EQ(cnt.bytes,codes);CHECK_EQ(cnt.calls,pieces);
     CHECK_EQ(t.mover->packed_stats().inserted,uint64_t(2));CHECK_EQ(t.mover->packed_stats().round_trip_failed,uint64_t(0));
+    t.drain();
+}
+
+/* Pack once (ds41p1::kPackOnceEnv, Mover::pack_unit_into_cache): an admitted drive miss packed straight into the
+ * packed RAM cache. The slots hold exactly the bytes pack_unit_for_ring writes into a ring slot (so the card gets
+ * the same bytes from the cache lease as from a pinned ready slot) and the bytes the background insert would
+ * have written; the unit is leased (two lease refs) until the caller lets it go, when the refs drop to 0 and
+ * the entries stay cached; a background insert afterwards packs nothing; a unit already cached is lent, not
+ * packed again. Also measured here: what one admitted miss no longer packs/copies in the background. */
+TEST(mapped_packed_pack_once_publishes_the_ring_bytes_and_leases_them_until_released){
+    Environment mapped("1","1");PackedEnvironment packed;
+    Fixture f;f.experts();f.info.relayout=mx_relayout;Image image(lay_out_mxfp4(f));write_scales(f,image);
+    Config cfg=plan_config(false);Plan plan=planned(f,cfg,true);const auto units=two_ssd_experts(plan);
+    std::atomic<uint64_t> calls{0};Access::Driver driver;Transport t;t.open(f,plan,image,80*MiB,calls);Access::attach(*t.mover,driver);
+    REQUIRE(t.mover->packed_cache());
+    const int32_t u=plan.units[size_t(units[0])].expert==1?units[1]:units[0];   //write_scales: expert 1's down is over budget
+    Mover::HostPlanes p;p.unit=u;Mover::HostPlanes* pp=&p;
+    REQUIRE(t.mover->read_unit_planes(&pp,1,1));REQUIRE_EQ(p.n,2);
+    /* The ring's bytes without the switch: pack_unit_for_ring into a ready slot. */
+    std::vector<uint8_t> ring(size_t(ds41p1::kSlotBytes),0x5a);bool ring_packed=false;int64_t rb[2]={0,0};
+    REQUIRE_EQ(t.mover->pack_unit_for_ring(p,ring.data(),ds41p1::kSlotBytes,&ring_packed,rb),RAD_OK);REQUIRE(ring_packed);
+    const auto before=t.mover->packed_stats();
+    Mover::HostUnit hu;REQUIRE_EQ(t.mover->pack_unit_into_cache(p,&hu),1);
+    REQUIRE_EQ(hu.n,2);CHECK(hu.packed);CHECK_EQ(hu.unit,u);
+    CHECK_EQ(Access::stats(*t.mover).cache.lease_refs,size_t(2));
+    CHECK(t.mover->unit_cached(u));
+    uint64_t once_bytes=0,codes_bytes=0,scale_bytes=0;
+    for(int k=0;k<2;++k){
+        const auto& w=f.prog.weights[p.w[k]];
+        CHECK_EQ(p.w[k],plan.units[size_t(u)].weights[size_t(k)]);   //the plan's order, as borrow_host_unit's
+        const int c=w.stored_bytes==int64_t(NativeMappedFileCache::GU)?0:1;
+        CHECK_EQ(hu.bytes[k],w.stored_bytes);CHECK_EQ(hu.slot[k],rb[c]);REQUIRE(hu.dev[k]!=nullptr);
+        CHECK(std::memcmp(hu.host[k],ring.data()+(c?ds41p1::kDnOff:0),size_t(rb[c]))==0);
+        once_bytes+=uint64_t(rb[c]);codes_bytes+=uint64_t(mx_rows(w)*mx_cols(w)/2);scale_bytes+=uint64_t(mx_rows(w)*(mx_cols(w)/32));
+    }
+    const auto mid=t.mover->packed_stats();
+    CHECK_EQ(mid.inserted-before.inserted,uint64_t(2));CHECK_EQ(mid.round_trip_failed,uint64_t(0));
+    /* The background insert of the same planes afterwards: nothing packed again. */
+    std::vector<uint8_t> scratch;CHECK_EQ(t.mover->insert_unit_planes(p,&scratch),RAD_OK);
+    CHECK_EQ(t.mover->packed_stats().inserted,mid.inserted);
+    /* A later hit lends the same slots. */
+    Mover::HostUnit hit;REQUIRE(t.mover->borrow_host_unit(u,&hit));REQUIRE_EQ(hit.n,2);
+    for(int k=0;k<2;++k)CHECK(hit.host[k]==hu.host[k]);
+    CHECK_EQ(Access::stats(*t.mover).cache.lease_refs,size_t(4));
+    t.mover->release_host_unit(&hit);t.mover->release_host_unit(&hu);
+    CHECK_EQ(hu.n,0);CHECK_EQ(Access::stats(*t.mover).cache.lease_refs,size_t(0));
+    CHECK(t.mover->unit_cached(u));   //released, still cached
+    /* A unit the cache holds already: lent (touched), not packed again; the same bytes. */
+    Mover::HostUnit again;REQUIRE_EQ(t.mover->pack_unit_into_cache(p,&again),1);REQUIRE_EQ(again.n,2);
+    CHECK_EQ(t.mover->packed_stats().inserted,mid.inserted);
+    for(int k=0;k<2;++k){const int c=again.bytes[k]==int64_t(NativeMappedFileCache::GU)?0:1;
+        CHECK(std::memcmp(again.host[k],ring.data()+(c?ds41p1::kDnOff:0),size_t(rb[c]))==0);}
+    t.mover->release_host_unit(&again);CHECK_EQ(Access::stats(*t.mover).cache.lease_refs,size_t(0));
+    /* The saving a miss the cache admits: without the switch the packer writes the packed unit into a ready slot
+     * and the insert thread packs it again from its planes (reading the codes and scales, writing the slots,
+     * re-reading the scales for the round-trip check); with it, the one pack writes the cache slots and the ring
+     * copy reads them, so the second pack's reads and writes are gone. */
+    std::fprintf(stderr,"pack once, one admitted miss: packed bytes %llu (written once instead of twice); the background "
+                 "insert's pass no longer made: %llu codes + %llu scale bytes read, %llu slot bytes written, %.1f MB in all\n",
+                 (unsigned long long)once_bytes,(unsigned long long)codes_bytes,(unsigned long long)scale_bytes,
+                 (unsigned long long)once_bytes,double(codes_bytes+scale_bytes+once_bytes)*1e-6);
+    CHECK(once_bytes>uint64_t(17)*1000*1000);
+    t.drain();
+}
+
+/* Pack once, failed admission: a unit over its raw budget, a cache with no room to grow, another epoch -- 0,
+ * nothing leased, nothing published, the counters the background insert keeps (over budget) untouched, so the
+ * caller's fallback (pack for the ring, hand to the insert threads) behaves exactly as without the switch. */
+TEST(mapped_packed_pack_once_refusals_lease_and_publish_nothing){
+    Environment mapped("1","1");PackedEnvironment packed;
+    Fixture f;f.experts();f.info.relayout=mx_relayout;Image image(lay_out_mxfp4(f));write_scales(f,image);
+    Config cfg=plan_config(false);Plan plan=planned(f,cfg,true);const auto units=two_ssd_experts(plan);
+    std::atomic<uint64_t> calls{0};Access::Driver driver;Transport t;t.open(f,plan,image,80*MiB,calls);Access::attach(*t.mover,driver);
+    REQUIRE(t.mover->packed_cache());
+    const bool first_over=plan.units[size_t(units[0])].expert==1;
+    const int32_t over=first_over?units[0]:units[1],fits=first_over?units[1]:units[0];
+    Mover::HostPlanes po,pf;po.unit=over;pf.unit=fits;Mover::HostPlanes* ps[2]={&po,&pf};
+    REQUIRE(t.mover->read_unit_planes(ps,2,1));
+    Mover::HostUnit hu;
+    /* Over budget. */
+    CHECK_EQ(t.mover->pack_unit_into_cache(po,&hu),0);CHECK_EQ(hu.n,0);
+    CHECK(!t.mover->unit_cached(over));CHECK_EQ(Access::stats(*t.mover).cache.lease_refs,size_t(0));
+    auto st=t.mover->packed_stats();CHECK_EQ(st.inserted,uint64_t(0));CHECK_EQ(st.over_budget,uint64_t(0));
+    std::vector<uint8_t> scratch;CHECK_EQ(t.mover->insert_unit_planes(po,&scratch),RAD_OK);   //the fallback counts it
+    CHECK_EQ(t.mover->packed_stats().over_budget,uint64_t(1));
+    /* A non-empty HostUnit is refused outright. */
+    Mover::HostUnit busy;busy.n=1;CHECK(t.mover->pack_unit_into_cache(pf,&busy)<0);busy.n=0;
+    /* No room: the growth limit binds before anything is charged. */
+    t.mover->set_cache_growth_limit(1);
+    CHECK_EQ(t.mover->pack_unit_into_cache(pf,&hu),0);CHECK_EQ(hu.n,0);
+    CHECK(!t.mover->unit_cached(fits));CHECK_EQ(Access::stats(*t.mover).cache.lease_refs,size_t(0));
+    CHECK_EQ(t.mover->packed_stats().inserted,uint64_t(0));
+    t.mover->set_cache_growth_limit(-1);
+    /* Another epoch: the container changed under the planes. */
+    REQUIRE_EQ(::ftruncate(image.fd,off_t(image.bytes.size()+1)),0);REQUIRE_EQ(::fsync(image.fd),0);
+    CHECK_EQ(t.mover->pack_unit_into_cache(pf,&hu),0);CHECK_EQ(hu.n,0);
+    CHECK(!t.mover->unit_cached(fits));CHECK_EQ(Access::stats(*t.mover).cache.lease_refs,size_t(0));
+    CHECK_EQ(t.mover->packed_stats().inserted,uint64_t(0));CHECK_EQ(t.mover->packed_stats().round_trip_failed,uint64_t(0));
     t.drain();
 }
 

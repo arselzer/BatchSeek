@@ -120,6 +120,7 @@ struct Tunables {
     bool tail_once = false;                                     /* ds41p1::kTailOnceEnv: waves skip the tail fill */
     bool wmma = false;                                          /* ds41p1::kWmmaEnv: the WMMA twin (inexact) */
     int  early = 0;                                             /* ds41p1::kEarlyEnv: next layer's units copied early (0 off) */
+    bool pack_once = false;                                     /* ds41p1::kPackOnceEnv: admitted drive misses packed into the RAM cache once */
 };
 /* The tunables from `get` (getenv for the engine): each a whole number in its range (wave 1-16,
  * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, lend_arena 0-64,
@@ -164,7 +165,9 @@ public:
     /* A new event: `host` true when the host queries or syncs it (copy events). Its id, or < 0. */
     virtual int  event_create(bool host) = 0;
     /* One unit's copy into ring slot `slot` on the DMA lane: behind event `wait` (-1: none), then
-     * gate_up to slot + 0 and down to slot + ds41p1::kDnOff, then `done` recorded. */
+     * gate_up to slot + 0 and down to slot + ds41p1::kDnOff, then `done` recorded. On failure (< 0) `done` is
+     * recorded all the same, after whatever part of the copy was queued: the stager keeps the source with the
+     * slot and lets it go only once `done` has passed. */
     virtual int  copy(int slot, const Source& src, int wait, int done) = 0;
     virtual int  compute_wait(int ev) = 0;
     virtual int  compute_record(int ev) = 0;
@@ -212,7 +215,9 @@ public:
     bool layer_open() const { return open_; }
     /* Early copies (above): between layers of a pass (no layer open), unit's bytes `s` (a RAM-cache lease,
      * `handle`) copied into the ring for the next layer. 0 queued; 1 not now (the ring holds as many early
-     * units as slots, or the unit is early already); < 0 refused. */
+     * units as slots, or the unit is early already); < 0 refused, the handle still the caller's -- but for
+     * kCopyKept: the copy failed after the slot took the source, which it lets go once the copy event has passed. */
+    static constexpr int kCopyKept = -2;
     int  early(int32_t unit, const Source& s, int32_t handle);
     bool is_early(int32_t unit) const;
     /* Deferred source retirement (on with early copies): a copy into a slot whose last source's copy has not
@@ -867,6 +872,10 @@ public:
         uint64_t lend_drive = 0, lend_drive_ns = 0, lend_read_failed = 0;
         uint64_t lend_audit_ns = 0;   /* the issuing thread's time in the read-back audit */
         uint64_t early_missed = 0;    /* early candidates the RAM cache did not give */
+        /* Pack once (ds41p1::kPackOnceEnv): admitted drive misses packed straight into the RAM cache and copied to
+         * the ring from its slots (and the bytes packed so), admitted ones the cache did not take whole (packed for
+         * the ring and handed to the insert threads as without the switch). */
+        uint64_t once_units = 0, once_bytes = 0, once_fallback = 0;
     };
     Counts& counts_mut() { return c_; }
     const Counts& counts() const { return c_; }
@@ -924,6 +933,11 @@ private:
     std::map<int32_t, std::shared_ptr<DUnit>> by_unit_;   /* this layer's and the next's, by unit */
     std::vector<uint8_t*> ready_;
     std::vector<int32_t>  ready_free_;
+    /* Pack once: by ready slot, the RAM-cache leases a drive unit's ring copy reads instead of the slot (n == 0:
+     * none, the slot's own bytes). Set by the packer while it owns the slot, let go with the slot (give_back). */
+    std::vector<std::unique_ptr<Mover::HostUnit>> rlease_;
+    /* Ready slot k back to the free list, its RAM-cache leases (pack once) let go first; under mu_. */
+    void give_back(int32_t k);
     bool reading_ = false, packing_ = false, stop_ = false;
     int  error_ = 0;
     int  owed_ = 0;                                 /* demanded drive units not yet handed over */
