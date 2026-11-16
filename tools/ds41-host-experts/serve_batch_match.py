@@ -24,6 +24,8 @@ SHEAD = "RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD"
 RESERVE = "RADIANCE_EXPERIMENTAL_DS41_RAM_RESERVE_MIB"
 HYBRID = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID"
 ADAPT = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT"
+HYB_PREFILL = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL"   # Qyp: --hybrid-prefill
+KERNEL_COST = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST"   # Qyk: on with it
 P1_SWITCHES = (("--tiled", "RADIANCE_EXPERIMENTAL_DS41_P1_TILED"), ("--tail-once", "RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE"),
                ("--swiglu-span", "RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN"),   # Qt, Qz, Qsp
                ("--engram-early", "RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY"))    # Ee (the harness sets it only when on)
@@ -98,6 +100,11 @@ def params(words):
     out += ["--hybrid", env.get(HYBRID) or "0"]
     for opt, var in P1_SWITCHES:
         out += [opt, env.get(var) or "0"]
+    hp, kc = env.get(HYB_PREFILL) or "0", env.get(KERNEL_COST) or "0"
+    if (hp != "0") != (kc != "0"):
+        raise ValueError("%s=%s with %s=%s: serve-batch.sh sets kernel costs exactly when hybrid prefill is on"
+                         % (HYB_PREFILL, hp, KERNEL_COST, kc))
+    out += ["--hybrid-prefill", hp]
     if flags.get("--max-seq-len"):
         out += ["--max-seq-len", flags["--max-seq-len"]]
     return out

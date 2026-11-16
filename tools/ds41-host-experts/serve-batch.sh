@@ -19,6 +19,10 @@
 #   - --tiled (Qt, ..._P1_TILED), --tail-once (Qz, ..._P1_TAIL_ONCE) and --swiglu-span (Qsp, ..._P1_SWIGLU_SPAN): the
 #     prefill Phase 1 twin's variants, on by default: exact, prefill -19% and 256 NL-SQL 287 -> 250 s with hybrid
 #     decode (window ab-20261115T070032Z); give 0 to turn one off.
+#   - --hybrid-prefill P (Qyp, RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL=P, with kernel costs Qyk,
+#     ..._HOST_EXPERTS_KERNEL_COST=1): the CPU pool takes a share of each prefill pass's experts as hybrid decode does;
+#     default 60: exact, 256 NL-SQL 257.5 -> 242.0 s, prefill -11.6% (A-K-P-P-A, window ab-20261116T031731Z);
+#     --hybrid-prefill 0 turns both off.
 #   - --engram-early (Ee, RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY=1): the next Engram layer's table rows read ahead; on by
 #     default (exact, 256 NL-SQL 266 -> 250 s in an A-B-B-A, window ab-20261115T173507Z); --engram-early 0 turns it off.
 #   - --served-model-name ds41 (a name only; --served-name sets another) and --radiance-home only when given
@@ -27,7 +31,7 @@
 # Usage: serve-batch.sh --model MODEL.rad --silu-table FILE [--streams 256] [--port 8000] [--reserve-mib N]
 #                       [--ctx-per-stream 1152] [--profile FILE] [--mirror DIR] [--shared-head 32] [--served-name ds41]
 #                       [--radiance-home DIR] [--hybrid 60] [--max-seq-len N] [--tiled 0|1] [--tail-once 0|1]
-#                       [--swiglu-span 0|1] [--engram-early 0|1] [--dry-run]
+#                       [--swiglu-span 0|1] [--engram-early 0|1] [--hybrid-prefill 60] [--dry-run]
 #                       [-- more radiance flags, e.g. --expert-stats FILE to record a profile; outside the measured set]
 #   RADIANCE_BIN (default: radiance on PATH, else build/bin/radiance), RADIANCE_HOME as for any radiance run.
 # --dry-run prints the environment and the command and starts nothing. Otherwise the script becomes the server (exec:
@@ -35,7 +39,7 @@
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
-EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1
+EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60
 while (( $# )); do
   case $1 in
     --model) MODEL=${2:?}; shift ;;
@@ -54,6 +58,7 @@ while (( $# )); do
     --tiled) TILED=${2:?}; shift ;;
     --tail-once) TAILONCE=${2:?}; shift ;;
     --engram-early) ENGEARLY=${2:?}; shift ;;
+    --hybrid-prefill) HYBPF=${2:?}; shift ;;
     --swiglu-span) SPAN=${2:?}; shift ;;
     --dry-run) DRY=1 ;;
     --) shift; EXTRA=("$@"); break ;;
@@ -68,6 +73,7 @@ num() { [[ $2 =~ ^[0-9]+$ ]] && (( 10#$2 >= $3 )) || die "$1 takes a whole numbe
 num --streams "$STREAMS" 1; num --port "$PORT" 1; num --ctx-per-stream "$CTX" 1; num --shared-head "$SHEAD" 0
 [[ -z "$RESERVE" ]] || num --reserve-mib "$RESERVE" 1024
 num --hybrid "$HYBRID" 0; (( 10#$HYBRID <= 400 )) || die "--hybrid takes 0 (off) or a share of 1-400 percent, not '$HYBRID'"
+num --hybrid-prefill "$HYBPF" 0; (( 10#$HYBPF <= 400 )) || die "--hybrid-prefill takes 0 (off) or a share of 1-400 percent, not '$HYBPF'"
 [[ -z "$SEQLEN" ]] || num --max-seq-len "$SEQLEN" 64
 for v in "--tiled $TILED" "--tail-once $TAILONCE" "--swiglu-span $SPAN" "--engram-early $ENGEARLY"; do
   [[ ${v#* } == [01] ]] || die "${v% *} takes 0 or 1, not '${v#* }'"
@@ -106,7 +112,7 @@ ENV=(
   RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1
   RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=1
   RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=32
-  RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST=0   # Qyk (kernel costs) off: not yet measured on the cards
+  RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST=$(( 10#$HYBPF > 0 ? 1 : 0 ))   # Qyk: kernel costs, on with hybrid prefill
   RADIANCE_EXPERIMENTAL_DS41_LCP=2048
   RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1
   RADIANCE_EXPERIMENTAL_DS41_RAM_BUDGET=1
@@ -172,7 +178,7 @@ ENV=(
   RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS=64
   RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=$((10#$HYBRID))   # QyP: hybrid decode, the CPU's share P%; 0 off
   RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT=            # empty: the share adapts (Qy, not Qyf)
-  RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL=0         # QypP (hybrid prefill) off: not yet measured on the cards
+  RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL=$((10#$HYBPF))   # QypP: hybrid prefill, the CPU's share P%; 0 off (H50: exact, NL-SQL 256 -6.0%, prefill -11.6%)
   RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT=0
   RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_HALF_ROWS=
   RADIANCE_EXPERIMENTAL_DS41_P1_LEND_HEAT_MARGIN_PCT=
