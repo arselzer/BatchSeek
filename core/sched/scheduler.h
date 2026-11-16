@@ -614,6 +614,21 @@ public:
      * share a step changes (batch_split_init). */
     static constexpr const char* kBatchSplitEnv = "RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT";
     bool    batch_admit_split() const { return batch_split_; }
+    /* RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD=<W> (pack_w_; 0 or unset: off, as before), beside batch
+     * admission: when the next waiting prompt cannot join an open batch (its chunk past the rows left, or
+     * not the one it takes alone), the next W waiting prompts are asked in queue order for one that can,
+     * under the same join rules (batch_fits, admit_one's batch_join_); the passed-over prompts keep their
+     * places at the queue's front and the next step opens with the first of them. A candidate whose prompt
+     * starts with the tokens before a snapshot another entry of this step writes (pack_head_conflict) is
+     * not taken: it resumes from that snapshot a step later, as it would have without the switch. Only
+     * which prompts share a step changes; every prompt's chunks and snapshots are the ones it takes alone.
+     * The shutdown line (batch_admit_report) gives the open batches' fill against their room, either way. */
+    static constexpr const char* kPackLookaheadEnv = "RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD";
+    static constexpr int64_t kPackLookaheadMax = 256;
+    int64_t pack_lookahead() const { return pack_w_; }
+    /* Whether `s`'s prompt starts with the tokens before a snapshot an entry of the step planned so far
+     * writes (StepEntry::ckpt_slot at ctx_len + ckpt_tok + 1). */
+    bool    pack_head_conflict(const SchedReq& s) const;
     /* The deepest checkpoint plan_chunk's chunks write for `r` from its computed tokens to `end`
      * at the whole step budget, or -1; with `all`, every one of them, ascending. */
     int64_t idle_prefill_checkpoint(const Request& r, int64_t end,
@@ -1030,6 +1045,8 @@ private:
     bool    batch_split_ = false;
     int64_t batch_join_ = 0;
     bool    batch_join_rows_ = false;   /* the last refused join's chunk was past the rows left */
+    bool    batch_join_refused_ = false;   /* the last admit_one refused a join (batch_join_), nothing else */
+    int64_t pack_w_ = 0;                   /* RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD (kPackLookaheadEnv) */
     int64_t batch_p1_rows_ = 0;
     int     batch_admit_init(const Config& cfg);
     /* RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD (kSharedHeadEnv): the floor once init took it, else 0. */

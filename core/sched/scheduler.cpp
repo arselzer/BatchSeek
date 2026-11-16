@@ -237,6 +237,20 @@ int Scheduler::batch_admit_init(const Config& cfg) {
     batch_split_ = false;
     batch_join_ = 0;
     batch_p1_rows_ = 0;
+    pack_w_ = 0;
+    /* RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD (pack_w_, scheduler.h): 0..kPackLookaheadMax, 0 / unset /
+     * empty off; anything else refuses to start. */
+    int64_t pack = 0;
+    if (const char* pv = std::getenv(kPackLookaheadEnv); pv && *pv) {
+        char* pe = nullptr;
+        const long long w = std::strtoll(pv, &pe, 10);
+        if (pe == pv || *pe || w < 0 || w > kPackLookaheadMax) {
+            RAD_ERR("%s=%s: the waiting prompts a batch may look past a refused one for, 0 to %lld (0 or unset: "
+                    "off)", kPackLookaheadEnv, pv, (long long)kPackLookaheadMax);
+            return RAD_E_INVAL;
+        }
+        pack = w;
+    }
     /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT (batch_split_, scheduler.h): 1 on, 0 / unset / empty off. */
     const char* sv = std::getenv(kBatchSplitEnv);
     const bool split = sv && *sv && std::strcmp(sv, "0");
@@ -249,6 +263,9 @@ int Scheduler::batch_admit_init(const Config& cfg) {
         if (split)
             RAD_WARN("batch split: refused (%s=1) -- it needs batch admission (%s) beside the prefix cache; "
                      "nothing changes", kBatchSplitEnv, kBatchAdmitEnv);
+        if (pack > 0)
+            RAD_WARN("pack lookahead: refused (%s=%lld) -- it needs batch admission (%s); nothing changes",
+                     kPackLookaheadEnv, (long long)pack, kBatchAdmitEnv);
         return RAD_OK;
     }
     char* end = nullptr;
@@ -311,6 +328,9 @@ int Scheduler::batch_admit_init(const Config& cfg) {
                  kBatchAdmitEnv, v, why.c_str());
         if (split)
             RAD_WARN("batch split: refused (%s=1) -- batch admission is off; nothing changes", kBatchSplitEnv);
+        if (pack > 0)
+            RAD_WARN("pack lookahead: refused (%s=%lld) -- batch admission is off; nothing changes",
+                     kPackLookaheadEnv, (long long)pack);
         batch_p1_rows_ = 0;
         return RAD_OK;
     }
@@ -342,6 +362,16 @@ int Scheduler::batch_admit_init(const Config& cfg) {
                  "step with the snapshot it writes alone: every prompt's chunk boundaries and snapshot "
                  "positions are the unbatched run's; two entries of a step writing one snapshot write it once",
                  kBatchSplitEnv);
+    }
+    if (pack > 0) {
+        pack_w_ = pack;
+        RAD_INFO("pack lookahead: on (%s=%lld) -- when the next waiting prompt cannot join an open batch (its "
+                 "chunk past the rows left, or not the one it takes alone), the next %lld waiting prompts are "
+                 "asked in order for one that can, under the same join rules; a prompt that starts with the "
+                 "tokens before a snapshot another entry of the step writes is not taken ahead (it resumes "
+                 "there a step later); the prompts passed keep their places and the next step opens with the "
+                 "first of them. Every prompt's chunks and snapshots stay the ones it takes alone",
+                 kPackLookaheadEnv, (long long)pack, (long long)pack);
     }
     return RAD_OK;
 }
@@ -2423,6 +2453,18 @@ bool Scheduler::batch_split_covered(const SchedReq& s, const StepEntry& e, int64
     return alone == e.n_tokens && ck == (ckpt > 0 ? ckpt : -1);
 }
 
+bool Scheduler::pack_head_conflict(const SchedReq& s) const {
+    if (!s.req) return false;
+    const std::vector<int32_t>& p = s.req->prompt;
+    for (const StepEntry& o : plan_.e) {
+        if (!o.req || o.ckpt_slot < 0 || o.ckpt_tok < 0) continue;
+        const int64_t at = (int64_t)o.ctx_len + o.ckpt_tok + 1;
+        if (at <= 0 || (int64_t)p.size() <= at || (int64_t)o.req->prompt.size() < at) continue;
+        if (std::equal(p.begin(), p.begin() + at, o.req->prompt.begin())) return true;
+    }
+    return false;
+}
+
 bool Scheduler::batch_whole(const SchedReq& s, bool fresh) {
     if (!fresh || !s.req) return false;
     const Request& r = *s.req;
@@ -2437,6 +2479,15 @@ void Scheduler::batch_admit_report() const {
              "step); %lld prefill-only steps in all",
              (long long)m.batch_admit_steps, (long long)m.batch_admit_prompts, (long long)m.batch_admit_rows,
              (long long)batch_rows_, (long long)m.steps_prefill);
+    RAD_INFO("pack lookahead: %lld steps held an open batch, %lld rows of %lld room (mean %.1f of %.1f a step, "
+             "%.1f%% full); %lld prompts taken past a refused one of %lld asked, %lld passed for a head another "
+             "entry snapshots (%s=%lld)",
+             (long long)m.pack_steps, (long long)m.pack_rows, (long long)m.pack_room,
+             m.pack_steps ? (double)m.pack_rows / (double)m.pack_steps : 0.0,
+             m.pack_steps ? (double)m.pack_room / (double)m.pack_steps : 0.0,
+             m.pack_room ? 100.0 * (double)m.pack_rows / (double)m.pack_room : 0.0,
+             (long long)m.pack_picks, (long long)m.pack_asked, (long long)m.pack_head_skips, kPackLookaheadEnv,
+             (long long)pack_w_);
     if (batch_p1_rows_ > 0)
         RAD_INFO("batch admission: %lld of those steps of %lld rows or more (Phase 1's card path)",
                  (long long)m.batch_admit_p1_steps, (long long)batch_p1_rows_);
@@ -2717,6 +2768,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
         join_refused = want != alone || ckpt != ck_alone ||
                        (!batch_split_ && r.n_computed + want != target) || want > batch_join_;
         batch_join_rows_ = join_refused && alone > batch_join_;
+        batch_join_refused_ = join_refused;
         /* Nor a keep point another entry of this step already snapshots (the same tokens before it): the
          * prompt would compute that head again beside it, where a step later it resumes from it. */
         if (!join_refused && batch_split_ && ckpt > 0 && ckpt < target)
@@ -2725,6 +2777,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
                     (int64_t)o.ctx_len + o.ckpt_tok + 1 == ckpt && (int64_t)o.req->prompt.size() >= ckpt &&
                     std::equal(r.prompt.begin(), r.prompt.begin() + ckpt, o.req->prompt.begin())) {
                     join_refused = true;
+                    batch_join_refused_ = true;
                     ++m_.batch_split_head_waits;
                     break;
                 }
@@ -3428,20 +3481,38 @@ replan:
         /* Why a prefill-only step beside the prefix cache stopped taking prompts (the shutdown line). */
         enum class Close { Waiting, Rows, Alone, Opener, Seqs } close = Close::Waiting;
         const size_t pf_before = plan_.e.size();
+        /* RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD (pack_w_): the last queue index the lookahead may ask,
+         * set at the first prompt refused a join to an open batch (-1: none refused yet); the step's close
+         * reason is that prompt's. */
+        int64_t pack_end = -1;
         while (at < waiting_.size() &&
                (int64_t)plan_.e.size() < cfg_.max_seqs && budget > 0) {
             /* A step planned for one prefill holds that one (span_now_ above). */
             if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
+            if (pack_end >= 0 && (int64_t)at > pack_end) break;
             int32_t slot = waiting_[at];
             SchedReq& s = *reqs_[(size_t)slot];
             /* Prefill alone: an admission's chunk is never beside another chunk or decode rows, but
              * for whole prompts admitted together into a step of nothing else (batch_fits; never
              * with the switch off). */
             const bool batched = prefill_alone_ && !plan_.e.empty();
+            /* A prompt the lookahead asks past a refused one: one that would resume from a snapshot an
+             * entry of this step writes waits for it (pack_head_conflict). */
+            if (pack_end >= 0) {
+                ++m_.pack_asked;
+                if (pack_head_conflict(s)) { ++m_.pack_head_skips; ++at; continue; }
+            }
             if (batched && !batch_fits(s, batch_used, budget)) {
-                close = batch_used < 0 ? Close::Opener
+                const Close c = batch_used < 0 ? Close::Opener
                         : std::min<int64_t>(batch_rows_ - batch_used, budget) < std::max<int64_t>(geo_.quantum, 1)
                             ? Close::Rows : Close::Alone;
+                /* An open batch with room left: ask the next pack_w_ waiting prompts (the lookahead). */
+                if (pack_w_ > 0 && c == Close::Alone) {
+                    if (pack_end < 0) { pack_end = (int64_t)at + pack_w_; close = c; }
+                    ++at;
+                    continue;
+                }
+                if (pack_end < 0) close = c;
                 break;
             }
             const bool fresh = s.req->state != ReqState::Preempted && s.req->n_computed == 0;
@@ -3474,9 +3545,18 @@ replan:
             const int as = admit_one(s, batched ? std::min(budget, batch_rows_ - batch_used) : budget,
                                      areserve);
             batch_join_ = 0;
-            if (as == kAdmitWait) { ++at; continue; }
-            if (as < 0 && batched) close = batch_join_rows_ ? Close::Rows : Close::Alone;
+            const bool join_refused = batch_join_refused_;
+            batch_join_refused_ = false;
+            if (as == kAdmitWait) { batch_join_rows_ = false; ++at; continue; }
+            if (as < 0 && batched && pack_end < 0) close = batch_join_rows_ ? Close::Rows : Close::Alone;
             batch_join_rows_ = false;
+            /* A join admit_one refused (its chunk past the rows left, or not the one it takes alone; it took
+             * no block and its hit went back): the lookahead asks the prompts behind it. */
+            if (as < 0 && batched && join_refused && pack_w_ > 0 && batch_used >= 0) {
+                if (pack_end < 0) pack_end = (int64_t)at + pack_w_;
+                ++at;
+                continue;
+            }
             /* An overdue preempted prefill on an idle engine that still cannot be admitted will
              * not become admissible by waiting: nothing is running to finish and free the pool.
              * Fail it (spec §17) and ask the next request, instead of parking the step loop. */
@@ -3530,6 +3610,7 @@ replan:
             plan_.n_tok += s.sched_tokens;
             budget -= s.sched_tokens;
             took_.push_back(at);
+            if (pack_end >= 0) ++m_.pack_picks;
             ++at;
             /* The batch: opened by a whole short prompt that is the step's first entry (the running
              * requests planned nothing), grown by each prompt batch_fits let in. One that did not
@@ -3583,6 +3664,12 @@ replan:
                     case Close::Seqs:    ++m_.batch_close_seqs;    break;
                 }
             }
+        }
+        /* The open batch's fill against its room (the shutdown's pack lookahead line, either way). */
+        if (batch_rows_ > 0 && batch_used >= 0 && !plan_.e.empty()) {
+            ++m_.pack_steps;
+            m_.pack_rows += batch_used;
+            m_.pack_room += std::min<int64_t>(batch_rows_, batch_used + std::max<int64_t>(budget, 0));
         }
         if (batch_n > 0 && batch_opened_running) ++m_.batch_split_opens;
         if (batch_n > 0) {
