@@ -39,9 +39,10 @@ behaves at hundreds of concurrent requests:
 - **Prefix cache and memory sizing.** Shared prompt heads (for example a database schema) are read once. The
   prefix cache's snapshot store is sized for short batch prompts, and a RAM budget sizes the expert cache from what
   the host actually has free.
-- **Placement profiles.** `--expert-stats` records how often each expert is used; `--expert-profile` loads such
-  counts at startup to choose which experts live on the GPUs and in RAM. Profiles can be made portable: the server
-  then matches them to a container by its size and the sha256 of its metadata header, not by its path.
+- **Placement profiles.** baKon's port records how often each expert is used (`--expert-stats`) and keeps the
+  busiest on the GPUs (`--expert-profile`). The fork also fills the RAM cache from the profile, adds `calibrate.sh`
+  and profile tools, and makes profiles portable: the server then matches them to a container by its size and the
+  sha256 of its metadata header, not by its path.
 - **Kernels.** Faster prompt processing (prefill; register tiling) and the GPUs' matrix units for the FP8 dense layers, both
   with unchanged results. Optionally, prompt processing and attention on the matrix units in another summation order: faster, but replies can then
   depend on the batch (see "Reproducible mode").
