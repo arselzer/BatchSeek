@@ -5734,7 +5734,7 @@ int FileStager::p1_hyb_pick(int32_t li) {
         c.rows = e >= 0 && e < counts_cap_ ? counts_host_[e] : 0;
         c.bytes = plan_->units[(size_t)u].bytes;
         /* An early copy waits in the ring for this unit (p1_early): the card's, as any ring unit. */
-        c.cached = mover_->unit_cached(u) && !p1_->early_for(li, u);
+        c.cached = mover_->unit_cached(u) && !(p1_ && p1_->early_for(li, u));
     }
     const p1hyb::Split sp = p1hyb::choose(p1_hyb_cand_.data(), (int)n, hx_pool_->backlog(), hx_pool_->cpu_bytes_per_ns(),
                                           hx_pool_->link_bytes_per_ns(), p1_hyb_shr().share(), p1_hyb_to_.data(),
