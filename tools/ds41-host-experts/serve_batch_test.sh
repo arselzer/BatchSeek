@@ -61,21 +61,21 @@ LW=$(sed -n '/^launch_words() {/,/^}/p' "$W")
 ) > "$T/loop.txt" 2>&1
 grep -q "^ARM $ARM$" "$T/loop.txt" && ok "the harness launches the arm" ||
   { bad "the harness did not launch the arm: $(grep -m3 -E 'skip|unknown' "$T/loop.txt")"; }
-awk -v a="ARM $ARM" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt" > "$T/harness.txt"
+awk -v a="ARM $ARM" '$0 == a { p = 1; next } /^ARM / { p = 0 } p && !/^LOG: /' "$T/loop.txt" > "$T/harness.txt"
 grep -q "^ARM $ARMQW$" "$T/loop.txt" && ok "the harness launches the Qw arm" ||
   { bad "the harness did not launch the Qw arm: $(grep -m3 -E "arm $ARMQW" "$T/loop.txt")"; }
-awk -v a="ARM $ARMQW" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt" > "$T/harness-qw.txt"
+awk -v a="ARM $ARMQW" '$0 == a { p = 1; next } /^ARM / { p = 0 } p && !/^LOG: /' "$T/loop.txt" > "$T/harness-qw.txt"
 grep -q "^ARM $ARMDA$" "$T/loop.txt" && ok "the harness launches the Dt-Aw arm" ||
   { bad "the harness did not launch the Dt-Aw arm: $(grep -m3 -E "arm $ARMDA" "$T/loop.txt")"; }
-awk -v a="ARM $ARMDA" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt" > "$T/harness-da.txt"
+awk -v a="ARM $ARMDA" '$0 == a { p = 1; next } /^ARM / { p = 0 } p && !/^LOG: /' "$T/loop.txt" > "$T/harness-da.txt"
 grep -q "^ARM $ARMDM$" "$T/loop.txt" && ok "the harness launches the Dm384 arm" ||
   { bad "the harness did not launch the Dm384 arm: $(grep -m3 -E "arm $ARMDM" "$T/loop.txt")"; }
-awk -v a="ARM $ARMDM" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt" > "$T/harness-dm.txt"
+awk -v a="ARM $ARMDM" '$0 == a { p = 1; next } /^ARM / { p = 0 } p && !/^LOG: /' "$T/loop.txt" > "$T/harness-dm.txt"
 
 grep -q "^ARM $ARMCAP$" "$T/loop.txt" && ok "the harness launches the capture arm" ||
   { bad "the harness did not launch the capture arm: $(grep -m3 -E "arm $ARMCAP" "$T/loop.txt")"; }
-awk -v a="ARM $ARMCAP" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt" > "$T/harness-cap.txt"
-awk -v a="ARM $ARMVL" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt" > "$T/harness-vl.txt"
+awk -v a="ARM $ARMCAP" '$0 == a { p = 1; next } /^ARM / { p = 0 } p && !/^LOG: /' "$T/loop.txt" > "$T/harness-cap.txt"
+awk -v a="ARM $ARMVL" '$0 == a { p = 1; next } /^ARM / { p = 0 } p && !/^LOG: /' "$T/loop.txt" > "$T/harness-vl.txt"
 if [[ -s "$T/harness-vl.txt" ]] && python3 -I "$HERE/serve_batch_match.py" params "$T/harness-vl.txt" > "$T/params-vl.txt" &&
    mapfile -t P < "$T/params-vl.txt" &&
    [[ " ${P[*]} " == *" --arena-split 1 "* && " ${P[*]} " == *" --kv-lend 1 "* && " ${P[*]} " == *" --ram-per-seq-mib 16 "* && " ${P[*]} " == *" --ctx-per-stream 576 "* ]] &&

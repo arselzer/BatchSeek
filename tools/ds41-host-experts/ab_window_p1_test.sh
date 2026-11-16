@@ -1087,8 +1087,10 @@ qdskip "$QONOP" "Qo needs P1; the arm is skipped"
 qdskip "$QONOK" "Qo packs into the packed RAM cache only (a K part); the arm is skipped"
 # ---- 6e. Qyc in the arm loop: the mask at 3 and every other switch as the arm without it; every other arm states 0;
 # Qyc without Qy or Qyp, Qyc4 and two Qyc parts skipped.
-sec=$(section "$QYC")
-base=$(section "$QYCBASE")
+# $QYCBASE is also $QYKP's name (launched twice): its last section only, and no skipped arm's LOG lines.
+lastsec() { awk -v a="ARM $1" '$0 == a { p = 1; buf = ""; next } /^ARM / { p = 0 } p && !/^LOG: / { buf = buf $0 "\n" } END { printf "%s", buf }' "$T/loop.txt"; }
+sec=$(lastsec "$QYC")
+base=$(lastsec "$QYCBASE")
 if [[ -z "$sec" || -z "$base" ]]; then bad "the Qyc arms $QYC / $QYCBASE were not launched: $(grep -m3 "arm $QYC" "$T/loop.txt")"
 else
   has "Qyc" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_CAL 3
