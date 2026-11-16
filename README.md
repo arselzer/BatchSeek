@@ -88,15 +88,15 @@ running. Power is GPUs + CPU, from their own sensors.
 Execution accuracy on both versions of BIRD's 500-question mini-dev set (thinking off, temperature 0 where a model
 accepts it), and the cost of the 2026 job:
 
-| Who runs the model | BIRD 2026 | BIRD original | Cost, 2026 set |
+| Who runs the model | BIRD 2026 accuracy | BIRD 2026 cost | BIRD original accuracy |
 |---|---:|---:|---:|
-| **This box** (default mode, BIRD training profile) | **50.2%** | **61.6%** | **€0.14** at €0.30/kWh |
-| DeepSeek API | 50.8% | 59.8% | €0.22 |
-| DeepInfra (FP8) | 47.2% | 60.2% | €0.12 |
-| Wafer (MXFP4) | 49.0% | 60.2% | €0.16 |
+| **This box** (default mode, BIRD training profile) | **50.2%** | **€0.14** at €0.30/kWh | **61.6%** |
+| DeepSeek API | 50.8% | €0.22 | 59.8% |
+| DeepInfra (FP8) | 47.2% | €0.12 | 60.2% |
+| Wafer (MXFP4) | 49.0% | €0.16 | 60.2% |
 | *Other models* | | | |
-| Claude Haiku 5.5 | 53.4% | 62.0% | €0.28 |
-| GPT-6 Luna | 43.0% | 55.8% | €0.17 |
+| Claude Haiku 5.5 | 53.4% | €0.28 | 62.0% |
+| GPT-6 Luna | 43.0% | €0.17 | 55.8% |
 
 API costs as billed through OpenRouter on 16 November 2026, at $1.12 per euro. Haiku and Luna ran at their default
 sampling, as they don't accept temperature 0. Differences of a few points are noise.
