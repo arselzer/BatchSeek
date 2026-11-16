@@ -40,7 +40,7 @@ b.append(k)
 # the part the cards keep resident
 b.append(f"<rect x='{X(0):.1f}' y='{Y(1):.1f}' width='{X(vram) - X(0):.1f}' height='{Y(0) - Y(1):.1f}' "
          f"fill='var(--s1)' fill-opacity='0.07'/>")
-b.append(text(X(vram) + 6, Y(0.08), f"\u2190 room on the cards (≈{vram:.0%})", SMALL, "ink2", "start", extra=HALO))
+b.append(text(X(vram) + 6, Y(0.08), f"\u2190 room on the GPUs (≈{vram:.0%})", SMALL, "ink2", "start", extra=HALO))
 b.append(text(X(vram) + 6, Y(0.08) + 14, "the rest: RAM cache, then SSD", SMALL, "muted", "start", extra=HALO))
 for v in (0, 0.25, 0.5, 0.75, 1.0):
     b.append(hline(L, x1, Y(v), "axis" if v == 0 else "grid"))
@@ -56,7 +56,7 @@ for kind, col in (("prefill", "s2"), ("decode", "s1")):
     b.append(dot(X(i / n), Y(cv[i]), col))
     b.append(text(X(i / n) + 8, Y(cv[i]) - 8 if kind == "decode" else Y(cv[i]) + 16, f"{cv[i]:.0%}", LABEL, "ink",
                   "start", "600", HALO))
-desc = (f"Busiest {vram:.0%} of each layer's experts (about what the cards keep resident): "
+desc = (f"Busiest {vram:.0%} of each layer's experts (about what the GPUs keep resident): "
         + ", ".join(f"{k} {v:.0%} of uses" for k, v in marks)) + "."
 # hover readout (inline use only; an <img> ignores the script): a crosshair and the two shares at the pointer
 b.append(f"<g id='xh' style='display:none;pointer-events:none'><line id='xhl' y1='{Y(1):.1f}' y2='{Y(0):.1f}' "

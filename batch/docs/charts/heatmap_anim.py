@@ -51,7 +51,7 @@ b = [css,
      f"<g class='hm' shape-rendering='crispEdges'>{''.join(cells)}</g>",
      f"<g class='vr'><line x1='{vx:.1f}' x2='{vx:.1f}' y1='{T - 4}' y2='{T + nl * ch + 4}' stroke='var(--ink)' "
      f"stroke-width='1.5' stroke-dasharray='4 3'/>"
-     + text(vx + 6, T - 8, f"room on the cards (≈{vram:.0%})", SMALL, "ink", "start", "600") + "</g>",
+     + text(vx + 6, T - 8, f"room on the GPUs (≈{vram:.0%})", SMALL, "ink", "start", "600") + "</g>",
      f"<g class='lab1'>{text(L0 + gw / 2, H - 10, 'experts in stored order', SMALL, 'ink2', 'middle')}</g>",
      f"<g class='lab2'>{text(L0 + gw / 2, H - 10, 'each layer sorted, busiest first', SMALL, 'ink2', 'middle')}</g>"]
 for l in (0, 10, 20, 30, 39):
@@ -60,6 +60,6 @@ b.append(text(L0 - 36, T + nl * ch / 2, "layer", SMALL, "ink2", "middle",
               extra=f" transform='rotate(-90 {L0 - 36} {T + nl * ch / 2})'"))
 desc = ("Animation: the 40 x 384 grid of expert use starts in stored order, scattered, then each layer's experts slide "
         "into sorted order, leaving a dark band of busy experts on the left of every layer, mostly inside the "
-        f"{vram:.0%} the cards have room for.")
+        f"{vram:.0%} the GPUs have room for.")
 open(out, "w").write(doc(W, H, f"<g transform='translate({PAD},0)'>{''.join(b)}</g>", "Sorting experts by use", desc))
 print(len(cells), "cells,", os.path.getsize(out) // 1024, "KB")

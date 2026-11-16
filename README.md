@@ -1,6 +1,6 @@
 # BatchSeek
 
-Large batch jobs (hundreds of requests at once) with DeepSeek-V4.1-Flash on four 16 GB AMD RDNA4 cards and 256 GB
+Large batch jobs (hundreds of requests at once) with DeepSeek-V4.1-Flash on four 16 GB AMD RDNA4 GPUs and 256 GB
 of RAM: a fork of radiance tuned for large batches, plus the tools to run and measure such jobs (in `batch/`).
 
 ## Credits
@@ -12,7 +12,7 @@ This repository builds on an engine written by other people:
   slydlake's and ggz14's MXFP4 matrix kernels. The full list is in radiance's
   [NOTICE](https://codeberg.org/StillDeadcode/radiance/src/branch/main/NOTICE).
 - **[baKon](https://codeberg.org/bakon)**: DeepSeek-V4.1 in radiance ([pull request 266](https://codeberg.org/StillDeadcode/radiance/pulls/266)):
-  the model across cards, the MXFP4 import, the Engram tables, and streaming experts from RAM and disk.
+  the model across GPUs, the MXFP4 import, the Engram tables, and streaming experts from RAM and disk.
 - **This repository** is a fork of radiance with changes for large batches (below), plus the batch tools in `batch/`:
   launcher, batch client, calibration, placement profiles, BIRD tools and model conversion.
 
@@ -24,25 +24,25 @@ Unofficial; not affiliated with DeepSeek, BIRD or radiance.
 
 ## What this fork changes in radiance
 
-The routed experts of DeepSeek-V4.1-Flash (about 289 GB) do not fit in four cards' 64 GB of VRAM. baKon's port
-already keeps hot experts on the cards and streams the rest from RAM and disk. This fork changes how that path
+The routed experts of DeepSeek-V4.1-Flash (about 289 GB) do not fit in four GPUs' 64 GB of VRAM. baKon's port
+already keeps hot experts on the GPUs and streams the rest from RAM and disk. This fork changes how that path
 behaves at hundreds of concurrent requests:
 
 - **RAM expert cache with CPU-computed experts.** A packed RAM cache holds most of the experts that are not on the
-  cards. The CPU computes some of them each step instead of sending them over PCIe (while generating and while
-  reading prompts). The CPU kernels use the card's arithmetic, so the results are bit-identical to the card's.
-- **Expert placement in VRAM.** Hot experts stay on the cards and follow live routing. The VRAM that the KV pool and
+  GPUs. The CPU computes some of them each step instead of sending them over PCIe (while generating and while
+  reading prompts). The CPU kernels use the GPU's arithmetic, so the results are bit-identical to the GPU's.
+- **Expert placement in VRAM.** Hot experts stay on the GPUs and follow live routing. The VRAM that the KV pool and
   other arenas do not need holds more experts.
 - **Batch admission and scheduling.** Requests that arrive together have their prompts read together in large
   chunks, and generation starts once the prompts are in, so each step generates a token for as many requests as
-  possible. Each expert sent to a card serves every token in the batch that needs it.
+  possible. Each expert sent to a GPU serves every token in the batch that needs it.
 - **Prefix cache and memory sizing.** Shared prompt heads (for example a database schema) are read once. The
   prefix cache's snapshot store is sized for short batch prompts, and a RAM budget sizes the expert cache from what
   the host actually has free.
 - **Placement profiles.** `--expert-stats` records how often each expert is used; `--expert-profile` loads such
-  counts at startup to choose which experts live on the cards and in RAM. Profiles can be made portable: the server
+  counts at startup to choose which experts live on the GPUs and in RAM. Profiles can be made portable: the server
   then matches them to a container by its size and the sha256 of its metadata header, not by its path.
-- **Kernels.** Faster prompt reading (register tiling) and the cards' matrix units for the FP8 dense layers, both
+- **Kernels.** Faster prompt reading (register tiling) and the GPUs' matrix units for the FP8 dense layers, both
   with unchanged results. Optionally, prompt reading and attention on the matrix units in another summation order: faster, but replies can then
   depend on the batch (see "Reproducible mode").
 - **Reproducibility checks and measurement harness.** `tools/ds41-host-experts/ab_window.sh` runs A/B measurement
@@ -123,10 +123,10 @@ The measured numbers used the IQ4_NL Engram tables from [ISTA-DASLab](https://hu
 ## Requirements
 
 - A HIP build of this repository, built like upstream radiance (see "Build from source" in its README; the
-  `deepseek41` plugin and `libr4d` must come from the same build), and the SiLU table its card check captures
+  `deepseek41` plugin and `libr4d` must come from the same build), and the SiLU table its GPU check captures
   (`ds41_mxfp4_device_check ... swiglu silu_table_gfx1201.bin`; see `tools/ds41-host-experts/README.md`).
 - The DeepSeek-V4.1-Flash container (`.rad`, 416 GB) on NVMe.
-- Tested only on four 16 GB RX 9070 XT cards (gfx1201, TP4), a 24-core EPYC and 256 GB of RAM. Big batches use nearly
+- Tested only on four 16 GB RX 9070 XT GPUs (gfx1201, TP4), a 24-core EPYC and 256 GB of RAM. Big batches use nearly
   all of that RAM: run jobs alone on the machine.
 - Python 3 (standard library only, except `batch/docs/charts/decode_steps.py`, which needs numpy and scipy).
 
@@ -194,7 +194,7 @@ instead keeps a profile per container in DIR and refreshes it from every run.
 
 ## Reproducible vs default mode
 
-By default, prompt reading and attention run on the cards' matrix units, summed in a different order, so a reply can change with
+By default, prompt reading and attention run on the GPUs' matrix units, summed in a different order, so a reply can change with
 the batch around it. `--reproducible` (alias `--exact`) turns those two modes off: every reply is then
 byte-identical whether a request runs alone or among hundreds of others, and the same whichever placement profile is
 used. On 500 BIRD questions the default finished the job 8% faster (260 s to 240 s) at similar accuracy (61.6% vs
@@ -257,7 +257,7 @@ python3 profile_blend_test.py
 ## What was not tested
 
 Upstream radiance serves many other models and has many other features (other architectures, speculative decoding,
-vision and audio input, Docker deployments, other GPUs and card counts). None of them were tested in this fork's
+vision and audio input, Docker deployments, other GPUs and GPU counts). None of them were tested in this fork's
 setup, and the fork's changes may affect them. For those, see
 [upstream radiance](https://codeberg.org/StillDeadcode/radiance) and its README.
 

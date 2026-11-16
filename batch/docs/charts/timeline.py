@@ -593,7 +593,7 @@ def render(a):
     for _, r in runs:
         gm = sum(v for _, v in r["gpu"]) / len(r["gpu"])
         cm = sum(v for _, v in r["cpu"]) / max(1, len(r["cpu"]))
-        caps4.append([(f"GPUs, {len(r['cards'])} cards (avg {gm:,.0f} W)", "s1", "line"),
+        caps4.append([(f"{len(r['cards'])} GPUs (avg {gm:,.0f} W)", "s1", "line"),
                       (f"CPU (avg {cm:,.0f} W)", "s2", "line"), "10 s mean over 1 s samples"])
     top4 = panel("Power (W)", draw4, caps4)
     bottom = top4 + PH
@@ -621,7 +621,7 @@ def render(a):
             + (f", {r['tok_per_step']:.0f} tokens per decode step" if r["tok_per_step"] else "") +
             f". Decode-step mean {rr['step_mean'] or 0:.0f} tok/s; whole-run average {rr['tokens'] / r['span']:.0f} tok/s; "
             + ". "
-            f"GPU power avg {gm:.0f} W over the {len(r['cards'])} cards; CPU avg {cm:.0f} W.")
+            f"GPU power avg {gm:.0f} W over the {len(r['cards'])} GPUs; CPU avg {cm:.0f} W.")
     desc = " ".join(descs)
     # pad the viewBox left so the y tick labels and panel titles share one left edge
     svg = doc(W, H, f"<g transform='translate(8,0)'>{''.join(body)}</g>", a.title or "Run timeline", desc)
