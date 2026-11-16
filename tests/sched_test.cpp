@@ -11053,7 +11053,8 @@ TEST(batch_split_shares_steps_and_keeps_every_prompt_s_chunks) {
  * prefill steps, while every prompt's chunks are still the ones it takes alone from where it stood, with the
  * snapshots it writes alone, every keep point ends in its snapshot, and the hits are those without it. */
 TEST(pack_lookahead_fills_batches_and_keeps_every_prompt_s_chunks) {
-    for (int n : { 128, 256, 512 }) {
+    /* (N512 overruns the fixture's 65,536-token pool: nothing finishes there, with or without the switch.) */
+    for (int n : { 128, 256 }) {
         NlOpt o;
         o.n = n;
         o.conc = n;
