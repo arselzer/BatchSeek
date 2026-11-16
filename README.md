@@ -126,6 +126,9 @@ export RADIANCE_HOME=/path/to/radiance-ramcache/build/radiance_home
 python3 batch_client.py questions.jsonl answers.jsonl --concurrency 512
 ```
 
+`--engram-file` reads the release's official FP8 Engram tables (203 GB extra download). Leave it out to use the IQ4_NL
+tables built into `model.rad` and save the space; both performed about the same in our tests.
+
 `questions.jsonl` has one `{"prompt": "...", "system": "...", "id": "..."}` a line; put text that prompts share (a
 schema, instructions) in `system`, so the prefix cache prefills it once. `batch_client.py --help` lists the rest.
 
