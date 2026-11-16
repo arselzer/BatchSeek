@@ -56,6 +56,8 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         { ds41p1::kHybridEnv, 0, ds41p1::kMaxHybridPct, &r.hybrid },
         /* Hybrid prefill: the same split in armed prefill passes, its own share in percent, 0 off. */
         { ds41p1::kHybridPrefillEnv, 0, ds41p1::kMaxHybridPct, &r.hybrid_prefill },
+        /* Hybrid calibration: a mask of the calibrated CPU rate (1) and the coupled share with its atomic choice (2). */
+        { ds41p1::kHybridCalEnv, 0, ds41p1::kMaxHybridCal, &r.hybrid_cal },
         /* Early ring copies: the next card-path layer's units a rank (0 off). */
         { ds41p1::kEarlyEnv, 0, ds41p1::kMaxEarly, &r.early },
     };

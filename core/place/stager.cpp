@@ -4635,6 +4635,7 @@ void FileStager::hx_drain() {
     aux_abandon();
     if (hx_reserved_ && hx_pool_) hx_pool_->unreserve(hx_reserved_);
     hx_reserved_ = 0;
+    p1_hyb_release_pre();
     if (hx_units_)
         for (int k = 0; k < hx_n_; ++k) mover_->release_host_unit(&hx_units_[k]);
     hx_n_ = 0;
@@ -5058,10 +5059,22 @@ int FileStager::p1_init(const Program& prog) {
             p1_hyb_ev_ = nullptr;
             return refuse(fmt("%s=%d: could not create its event", env, pct));
         }
-        if (t.hybrid > 0) p1_hyb_share_.init(t.hybrid, t.hybrid_adapt);
-        if (t.hybrid_prefill > 0) p1_hyb_pf_share_.init(t.hybrid_prefill, t.hybrid_adapt);
+        /* ..._P1_HYBRID_CAL (p1_hybrid.h "calibration"): calibrated, the share may grow to 4P (P was chosen against
+         * the model rate); coupled, the process's one share a kind starts there too (every rank inits it the same). */
+        const bool cal = (t.hybrid_cal & ds41p1::kHybridCalRate) != 0, cpl = (t.hybrid_cal & ds41p1::kHybridCalCouple) != 0;
+        const int ceil_dec = cal ? p1hyb::cal_ceiling(t.hybrid, ds41p1::kMaxHybridPct) : 0;
+        const int ceil_pf = cal ? p1hyb::cal_ceiling(t.hybrid_prefill, ds41p1::kMaxHybridPct) : 0;
+        if (t.hybrid > 0) p1_hyb_share_.init(t.hybrid, t.hybrid_adapt, ceil_dec);
+        if (t.hybrid_prefill > 0) p1_hyb_pf_share_.init(t.hybrid_prefill, t.hybrid_adapt, ceil_pf);
+        if (cpl && t.hybrid > 0) p1hyb::coupled_share(0).init(t.hybrid, t.hybrid_adapt, ceil_dec);
+        if (cpl && t.hybrid_prefill > 0) p1hyb::coupled_share(1).init(t.hybrid_prefill, t.hybrid_adapt, ceil_pf);
+        if (cal) p1hyb::rate_cal().init(hx_pool_->cpu_bytes_per_ns());
         p1_hyb_st_ = HybStats{};
         p1_hyb_pf_st_ = HybStats{};
+        p1_hyb_cal_n_[0] = p1_hyb_cal_n_[1] = 0;
+    } else if (t.hybrid_cal > 0) {
+        return refuse(fmt("%s=%d calibrates the hybrid split, and neither %s nor %s is on", ds41p1::kHybridCalEnv,
+                          t.hybrid_cal, ds41p1::kHybridEnv, ds41p1::kHybridPrefillEnv));
     }
     if (t.lend_audit && t.lend <= 0 && t.lend_arena <= 0 && t.lend_slab <= 0)
         return refuse(fmt("%s=1 reads lent slots back, and none is lent (%s, %s or %s)", ds41p1::kLendAuditEnv,
@@ -5246,6 +5259,17 @@ int FileStager::p1_init(const Program& prog) {
                  ds41p1::kLogHybridPrefill, (long long)p1_min_rows_, t.hybrid_prefill, ds41p1::kHybridPrefillEnv,
                  t.hybrid_prefill, hx_pool_->cpu_bytes_per_ns(), hx_pool_->link_bytes_per_ns(),
                  t.hybrid_adapt ? "adapts per rank from each layer's outcome, at most that" : "is held (..._P1_HYBRID_ADAPT=0)");
+    if (plan_->rank == 0 && t.hybrid_cal > 0 && (t.hybrid > 0 || t.hybrid_prefill > 0))
+        RAD_INFO("ds41 p1: hybrid calibration on (%s=%d): %s; %s; selection only (which side computes a unit, never its "
+                 "rows' bytes); counts in the shutdown stats line",
+                 ds41p1::kHybridCalEnv, t.hybrid_cal,
+                 (t.hybrid_cal & ds41p1::kHybridCalRate)
+                     ? "the split's CPU rate learnt from each split layer's completion (an EWMA a pass kind over every rank, "
+                       "from the pool's model rate), the share's ceiling 4P"
+                     : "the pool's model rate",
+                 (t.hybrid_cal & ds41p1::kHybridCalCouple)
+                     ? "one share a pass kind for every rank, and the choice with its reservation under the pool's decide lock"
+                     : "a share a rank");
     if (plan_->rank == 0 && t.early > 0)
         RAD_INFO("ds41 p1: early ring copies on (%s=%d): behind each card-path layer's waves, up to %d RAM-cache units "
                  "of the pass's next card-path layer, the profile's likeliest first, are copied into the ring before its "
@@ -5635,6 +5659,12 @@ int FileStager::p1_layer(int32_t li, RadStream s, bool hyb) {
                 L.layer, (int)hx_li_, hx_n_, (long long)hx_reserved_);
         return RAD_E_STATE;
     }
+    /* ..._P1_HYBRID_CAL's couple bit: what the choice reserved and no borrow drew goes back after the borrows, or
+     * on any early return. */
+    struct PreBack {
+        FileStager* fs;
+        ~PreBack() { fs->p1_hyb_release_pre(); }
+    } pre_back{ this };
     const bool split = hyb && p1_hyb_pick(li) > 0;
     for (size_t i = 0; i < want_.size(); ++i) {
         const int32_t u = want_[i];
@@ -5656,6 +5686,7 @@ int FileStager::p1_layer(int32_t li, RadStream s, bool hyb) {
         p1_ram_.push_back(hit ? 1 : 0);
         ++p1_units_;
     }
+    p1_hyb_release_pre();
     /* The layer's selected units pinned in the host pool: copied from their pool slots as a RAM-cache
      * unit is, and published skipped like the others until the layer is released. */
     p1_pool_sel_.clear();
@@ -5736,14 +5767,42 @@ int FileStager::p1_hyb_pick(int32_t li) {
         /* An early copy waits in the ring for this unit (p1_early): the card's, as any ring unit. */
         c.cached = mover_->unit_cached(u) && !(p1_ && p1_->early_for(li, u));
     }
-    const p1hyb::Split sp = p1hyb::choose(p1_hyb_cand_.data(), (int)n, hx_pool_->backlog(), hx_pool_->cpu_bytes_per_ns(),
-                                          hx_pool_->link_bytes_per_ns(), p1_hyb_shr().share(), p1_hyb_to_.data(),
+    p1_hyb_release_pre();
+    /* ..._P1_HYBRID_CAL's couple bit: the backlog read, the choice and the reservation of its whole cost under the
+     * pool's decide lock, so a rank deciding at the same time sees this choice whole (p1_hybrid.h "calibration"). */
+    std::unique_lock<std::mutex> lk;
+    if (p1_hyb_coupled()) lk = std::unique_lock<std::mutex>(hx_pool_->decide_mu());
+    const int64_t backlog = hx_pool_->backlog();
+    const p1hyb::Split sp = p1hyb::choose(p1_hyb_cand_.data(), (int)n, backlog, p1_hyb_cpu_rate(),
+                                          hx_pool_->link_bytes_per_ns(), p1_hyb_share_now(), p1_hyb_to_.data(),
                                           &p1_hyb_order_, HostExpertPool::kernel_cost());
+    if (lk.owns_lock() && sp.n_cpu > 0) {
+        hx_pool_->reserve(sp.cpu_cost);
+        p1_hyb_pre_ = sp.cpu_cost;
+    }
+    if (lk.owns_lock()) lk.unlock();
+    p1_hyb_seen_ = std::max<int64_t>(backlog, 0);
     if (sp.n_cpu > 0) {
         p1_hyb_cur().pred_cpu_ns += sp.cpu_ns;
         p1_hyb_cur().pred_card_ns += sp.card_ns;
     }
     return sp.n_cpu;
+}
+
+/* ..._P1_HYBRID_CAL's couple bit: the choice's reservation that no borrow drew (units the cache no longer gave, which
+ * went to the ring) goes back once the layer's borrows are done. */
+void FileStager::p1_hyb_release_pre() {
+    if (p1_hyb_pre_ > 0 && hx_pool_) hx_pool_->unreserve(p1_hyb_pre_);
+    p1_hyb_pre_ = 0;
+}
+
+/* The CPU rate the split charges: RateCal's for the pass kind under ..._P1_HYBRID_CAL's rate bit, else the model's. */
+double FileStager::p1_hyb_cpu_rate() const {
+    if (p1_hyb_calibrated()) {
+        const double r = p1hyb::rate_cal().bytes_per_ns(p1_hyb_kind());
+        if (r > 0) return r;
+    }
+    return hx_pool_->cpu_bytes_per_ns();
 }
 
 /* ..._P1_HYBRID: unit u (rows this pass; the admission's touch) leased into the pool's next unit, as the CPU path
@@ -5762,7 +5821,10 @@ bool FileStager::p1_hyb_borrow(int32_t u, int rows, bool admit) {
                 ++hx_n_;
                 p1_hyb_cpu_.push_back(u);
                 const int64_t c = HostExpertPool::cost_rows(std::max(rows, 1));
-                hx_pool_->reserve(c);
+                /* Coupled: drawn from the choice's reservation (p1_hyb_pick), the rest reserved here. */
+                const int64_t pre = std::min(p1_hyb_pre_, c);
+                p1_hyb_pre_ -= pre;
+                if (c > pre) hx_pool_->reserve(c - pre);
                 hx_reserved_ += c;
                 p1_hyb_cur().cost_bytes += c;
                 return true;
@@ -5783,6 +5845,7 @@ int FileStager::p1_hyb_submit(int32_t li) {
     p1_hyb_li_ = li;
     p1_hyb_split_ = true;
     hx_ticket_.last_ns.store(0, std::memory_order_relaxed);   /* p1_hyb_done reads the pool's finish */
+    p1_hyb_drain_ = p1_hyb_seen_ + hx_reserved_;               /* ..._P1_HYBRID_CAL: the cost the pool drains for it */
     p1_hyb_t_sub_ = std::chrono::steady_clock::now();
     RAD_TRY(hx_submit());
     HybStats& hs = p1_hyb_cur();
@@ -5807,6 +5870,11 @@ void FileStager::p1_hyb_done(bool early, uint64_t waited_ns) {
     if (fin > 0) {
         hs.pool_ns += (uint64_t)std::max<int64_t>(fin - sub, 0);
         ++hs.pool_layers;
+        /* ..._P1_HYBRID_CAL's rate bit: the pool's real rate on what it drained for this layer. */
+        if (p1_hyb_calibrated() && fin > sub) {
+            p1hyb::rate_cal().sample(p1_hyb_kind(), p1_hyb_drain_, fin - sub);
+            ++p1_hyb_cal_n_[p1_hyb_kind()];
+        }
     }
     const bool late = !early && p1_hyb_rec_ && rad_event_query(p1_hyb_ev_) == 1;
     if (early) ++hs.early;
@@ -5814,7 +5882,8 @@ void FileStager::p1_hyb_done(bool early, uint64_t waited_ns) {
         ++hs.late;
         hs.late_wait_ns += waited_ns;
     }
-    p1_hyb_shr().layer(early, late);
+    if (p1_hyb_coupled()) p1hyb::coupled_share(p1_hyb_kind()).layer(early, late);
+    else p1_hyb_shr().layer(early, late);
     p1_hyb_li_ = -1;
     p1_hyb_rec_ = false;
 }
@@ -6038,6 +6107,21 @@ std::string FileStager::p1_stats_line() const {
                     (double)h.late_wait_ns * 1e-9, (unsigned long long)h.early, 100.0 * p1_hyb_pf_share_.share(),
                     100.0 * p1_hyb_pf_share_.min_seen(), (double)h.pool_ns * 1e-9, (double)h.pool_ns * per,
                     (unsigned long long)h.pool_layers, (double)h.cost_bytes * 1e-9);
+    }
+    /* ..._P1_HYBRID_CAL: the calibrated rates (process-wide) and this rank's samples, and the coupled shares; the
+     * share fields above are this rank's own, which a coupled split does not move. ab_window.sh's Qyc gate reads it. */
+    if (p1_tun_.hybrid_cal > 0 && (p1_tun_.hybrid > 0 || p1_tun_.hybrid_prefill > 0)) {
+        const bool cal = p1_hyb_calibrated();
+        line += fmt("; hybrid calibration %d: pool rate decode %.1f GB/s (%llu samples), prefill %.1f GB/s (%llu samples), "
+                    "model %.1f GB/s; shares %s",
+                    p1_tun_.hybrid_cal, cal ? p1hyb::rate_cal().bytes_per_ns(0) : hx_pool_->cpu_bytes_per_ns(),
+                    (unsigned long long)p1_hyb_cal_n_[0], cal ? p1hyb::rate_cal().bytes_per_ns(1) : hx_pool_->cpu_bytes_per_ns(),
+                    (unsigned long long)p1_hyb_cal_n_[1], hx_pool_->cpu_bytes_per_ns(),
+                    p1_hyb_coupled()
+                        ? fmt("coupled, decode %.1f%% (lowest %.1f%%), prefill %.1f%% (lowest %.1f%%)",
+                              100.0 * p1hyb::coupled_share(0).share(), 100.0 * p1hyb::coupled_share(0).min_seen(),
+                              100.0 * p1hyb::coupled_share(1).share(), 100.0 * p1hyb::coupled_share(1).min_seen()).c_str()
+                        : "a rank's own");
     }
     return line;
 }

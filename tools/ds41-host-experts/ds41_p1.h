@@ -239,6 +239,21 @@ constexpr int kMaxHybridPct = 400;
  * rows before its gather, the same bytes the card path writes (core/place/p1_hybrid.h). Independent of kHybridEnv
  * (either or both); the same refusals, except that it does not need kDecodeRowsEnv. */
 constexpr const char* kHybridPrefillEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL";
+/* Hybrid calibration (kHybridCalEnv=M; 0 off, the default; else a mask of kHybridCalRate | kHybridCalCouple, 1 to 3;
+ * needs kHybridEnv or kHybridPrefillEnv; core/place/p1_hybrid.h "calibration"):
+ *  - kHybridCalRate: the split's CPU rate is learnt from each split layer's completion (the pool's submit-to-finish
+ *    time over the cost it had to drain: the backlog the choice saw plus its own), an EWMA a pass kind, process-wide,
+ *    in place of the pool's model rate (78 GB/s, which the pool runs ~2.6x below beside four cards' DMA); the share
+ *    keeps adapting as the safety loop, with its ceiling lifted to 4P (at most kMaxHybridPct), since P was chosen
+ *    against the model rate;
+ *  - kHybridCalCouple: one share a pass kind for every rank, adapted from every rank's layer outcomes (per rank, the
+ *    rank whose jobs sat last in the shared pool's oldest-first order took the lateness and backed off alone: H55's
+ *    N512 prefill shares settled at 52.9 / 39.0 / 20.7 / 27.7%), and the choice and its reservation made under one
+ *    lock, so ranks deciding at once see each other's choices whole (choose-then-reserve let two ranks both fit
+ *    into the same backlog).
+ * Selection only: which side computes a unit never changes its rows' bytes. */
+constexpr const char* kHybridCalEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_CAL";
+constexpr int kHybridCalRate = 1, kHybridCalCouple = 2, kMaxHybridCal = 3;
 /* Early ring copies (kEarlyEnv=K; 0 off, the default; else 1 to kMaxEarly, at most the ring's slots used): right
  * after a card-path layer's waves are issued, up to K RAM-cache units of the pass's next card-path layer, by the
  * sealed profile's share, are copied into the ring on the DMA lane, so the link works through that layer's

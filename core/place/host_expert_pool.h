@@ -163,6 +163,9 @@ public:
     int64_t backlog() const { return backlog_.load(std::memory_order_relaxed); }
     void    reserve(int64_t bytes) { backlog_.fetch_add(bytes, std::memory_order_relaxed); }
     void    unreserve(int64_t bytes) { drained(backlog_.fetch_sub(bytes, std::memory_order_relaxed) - bytes); }
+    /* The hybrid split's decide lock (p1_hybrid.h, kHybridCalCouple): a rank reads backlog(), chooses and reserves
+     * the choice's cost under it, so ranks deciding at once see each other's choices whole. Nothing else takes it. */
+    std::mutex& decide_mu() { return decide_mu_; }
     /* Sleeps until the pool has nothing queued or reserved, or `max_ns` has passed: for work that
      * should not share DRAM with the pool's streaming (the RAM cache's background inserts). */
     void    wait_idle(int64_t max_ns);
@@ -312,6 +315,7 @@ private:
      * before looking for work. 32 bits: with ..._FUTEX it is the futex word itself. */
     std::atomic<uint32_t> work_gen_{ 0 };
     std::mutex              submit_mu_;
+    std::mutex              decide_mu_;
     uint64_t                seq_ = 0;
     std::atomic<uint64_t>   submit_waits_{ 0 }, submit_wait_ns_{ 0 };
     std::mutex              idle_mu_;

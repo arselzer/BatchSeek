@@ -898,6 +898,20 @@ private:
      * the two adapt apart); p1_hyb_shr() is the share of this pass's kind. */
     p1hyb::Share p1_hyb_pf_share_;
     p1hyb::Share& p1_hyb_shr() { return p1_decode_pass_ ? p1_hyb_share_ : p1_hyb_pf_share_; }
+    /* ..._P1_HYBRID_CAL (p1_hybrid.h "calibration"; p1_tun_.hybrid_cal, 0 off): the pass kind (0 decode, 1 prefill);
+     * the share the split runs with and where a layer's outcome goes (the rank's own, or the coupled one); the rate
+     * the choice charges the CPU at (the model's, or RateCal's). */
+    int    p1_hyb_kind() const { return p1_decode_pass_ ? 0 : 1; }
+    bool   p1_hyb_coupled() const { return (p1_tun_.hybrid_cal & ds41p1::kHybridCalCouple) != 0; }
+    bool   p1_hyb_calibrated() const { return (p1_tun_.hybrid_cal & ds41p1::kHybridCalRate) != 0; }
+    double p1_hyb_share_now() { return p1_hyb_coupled() ? p1hyb::coupled_share(p1_hyb_kind()).share() : p1_hyb_shr().share(); }
+    double p1_hyb_cpu_rate() const;
+    /* kHybridCalCouple: the cost reserved at the choice that no borrow has drawn yet (given back by
+     * p1_hyb_release_pre after the layer's borrows); the backlog the choice saw and the cost the layer's submit had to
+     * drain (kHybridCalRate's sample); this rank's samples by kind. */
+    int64_t  p1_hyb_pre_ = 0, p1_hyb_seen_ = 0, p1_hyb_drain_ = 0;
+    uint64_t p1_hyb_cal_n_[2] = { 0, 0 };
+    void     p1_hyb_release_pre();
     std::vector<p1hyb::Cand> p1_hyb_cand_;
     std::vector<uint8_t> p1_hyb_to_;
     std::vector<int> p1_hyb_order_;
