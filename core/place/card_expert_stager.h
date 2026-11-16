@@ -114,6 +114,7 @@ struct Tunables {
     int  hybrid = 0;                                            /* hybrid decode: the CPU's share, percent (0 off) */
     int  hybrid_prefill = 0;                                    /* hybrid prefill: the CPU's share, percent (0 off) */
     bool hybrid_adapt = true;                                   /* the share adapts per rank (p1_hybrid.h) */
+    int  hybrid_cal = 0;                                        /* ds41p1::kHybridCalEnv: calibration mask (0 off) */
     bool align_end = true;
     bool swiglu_span = false;
     bool tiled = false;                                         /* ds41p1::kTiledEnv: the register-tiled twin */
@@ -126,7 +127,7 @@ struct Tunables {
  * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, lend_arena 0-64,
  * grace_ms 0-60000, lend_heat 0-8, lend_heat_half 1-100000000 (unset: 100, or 2000 with lend_slab),
  * lend_heat_margin 100-1000, lend_heat_prior 0-100000000 (unset: the half-life), lend_slab 0-256, lend_rest_ms 0-600000 (unset: 5000 with lend_heat or lend_slab, else
- * 0), decode_rows 0 or 17-4096, hybrid 0-400, hybrid_prefill 0-400, early 0-64), align "end" or "start", swiglu_span, lend_audit, tiled and
+ * 0), decode_rows 0 or 17-4096, hybrid 0-400, hybrid_prefill 0-400, hybrid_cal 0-3, early 0-64), align "end" or "start", swiglu_span, lend_audit, tiled and
  * tail_once 0/off or 1/on (default off), hybrid_adapt 0/off or 1/on (default on). False with the reason on anything else. */
 bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables* t, std::string* why);
 

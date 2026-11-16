@@ -35,6 +35,9 @@
 #   - --fast-attn (Aw, ..._ATTN_WMMA): the sparse attention at every height on the matrix cores, OFF by default. NOT
 #     exact: q.k and sum p k summed in another f32 order (the softmax's exp, max and normaliser the exact kernel's), so
 #     replies are not byte-identical to the exact engine's. Give 1 to turn it on (FASTDENSE-20261115.md).
+#   - --hybrid-cal M (QycM, ..._P1_HYBRID_CAL): the hybrid split's CPU rate learnt from completions (1), one share for
+#     every rank with the choice reserved under one lock (2), or both (3); exact (selection only). OFF (0) until window
+#     H58 measures it (core/place/p1_hybrid.h "calibration").
 #   - --early K (QxK, ..._P1_EARLY): up to K of the next card-path layer's units copied into the ring before its routing
 #     counts, so the link works through attention and the router; exact (scheduling only). OFF (0) until window H55
 #     measures it (OVERLAP-20261115.md).
@@ -65,8 +68,8 @@
 #                       [--ctx-per-stream 1152] [--profile FILE] [--mirror DIR] [--shared-head 32] [--served-name ds41]
 #                       [--radiance-home DIR] [--hybrid 60] [--max-seq-len N] [--tiled 0|1] [--tail-once 0|1]
 #                       [--swiglu-span 0|1] [--engram-early 0|1] [--hybrid-prefill 60] [--fast-prefill 0|1]
-#                       [--fast-dense 0|1] [--fast-attn 0|1] [--early K] [--pack W] [--pack-once 0|1] [--capture FILE]
-#                       [--auto-profile DIR] [--dry-run]
+#                       [--fast-dense 0|1] [--fast-attn 0|1] [--early K] [--pack W] [--pack-once 0|1] [--hybrid-cal M]
+#                       [--capture FILE] [--auto-profile DIR] [--dry-run]
 #                       [-- more radiance flags, e.g. --expert-stats FILE to record a profile; outside the measured set]
 #   RADIANCE_BIN (default: radiance on PATH, else build/bin/radiance), RADIANCE_HOME as for any radiance run.
 # --dry-run prints the environment and the command and starts nothing. Otherwise the script becomes the server (exec:
@@ -74,7 +77,7 @@
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
-EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=0 FASTDN=1 FASTAT=0 EARLY=0 PACK=0 PACKONCE=0 CAPTURE="" STREAMS_SET=0 AUTO=""
+EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=0 FASTDN=1 FASTAT=0 EARLY=0 PACK=0 PACKONCE=0 HYBCAL=0 CAPTURE="" STREAMS_SET=0 AUTO=""
 while (( $# )); do
   case $1 in
     --model) MODEL=${2:?}; shift ;;
@@ -103,6 +106,7 @@ while (( $# )); do
     --early) EARLY=${2:?}; shift ;;
     --pack) PACK=${2:?}; shift ;;
     --pack-once) PACKONCE=${2:?}; shift ;;
+    --hybrid-cal) HYBCAL=${2:?}; shift ;;
     --dry-run) DRY=1 ;;
     --) shift; EXTRA=("$@"); break ;;
     -h|--help) sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -127,6 +131,8 @@ num --hybrid-prefill "$HYBPF" 0; (( 10#$HYBPF <= 400 )) || die "--hybrid-prefill
 [[ -z "$SEQLEN" ]] || num --max-seq-len "$SEQLEN" 64
 num --early "$EARLY" 0; (( 10#$EARLY <= 64 )) || die "--early takes 0 (off) or 1-64 units, not '$EARLY'"
 num --pack "$PACK" 0; (( 10#$PACK <= 256 )) || die "--pack takes 0 (off) or 1-256 waiting prompts, not '$PACK'"
+num --hybrid-cal "$HYBCAL" 0; (( 10#$HYBCAL <= 3 )) || die "--hybrid-cal takes 0 (off) or a mask of 1-3, not '$HYBCAL'"
+(( 10#$HYBCAL == 0 || 10#$HYBRID > 0 || 10#$HYBPF > 0 )) || die "--hybrid-cal $HYBCAL calibrates the hybrid split: it needs --hybrid or --hybrid-prefill above 0"
 for v in "--tiled $TILED" "--tail-once $TAILONCE" "--swiglu-span $SPAN" "--engram-early $ENGEARLY" "--fast-prefill $FASTPF" "--fast-dense $FASTDN" "--fast-attn $FASTAT" "--pack-once $PACKONCE"; do
   [[ ${v#* } == [01] ]] || die "${v% *} takes 0 or 1, not '${v#* }'"
 done
@@ -224,6 +230,7 @@ ENV=(
   RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA=$FASTAT         # Aw: the WMMA sparse attention, inexact (--fast-attn)
   RADIANCE_EXPERIMENTAL_DS41_P1_EARLY=$((10#$EARLY))   # QxK: early ring copies, exact (--early K; 0 off until a window measures it)
   RADIANCE_EXPERIMENTAL_DS41_P1_PACK_ONCE=$PACKONCE    # Qo: admitted drive misses packed once, exact (--pack-once; 0 off until H60)
+  RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_CAL=$((10#$HYBCAL))   # QycM: the hybrid split's calibration, exact (--hybrid-cal M; 0 off)
   RADIANCE_EXPERIMENTAL_DS41_P1=1
   RADIANCE_EXPERIMENTAL_DS41_P1_WAVE=
   RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT=

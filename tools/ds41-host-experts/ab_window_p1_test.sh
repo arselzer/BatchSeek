@@ -43,6 +43,11 @@
 #   6d. Qyk (kernel costs, ..._HOST_EXPERTS_KERNEL_COST): qyk_gate on synthetic logs (the pool's line in a Qyk arm
 #      only); in the arm loop Qd64-Qy60-Qyk and Qd64-Qy60-Qyp60-Qyk on the fast arm state it 1, every other arm 0,
 #      and two Qyk parts are skipped.
+#   6e. QycM (the hybrid split's calibration, ..._P1_HYBRID_CAL): qyc_gate on synthetic logs (rank 0's line naming M
+#      once at startup; at exit every rank's calibration counts, with bit 1 some completion sample, with bit 2 the
+#      coupled shares; an arm without the part only without the line); in the arm loop Qd64-Qy60-Qyp60-Qyk-Qyc3 on the
+#      fast arm states it 3 and every other switch as the arm without it, every arm without the part states it 0,
+#      while Qyc without Qy or Qyp, Qyc4 and two Qyc parts are skipped with the reason.
 #   7. Ctp / CtpN (the prefill chain trace, ..._CHAIN_TRACE_PREFILL): the fast arm with Ctp traces one armed
 #      prefill pass in 4 into chain-<arm>, with Qd64 Ct16 Ctp2 both traces at their N into the same files;
 #      Ctp without P1 and Ctp0 are skipped with the reason; arms without the part do not set it; and
@@ -400,6 +405,42 @@ xexpect 1 'Qx unrequested activation' "$T/qx-good.log" '' start
 xexpect 0 'Qx explicitly off' "$T/qt-off.log" '' exit
 xexpect 1 'Qx asked, no line' "$T/qt-off.log" 12 start
 
+# ---- 6e. Qyc's gates: rank 0's calibration line naming M once at startup; at exit every rank's calibration counts,
+# some completion sample with bit 1, the coupled shares with bit 2.
+eval "$(sed -n '/^qyc_gate() {/,/^}/p' "$W")"
+declare -F qyc_gate >/dev/null || { echo "FAIL no qyc_gate in $W"; exit 1; }
+{
+  echo "I ds41 p1: hybrid calibration on (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_CAL=3): the split's CPU rate learnt from ..."
+  for rank in 0 1 2 3; do
+    echo "I[$rank] ds41 p1 stats, rank $rank: passes 3; ...; hybrid prefill: passes split 9 of 9 armed, ..., share 40.0% (lowest 20.0%), pool done 1.000 s after the submits (0.1000 s a pass, 300 layers), cost 12.0 GB; hybrid calibration 3: pool rate decode 31.2 GB/s (0 samples), prefill 28.4 GB/s ($((rank * 100)) samples), model 78.0 GB/s; shares coupled, decode 60.0% (lowest 60.0%), prefill 85.0% (lowest 30.0%)"
+  done
+} > "$T/qyc-good.log"
+sed -E 's/\(([0-9]+) samples\)/(0 samples)/g' "$T/qyc-good.log" > "$T/qyc-idle.log"
+sed 's/; shares coupled, .*/; shares a rank'"'"'s own/' "$T/qyc-good.log" > "$T/qyc-uncoupled.log"
+sed 's/P1_HYBRID_CAL=3/P1_HYBRID_CAL=1/; s/hybrid calibration 3:/hybrid calibration 1:/' "$T/qyc-uncoupled.log" > "$T/qyc-rate.log"
+sed 's/P1_HYBRID_CAL=3/P1_HYBRID_CAL=2/; s/hybrid calibration 3:/hybrid calibration 2:/' "$T/qyc-idle.log" > "$T/qyc-couple.log"
+grep -v 'rank 2:' "$T/qyc-good.log" > "$T/qyc-partial.log"
+sed '3s/; hybrid calibration .*//' "$T/qyc-good.log" > "$T/qyc-onemissing.log"
+cat "$T/qyc-good.log" "$T/qyc-good.log" > "$T/qyc-twice.log"
+cexpect() {
+  local want=$1 label=$2 rc; shift 2
+  qyc_gate "$@" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$label"; else bad "$label: exit $rc, want $want"; fi
+}
+cexpect 0 'Qyc startup line' "$T/qyc-good.log" 3 start
+cexpect 0 'Qyc counts at exit' "$T/qyc-good.log" 3 exit
+cexpect 0 'Qyc partial ranks still every line counted' "$T/qyc-partial.log" 3 exit
+cexpect 1 'Qyc line names another mask' "$T/qyc-rate.log" 3 start
+cexpect 1 'Qyc line twice' "$T/qyc-twice.log" 3 start
+cexpect 1 'Qyc3 never sampled' "$T/qyc-idle.log" 3 exit
+cexpect 1 'Qyc3 shares not coupled' "$T/qyc-uncoupled.log" 3 exit
+cexpect 1 'Qyc3 a rank without its counts' "$T/qyc-onemissing.log" 3 exit
+cexpect 0 'Qyc1 sampled, uncoupled' "$T/qyc-rate.log" 1 exit
+cexpect 0 'Qyc2 coupled, no samples needed' "$T/qyc-couple.log" 2 exit
+cexpect 1 'Qyc unrequested activation' "$T/qyc-good.log" '' start
+cexpect 0 'Qyc explicitly off' "$T/qt-off.log" '' exit
+cexpect 1 'Qyc asked, no line' "$T/qt-off.log" 3 start
+
 # ---- the balance receipt: an old generic PASS is not requested-height evidence
 eval "$(sed -n '/^bal_receipt_bound() {/,/^}/p' "$W")"
 declare -F bal_receipt_bound >/dev/null || { echo "FAIL no bal_receipt_bound in $W"; exit 1; }
@@ -567,6 +608,12 @@ QO=$FAST-Qd64-Qy60-Qo
 QONOP=$REF-Qo
 QONOK=${FAST/-K-/-}-Qo
 ARMS="$ARMS $QO $QONOP $QONOK"
+QYC=$FAST-Qd64-Qy60-Qyp60-Qyk-Qyc3
+QYCBASE=$FAST-Qd64-Qy60-Qyp60-Qyk
+QYCNOH=$FAST-Qyc1
+QYCBIG=$FAST-Qd64-Qy60-Qyc4
+QYCTWO=$FAST-Qd64-Qy60-Qyc1-Qyc2
+ARMS="$ARMS $QYC $QYCBASE $QYCNOH $QYCBIG $QYCTWO"
 run_loop() {   # actual balance-oracle bound; every model action remains stubbed
  (
   set +u
@@ -964,6 +1011,26 @@ for a in "$REF" "$NEW" "$FAST" "$QD200" "$QX" "$QZ" "$QT"; do
 done
 qdskip "$QONOP" "Qo needs P1; the arm is skipped"
 qdskip "$QONOK" "Qo packs into the packed RAM cache only (a K part); the arm is skipped"
+# ---- 6e. Qyc in the arm loop: the mask at 3 and every other switch as the arm without it; every other arm states 0;
+# Qyc without Qy or Qyp, Qyc4 and two Qyc parts skipped.
+sec=$(section "$QYC")
+base=$(section "$QYCBASE")
+if [[ -z "$sec" || -z "$base" ]]; then bad "the Qyc arms $QYC / $QYCBASE were not launched: $(grep -m3 "arm $QYC" "$T/loop.txt")"
+else
+  has "Qyc" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_CAL 3
+  has "Qyc beside Qy60" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID 60
+  has "Qyc beside Qyp60" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL 60
+  has "no Qyc part ($QYCBASE)" "$base" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_CAL 0
+  if diff <(grep -v 'HYBRID_CAL\|ARM_QYC\|^ARM \|Qyc' <<< "$sec") <(grep -v 'HYBRID_CAL\|ARM_QYC\|^ARM \|Qyc' <<< "$base") >/dev/null; then
+    ok "Qyc: every other switch and argument as $QYCBASE"
+  else bad "Qyc: differs from $QYCBASE beyond the switch: $(diff <(grep -v 'HYBRID_CAL\|ARM_QYC\|Qyc' <<< "$sec") <(grep -v 'HYBRID_CAL\|ARM_QYC\|Qyc' <<< "$base") | head -4 | tr '\n' ' ')"; fi
+fi
+for a in "$REF" "$NEW" "$FAST" "$QD200" "$QY25" "$QZ" "$QT" "$QX"; do
+  has "no Qyc part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_CAL 0
+done
+qdskip "$QYCNOH" "Qyc1 calibrates the hybrid split, which needs Qy or Qyp; the arm is skipped"
+qdskip "$QYCBIG" "Qyc4: Qyc takes 1-3 (a mask); the arm is skipped"
+qdskip "$QYCTWO" "two Qyc parts; the arm is skipped"
 
 short_out=$(run_loop 2048)
 for a in "$COLD4K" "$PC4K"; do
