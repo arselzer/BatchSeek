@@ -92,8 +92,8 @@ accepts it), and the cost of the 2026 job:
 |---|---:|---:|---:|---:|
 | **This box** (default mode, BIRD training profile) | **50.2%** | **€0.14** at €0.30/kWh | **61.6%** | **€0.014** |
 | DeepSeek API | 50.8% | €0.22 | 59.8% | €0.031 |
-| DeepInfra (FP8) | 47.2% | €0.12 | 60.2% | €0.015 |
-| Wafer (MXFP4) | 49.0% | €0.16 | 60.2% | €0.021 |
+| DeepInfra | 47.2% | €0.12 | 60.2% | €0.015 |
+| Wafer | 49.0% | €0.16 | 60.2% | €0.021 |
 | *Other models* | | | | |
 | Claude Haiku 5.5 | 53.4% | €0.28 | 62.0% | €0.10 |
 | GPT-6 Luna | 43.0% | €0.17 | 55.8% | €0.063 |
