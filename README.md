@@ -136,10 +136,6 @@ accuracy.
 
 ## From zero
 
-Note (16 November 2026): the engine update behind the launcher's newest options (the faster default mode,
-`--reproducible` and `--engram-file`) is being merged into `main` today; until then `main` runs the reproducible
-configuration and ignores `--engram-file`.
-
 ```sh
 git clone https://github.com/arselzer/BatchSeek && cd BatchSeek
 
