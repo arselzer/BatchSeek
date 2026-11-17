@@ -70,28 +70,34 @@ Configuration, switches and measurements: [tools/ds41-host-experts/README.md](to
 
 ## Results
 
-Four RX 9070 XT (TP4), EPYC 7443 (24 cores), 256 GB DDR4-2666, one 2 TB NVMe drive. All 500 questions of BIRD's 2026
-mini-dev set (official prompts, replies up to 2048 tokens) in one batch, default mode, the release's FP8 Engram tables
-(`--engram-file`) and the BIRD training profile:
+Four RX 9070 XT (TP4), EPYC 7443 (24 cores), 256 GB DDR4-2666, one 2 TB NVMe drive; default mode, the release's FP8
+Engram tables (`--engram-file`), the BIRD training profile, a KV pool of 655,360 tokens (original BIRD) or 720,896
+(BIRD 2026). Both versions of BIRD's 500-question mini-dev set: the original prompts ask for the SQL only, the 2026
+revision's official prompts for reasoning before the SQL (replies up to 2,048 tokens).
+
+| Questions at once | Original BIRD: tokens/s generating | whole job | Wh per 1,000 tokens | BIRD 2026: tokens/s generating | whole job | Wh per 1,000 tokens |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 34 | 14 | 12.0 | 25 | 21 | 8.5 |
+| 8 | 59 | 33 | 4.8 | 37 | 35 | 4.1 |
+| 64 | 79 | 46 | 3.3 | 53 | 50 | 2.8 |
+| 256 | 164 | 108 | 1.69 | 101 | 94 | 1.91 |
+| 500 | 228 | 152 | 1.28 | 155 | 137 | 1.34 |
+
+"Generating": output tokens over the server's generation time; "whole job": over the time from the first request to the
+last reply, prompts included. The 1, 8 and 64 rows use the first 8 or 64 questions of each set. Power (GPUs + CPU, from
+their own sensors) stays between 520 and 710 W. All 500 original questions at once take 3.5 minutes (31,643 output
+tokens); BIRD 2026's take 39 minutes (316,824 output tokens), most of it a shrinking group of long answers.
+
+![Output tokens per second by questions at once, two BIRD sets](batch/docs/charts/throughput.svg)
 
 ![A 500-request job over time: requests waiting, processing prompts and generating, output tokens per second, KV cache, power](batch/docs/charts/timeline-500.svg)
-
-| BIRD 2026 questions at once | Peak output tokens/s | Whole job, tokens/s | Power (avg, W) | Wh per 1,000 tokens |
-|---:|---:|---:|---:|---:|
-| 1 | ~20 | 17 | 587 | 9.4 |
-| 500 | ~340 | 137 | 663 | 1.34 |
-
-The job takes 39 minutes from the first request to the last reply and produces 316,824 output tokens: four and a half
-minutes of prompt processing, then generation. The peak is measured from the KV cache's growth over 10 seconds while all 500
-generate. Replies vary a lot in length, so for most of the second half only a shrinking group of long answers is still
-running. Power is GPUs + CPU, from their own sensors.
 
 Execution accuracy on both versions of BIRD's 500-question mini-dev set (thinking off, temperature 0 where a model
 accepts it), and the cost of the 2026 job:
 
 | Who runs the model | BIRD 2026 accuracy | BIRD 2026 cost | BIRD original accuracy | BIRD original cost |
 |---|---:|---:|---:|---:|
-| **This box** (default mode, BIRD training profile) | **50.6%** | **€0.13** at €0.30/kWh | **61.6%** | **€0.014** |
+| **This box** (default mode, BIRD training profile) | **50.6%** | **€0.13** at €0.30/kWh | **61.8%** | **€0.012** |
 | DeepSeek API | 50.8% | €0.22 | 59.8% | €0.031 |
 | DeepInfra | 47.2% | €0.12 | 60.2% | €0.015 |
 | Wafer | 49.0% | €0.16 | 60.2% | €0.021 |
