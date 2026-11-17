@@ -31,8 +31,9 @@ behaves at hundreds of concurrent requests:
 - **RAM expert cache with CPU-computed experts.** A packed RAM cache holds most of the experts that are not on the
   GPUs. The CPU computes some of them each step instead of sending them over PCIe (while generating and while
   prompt processing). The CPU kernels use the GPU's arithmetic, so the results are bit-identical to the GPU's.
-- **Expert placement in VRAM.** Hot experts stay on the GPUs and follow live routing. The VRAM that the KV pool and
-  other arenas do not need holds more experts.
+- **Expert placement in VRAM.** The busiest experts in the placement profile stay on the GPUs; the activation
+  arena's room that a step does not use holds more of them (lent arena). The KV pool takes VRAM from the experts, so
+  it should be no larger than the batch needs (see "Long prompts").
 - **Batch admission and scheduling.** Requests that arrive together have their prompts processed together in large
   chunks, and generation starts once the prompts are in, so each step generates a token for as many requests as
   possible. Each expert sent to a GPU serves every token in the batch that needs it.
@@ -180,6 +181,20 @@ pool at most about 720,000 tokens: it takes VRAM from the experts kept on the GP
 down (the launcher warns above about 786,000). For all 500 of BIRD's 2026 prompts at once (about 4,000-token prompts,
 replies up to 2,048): `--streams 512 --ctx-per-stream 1408 --max-seq-len 8192`. `--dry-run` shows the resulting settings.
 
+**Reproducing the results.** Build the sets (see "Rebuilding the BIRD sets"), start the server with the set's pool,
+send the set, score it. The runs in the results tables used `--profile profiles/bird-train.profile.json` and
+`--engram-file` with the two FP8 shards; everything else is the launcher's default.
+
+| Set | `serve-batch.sh` | `batch_client.py` |
+|---|---|---|
+| Original BIRD, 500 at once | `--streams 512 --ctx-per-stream 1280 --max-seq-len 4096` | `sets/bird500-receipt.json out.jsonl --receipt --concurrency 512` |
+| BIRD 2026, 500 at once | `--streams 512 --ctx-per-stream 1408 --max-seq-len 8192` | `sets/birdhf500-receipt.json out.jsonl --receipt --concurrency 512` |
+| BIRD dev, 1,534 through 512 slots | `--streams 512 --ctx-per-stream 1408 --max-seq-len 8192` | `sets/birddev26-receipt.json out.jsonl --receipt --concurrency 512` |
+| Smaller rows (1, 8, 64, 256) | as for the set | add `--first N --concurrency N` (256: `bird256-receipt.json`) |
+
+The client keeps each receipt's own reply limit (2,048 tokens for BIRD 2026). It refills slots one at a time as
+replies finish; the measured dev run refilled 16 at a time, which keeps prompt steps larger.
+
 ## Calibration
 
 A profile recorded on prompts like yours places experts better. One command starts a calibration server, sends
@@ -200,8 +215,8 @@ instead keeps a profile per container in DIR and refreshes it from every run.
 By default, prompt processing and attention run on the GPUs' matrix units, summed in a different order, so a reply can change with
 the batch around it. `--reproducible` (alias `--exact`) turns those two modes off: every reply is then
 byte-identical whether a request runs alone or among hundreds of others, and the same whichever placement profile is
-used. On 500 BIRD questions the default finished the job 8% faster (260 s to 240 s) at similar accuracy (61.6% vs
-62.2%; the paired test found no significant difference). Calibration runs use the reproducible mode unless the fast modes are
+used. In an earlier run (500 original BIRD questions, 256 at a time) the default finished the job 8% faster (260 s to 240 s)
+at similar accuracy (61.6% vs 62.2%; the paired test found no significant difference). Calibration runs use the reproducible mode unless the fast modes are
 named.
 
 ## Rebuilding the BIRD sets
@@ -229,8 +244,15 @@ they write. Run them with `python3 -I`, since they read downloaded data.
    ```
    07e52383de992829824d2da76a6e09ed17f170db876cf8e1ae1c4592d8bee8f0  birdtrain64-receipt.json
    ```
-3. `bird/make_birddev_set.py` builds a larger set from BIRD's full dev split, and `bird/make_birdhf_sets.py` the
-   2026 revision with BIRD's own prompts (https://huggingface.co/datasets/birdsql/bird_mini_dev).
+3. `bird/make_birdhf_sets.py` builds the 2026 revision with BIRD's own prompts
+   (https://huggingface.co/datasets/birdsql/bird_mini_dev; it writes `birdhf500-receipt.json`), and
+   `bird/make_birddev26_set.py` BIRD's full dev split (1,534 questions; unpack `dev.zip` from bird-bench) in the same
+   2026 prompt format, taking each database's schema block from the 2026 prompts:
+   ```sh
+   python3 -I bird/make_birddev26_set.py sets/birdhf500-receipt.json mini_dev_2026/data/mini_dev_sqlite.jsonl \
+     dev_20240627/dev.json sets/birddev26-receipt.json
+   ```
+   (`bird/make_birddev_set.py` builds a dev set in the original prompt format.)
 
 Send a set with `python3 batch_client.py sets/bird256-receipt.json replies.jsonl --receipt --concurrency 256`.
 
@@ -238,6 +260,8 @@ Send a set with `python3 batch_client.py sets/bird256-receipt.json replies.jsonl
 
 ```sh
 python3 -I bird/bird_ex.py replies.jsonl minidev/MINIDEV/mini_dev_sqlite.json minidev/MINIDEV/dev_databases
+python3 -I bird/bird_ex.py replies-2026.jsonl mini_dev_2026/data/mini_dev_sqlite.jsonl minidev/MINIDEV/dev_databases
+python3 -I bird/bird_ex.py replies-dev.jsonl dev_20240627/dev.json dev_20240627/dev_databases
 python3 -I bird/paired_ex.py a.jsonl b.jsonl minidev/MINIDEV/mini_dev_sqlite.json minidev/MINIDEV/dev_databases
 python3 -I bird/compare_runs.py minidev/MINIDEV/mini_dev_sqlite.json minidev/MINIDEV/dev_databases A=a.jsonl B=b.jsonl
 ```
@@ -267,9 +291,10 @@ setup, and the fork's changes may affect them. For those, see
 Also not covered:
 
 - other hardware than four 16 GB RX 9070 XT and 256 GB of RAM;
-- continuous serving with a long queue (the measurements are finite batches submitted together);
+- continuous serving for hours (the longest measured queue is BIRD's dev set: 1,534 questions, 52 minutes);
 - long contexts at large batch sizes;
-- chat: at large batches each request gets about 0.5-0.8 tokens/s, which suits jobs nobody waits on.
+- chat: at large batches each request gets well under 1 token/s (about 0.3-0.6 at 256-500 at once), which suits jobs
+  nobody waits on.
 
 ## License
 

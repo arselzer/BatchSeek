@@ -5,7 +5,10 @@ are the mini-dev ones), and each dev question/evidence replaces the mini-dev one
 Usage: make_birddev26_set.py BIRDHF500_RECEIPT ANNOTATIONS_2026 DEV_JSON OUT_RECEIPT"""
 import json, sys
 rec, ann, dev, out = sys.argv[1:5]
-R = json.load(open(rec))['benchmark_requests']; A = {str(x['question_id']): x for x in json.load(open(ann))}
+R = json.load(open(rec))['benchmark_requests']
+txt = open(ann).read()   # the 2026 annotations: a JSON list, or the release's JSON Lines (data/mini_dev_sqlite.jsonl)
+A = {str(x['question_id']): x for x in (json.loads(txt) if txt.lstrip().startswith('[') else
+                                        [json.loads(l) for l in txt.splitlines() if l.strip()])}
 tmpl = {}
 for r in R:
     q = A[r['name'].split('-', 1)[1]]; u = r['request']['chat_turns'][0]['user']
