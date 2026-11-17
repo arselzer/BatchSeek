@@ -509,9 +509,7 @@ def render(a):
             if not r["tps"]:
                 capst.append([]); continue
             it = [(f"{r['tps_smooth']:.0f} s mean", "s1", "line"), f"faint: {r['tps_grid']:.0f} s cells"]
-            it.append("reconstructed from per-request timings;")
-            if r["tps_check"] is not None:
-                it.append(f"matches the server's step count within {r['tps_check']:.1f}%")
+            it.append("reconstructed from per-request timings")
             capst.append(it)
         panel("Output tokens/s while generating", drawt, capst)
 
