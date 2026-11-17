@@ -7,7 +7,7 @@ function mv(e){var r=s.getBoundingClientRect(),vb=s.viewBox.baseVal,x=(e.clientX
  var bx=px+12>X1-210?px-218:px+12,by=Y0+40,b=q('thb');b.setAttribute('x',bx);b.setAttribute('y',by);
  var L=[Math.round(t)+' s',
   'waiting '+f(S.wait[i])+', processing prompt '+f(S.pre[i]),'generating '+f(S.dec[i]),
-  S.tps.length?'output ≈'+f(S.tps[i])+' tokens/s':'',S.kv.length?'KV cache '+f(S.kv[i]/1000)+'k tokens':'',
+  S.tps.length?'output ≈'+f(S.tps[i])+' tokens/s':'',S.kv.length?'KV cache '+Math.round(S.kv[i])+'% of the pool':'',
   'GPUs '+f(S.gpu[i])+' W',S.cpu.length?'CPU '+f(S.cpu[i])+' W':''].filter(function(z){return z});
  for(var k=0;k<7;k++){var el=q('tht'+k);el.textContent=L[k]||'';el.setAttribute('x',bx+10);el.setAttribute('y',by+17+k*14.5)}
  b.setAttribute('height',14+L.length*14.5)}

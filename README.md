@@ -202,7 +202,10 @@ send the set, score it. The runs in the results tables used `--profile profiles/
 | Original BIRD, 500 at once | `--streams 512 --ctx-per-stream 1280 --max-seq-len 4096` | `sets/bird500-receipt.json out.jsonl --receipt --concurrency 512` |
 | BIRD 2026, 500 at once | `--streams 512 --ctx-per-stream 1408 --max-seq-len 8192` | `sets/birdhf500-receipt.json out.jsonl --receipt --concurrency 512` |
 | BIRD dev, 1,534 through 512 slots | `--streams 512 --ctx-per-stream 1408 --max-seq-len 8192` | `sets/birddev26-receipt.json out.jsonl --receipt --concurrency 512` |
-| Smaller rows (1, 8, 64, 256) | as for the set | add `--first N --concurrency N` (256: `bird256-receipt.json`); the measured 8 row ran in waves of 8, the client refills instead |
+| 1 at a time | as for the set | `--first 8 --concurrency 1` |
+| 8 at a time | as for the set | `--first 64 --concurrency 8` (the measured run sent eight waves of 8; the client refills instead) |
+| 64 at once | as for the set | `--first 64 --concurrency 64` |
+| 256 at once | as for the set | original: `sets/bird256-receipt.json out.jsonl --receipt --concurrency 256`; 2026: `sets/birdhf500-receipt.json out.jsonl --receipt --first 256 --concurrency 256` |
 
 The client keeps each receipt's own reply limit (2,048 tokens for BIRD 2026). It refills slots one at a time as
 replies finish; the measured dev run refilled 16 at a time, which keeps prompt steps larger.
