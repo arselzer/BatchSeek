@@ -22,12 +22,12 @@ fail=0
 ok()  { echo "ok   $*"; }
 bad() { echo "FAIL $*"; fail=1; }
 
-ARM=all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-mA-Qd64-Qa0-Pc-Pch32-Pcs128-L294912-Pf-N256-C256-Ba2048-Bs-Qy60-Qyp60-Qyk-Qsp-Qt-Qz-Ee-Dt-Xqprof
+ARM=all-t40-f-M2048-H-p256-m229376-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-mA5120-Qd64-Qa0-Pc-Pch32-Pcs128-L294912-Pf-N256-C256-Ba2048-Bs-Bp16-Qy60-Qyp60-Qyk-Qyc3-Qsp-Qt-Qz-Qo-Qes-Qx12-Ee-Dt-Xqprof
 ARMQW=${ARM%-Dt-Xqprof}-Qw-Dt-Xqprof; ARMQW=${ARMQW/-Qsp-Qt-Qz-/-Qsp-Qz-}   # with the WMMA P1 twin (Qw, inexact) in place of Qt: --fast-prefill 1
 ARMDA=${ARM%-Xqprof}-Aw-Xqprof   # with the WMMA attention (Aw, inexact) too: --fast-attn 1
 # The calibration run (serve-batch.sh --capture): 8 streams, Ba256 without Bs, routing counts (Xst), no profile.
 ARMCAP=${ARM/-L294912-Pf-N256-C256-Ba2048-Bs-/-L9216-Pf-N8-C8-Ba256-}; ARMCAP=${ARMCAP%-Xqprof}-Xnp-Xst
-ARMVL=${ARM%-Xqprof}-Qes-Kvl-mS16-Xqprof; ARMVL=${ARMVL/-L294912-/-Lk452-}   # VRAMLEND: --arena-split 1 --kv-lend 1 --ram-per-seq-mib 16, an Lk pool
+ARMVL=${ARM%-Xqprof}-Kvl-mS16-Xqprof; ARMVL=${ARMVL/-L294912-/-Lk452-}   # VRAMLEND: --arena-split 1 --kv-lend 1 --ram-per-seq-mib 16, an Lk pool
 ARMDM=${ARM%-Xqprof}-Dm384-Xqprof   # decode first at 384 ready streams (DmN, exact): --decode-min 384
 mkdir -p "$T/home/kernels" "$T/mirror" "$T/profiles"; echo "{}" > "$T/profiles/prof.json"
 echo "not a library" > "$T/home/kernels/libr4d.so"
@@ -86,9 +86,9 @@ if [[ -s "$T/harness-vl.txt" ]] && python3 -I "$HERE/serve_batch_match.py" param
   ok "the Qes-Kvl-mS16-Lk452 arm: params give --arena-split 1 --kv-lend 1 --ram-per-seq-mib 16 --ctx-per-stream 576, and serve-batch.sh with them: $(cat "$T/cmp-vl.txt")"
 else bad "the VRAMLEND arm: $(grep -m2 "arm $ARMVL" "$T/loop.txt") $(tr '\n' ' ' < "$T/params-vl.txt" 2>/dev/null) $(tr '\n' ';' < "$T/cmp-vl.txt" 2>/dev/null)"; fi
 dv=$("$SB" --model M --silu-table S --dry-run)
-grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_KV_LEND=0' <<< "$dv" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT=0' <<< "$dv" &&
+grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_KV_LEND=0' <<< "$dv" && grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT=1' <<< "$dv" &&
   grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_RAM_PER_SEQ_MIB=' <<< "$dv" && [[ $dv == *"--max-model-len 294912 "* ]] &&
-  ok "--kv-lend, --arena-split off and no per-sequence term by default; the pool streams x 1152" || bad "the VRAMLEND defaults"
+  ok "--kv-lend off, --arena-split on and no per-sequence term by default; the pool streams x 1152" || bad "the VRAMLEND defaults"
 "$SB" --model M --silu-table S --kv-lend 2 --dry-run > /dev/null 2>&1 && bad "--kv-lend 2 accepted" || ok "--kv-lend 2 refused"
 "$SB" --model M --silu-table S --kv-auto 8 --dry-run > /dev/null 2>&1 && bad "--kv-auto 8 accepted" || ok "--kv-auto under 16 refused"
 
@@ -146,9 +146,9 @@ grep -qx 'env RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=64' <<< "$dres" && ok "--
   bad "--shared-head"
 [[ $dres == *"--port 9000"* ]] && ok "--port" || bad "--port"
 d0=$("$SB" --model M --silu-table S --dry-run)
-if grep -q 'RAM_RESERVE_MIB' <<< "$d0" || [[ $d0 == *--expert-profile* || $d0 == *--expert-plane-mirror* ]]; then
-  bad "the defaults add a reserve, a profile or a mirror"
-else ok "the defaults: no reserve variable, no --expert-profile, no mirror"; fi
+if ! grep -qx 'env RADIANCE_EXPERIMENTAL_DS41_RAM_RESERVE_MIB=5120' <<< "$d0" || [[ $d0 == *--expert-profile* || $d0 == *--expert-plane-mirror* ]]; then
+  bad "the defaults: the measured 5120 MiB reserve, and no profile or mirror"
+else ok "the defaults: the measured 5120 MiB reserve, no --expert-profile, no mirror"; fi
 grep -qx 'env RADIANCE_EXPERIMENTAL_PREFIX_SHARED_HEAD=32' <<< "$d0" && ok "the shared-head floor's default: 32" ||
   bad "the shared-head default"
 

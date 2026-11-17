@@ -41,13 +41,13 @@
 #     speed (BIRD 256 170.2 vs 172.2 s), NLL 0.688 vs 0.692 (window ab-20261116T114113Z). Recommended; off when not given.
 #   - --reproducible (alias --exact): both batch-dependent modes off (--fast-prefill 0 --fast-attn 0): replies byte-identical whatever the batch.
 #   - --hybrid-cal M (QycM, ..._P1_HYBRID_CAL): the hybrid split's CPU rate learnt from completions (1), one share for
-#     every rank with the choice reserved under one lock (2), or both (3); exact (selection only). OFF (0) until window
-#     H58 measures it (core/place/p1_hybrid.h "calibration").
+#     every rank with the choice reserved under one lock (2), or both (3); exact (selection only). On by default (3), as in the
+#     measured runs (windows H62c-H71; core/place/p1_hybrid.h "calibration").
 #   - --early K (QxK, ..._P1_EARLY): up to K of the next card-path layer's units copied into the ring before its routing
-#     counts, so the link works through attention and the router; exact (scheduling only). OFF (0) until window H55
-#     measures it (OVERLAP-20261115.md).
+#     counts, so the link works through attention and the router; exact (scheduling only). On by default (12), as in the measured runs
+#     (windows H55-H71; OVERLAP-20261115.md).
 #   - --pack W (BpW, RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD): a batch whose next waiting prompt does not fit asks the next W
-#     waiting prompts for one that does; exact (step composition only). OFF (0) until window H56 measures it.
+#     waiting prompts for one that does; exact (step composition only). On by default (16), as in the measured runs (windows H62c-H71).
 #   - --capture FILE: a calibration run (calibrate.sh), not the measured arm: the routing counts written to FILE
 #     (--expert-stats; at shutdown on SIGINT, and every 30 s), 8 streams unless --streams is given, and batch
 #     admission at 256 rows without the batch split (Ba, no Bs), as the window harness's capture arms ran
@@ -65,10 +65,10 @@
 #     so send SIGTERM there); it gets SIGINT if this script dies, where setpriv --pdeathsig is available.
 #   - --pack-once 0|1 (Qo, ..._P1_PACK_ONCE): a drive miss the RAM cache admits is packed once, straight into the
 #     packed RAM cache, and its ring copy reads the cache slots, instead of a pinned ready slot plus a second pack by
-#     the insert threads; exact (the same bytes in the cache and on the card). OFF (0) until window H60 measures it.
+#     the insert threads; exact (the same bytes in the cache and on the card). On by default, as in the measured runs (windows H62c-H71).
 #   - --arena-split 0|1 (Qes, ..._P1_LEND_ARENA_SPLIT): the lent arena's slots (Qe64) taken back only by a step at the
 #     full plan, so an armed decode pass leaves their residents published (~38 more file-tier units a card stay on the
-#     card through decode at N512). Residency only, exact. OFF (0) until window H57 measures it (VRAMLEND-20261116.md).
+#     card through decode at N512). Residency only, exact. On by default, as in the measured runs (windows H62c-H71).
 #   - --kv-lend 0|1 (Kvl, ..._KV_LEND): the KV pool's free tail (above the cache's held blocks less two chunks) lent
 #     to expert slots carved from its FULL groups, taken back before the cache hands a block out. Residency only, exact.
 #     OFF (0) until window H57 measures it (VRAMLEND-20261116.md).
@@ -100,7 +100,7 @@
 # window harness does: an exhausted host can hit an amdgpu bug on the OOM path that panics the kernel.
 set -u
 die() { echo "serve-batch.sh: $*" >&2; exit 2; }
-EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE="" CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=1 FASTDN=1 FASTAT=1 EARLY=0 PACK=0 PACKONCE=0 HYBCAL=0 ASPLIT=0 KVAUTO=0 PERSEQ="" KVLEND=0 DECMIN=0 CAPTURE="" STREAMS_SET=0 AUTO="" FAST_SET=0 ENGFILE=""
+EXTRA=() NAME=ds41 MODEL="" SILU="" STREAMS=256 PORT=8000 RESERVE=5120 CTX=1152 PROFILE="" MIRROR="" SHEAD=32 DRY=0 HOME_DIR="" HYBRID=60 SEQLEN="" TILED=1 TAILONCE=1 SPAN=1 ENGEARLY=1 HYBPF=60 FASTPF=1 FASTDN=1 FASTAT=1 EARLY=12 PACK=16 PACKONCE=1 HYBCAL=3 ASPLIT=1 KVAUTO=0 PERSEQ="" KVLEND=0 DECMIN=0 CAPTURE="" STREAMS_SET=0 AUTO="" FAST_SET=0 ENGFILE=""
 while (( $# )); do
   case $1 in
     --model) MODEL=${2:?}; shift ;;
@@ -347,6 +347,15 @@ ENV=(
 # The KV pool: --max-model-len is the pool the streams share, streams x tokens a stream (prompt plus reply). The
 # measured arms: 256 x 1152 = 294912 and 128 x 1152 = 147456 for prompts of about 1K tokens and 128-token replies.
 POOL=$((STREAMS * CTX))
+# The pool is taken from the same VRAM as the experts kept on the GPUs. Measured on four 16 GB GPUs: 655,360 tokens
+# left 444 resident experts a card, 720,896 left 335-399, and 1,179,648 or more left 43, so every prompt step read
+# hundreds of experts from the drive (ab-20261116T210025Z: 213 s of prompt processing instead of 83 s). Size the
+# pool from the tokens the streams really hold at once (prompt plus reply), not from the longest possible request.
+if (( POOL > 786432 )); then
+  echo "serve-batch: warning: a KV pool of $POOL tokens (--streams $STREAMS x --ctx-per-stream $CTX) takes VRAM the" >&2
+  echo "  experts need; above about 786,432 tokens few experts stay on the GPUs and throughput drops sharply." >&2
+  echo "  Lower --ctx-per-stream (or --streams) unless the requests really need it." >&2
+fi
 ARGS=(
   --kernels libr4d,libref --model "$MODEL" --served-model-name "$NAME"
   --tp 4 --tp-wire exact --placement expert_tiered --weights-disk-tier
