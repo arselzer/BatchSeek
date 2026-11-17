@@ -76,13 +76,21 @@ Engram tables (`--engram-file`), the BIRD training profile, a KV pool of 655,360
 (BIRD 2026). Both versions of BIRD's 500-question mini-dev set: the original prompts ask for the SQL only, the 2026
 revision's official prompts for reasoning before the SQL (replies up to 2,048 tokens).
 
-| At once | Original BIRD: generating | whole job | Wh/1k | BIRD 2026: generating | whole job | Wh/1k |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 34 | 14 | 12.0 | 25 | 21 | 8.5 |
-| 8 | 59 | 33 | 4.8 | 37 | 35 | 4.1 |
-| 64 | 79 | 46 | 3.3 | 53 | 50 | 2.8 |
-| 256 | 164 | 108 | 1.69 | 101 | 94 | 1.91 |
-| 500 | 228 | 152 | 1.28 | 155 | 137 | 1.34 |
+| Original BIRD, at once | Generating, tok/s | Whole job, tok/s | Wh/1k |
+|---:|---:|---:|---:|
+| 1 | 34 | 14 | 12.0 |
+| 8 | 59 | 33 | 4.8 |
+| 64 | 79 | 46 | 3.3 |
+| 256 | 164 | 108 | 1.69 |
+| 500 | 228 | 152 | 1.28 |
+
+| BIRD 2026, at once | Generating, tok/s | Whole job, tok/s | Wh/1k |
+|---:|---:|---:|---:|
+| 1 | 25 | 21 | 8.5 |
+| 8 | 37 | 35 | 4.1 |
+| 64 | 53 | 50 | 2.8 |
+| 256 | 101 | 94 | 1.91 |
+| 500 | 155 | 137 | 1.34 |
 
 "Generating": output tokens over the server's generation time; "whole job": over the time from the first request to the
 last reply, prompts included. Wh/1k: watt-hours per 1,000 output tokens. The 1, 8 and 64 rows use the first 8 or 64 questions of each set. Power (GPUs + CPU, from
@@ -97,17 +105,17 @@ time, keeps about 500 requests running for 32 minutes at about 210 output tokens
 ![A 500-request job over time: requests waiting, processing prompts and generating, output tokens per second, KV cache, power](batch/docs/charts/timeline-500.svg)
 
 Execution accuracy on both versions of BIRD's 500-question mini-dev set (thinking off, temperature 0 where a model
-accepts it), and the cost of the 2026 job:
+accepts it), and the cost of each job:
 
-| Who runs the model | BIRD 2026 accuracy | cost | Original accuracy | cost |
+| Who runs the model | Original accuracy | cost | BIRD 2026 accuracy | cost |
 |---|---:|---:|---:|---:|
-| **This box** (default mode, BIRD training profile) | **50.6%** | **€0.13** | **61.8%** | **€0.012** |
-| DeepSeek API | 50.8% | €0.22 | 59.8% | €0.031 |
-| DeepInfra | 47.2% | €0.12 | 60.2% | €0.015 |
-| Wafer | 49.0% | €0.16 | 60.2% | €0.021 |
+| **This box** (default mode, BIRD training profile) | **61.8%** | **€0.012** | **50.6%** | **€0.13** |
+| DeepSeek API | 59.8% | €0.031 | 50.8% | €0.22 |
+| DeepInfra | 60.2% | €0.015 | 47.2% | €0.12 |
+| Wafer | 60.2% | €0.021 | 49.0% | €0.16 |
 | *Other models* | | | | |
-| Claude Haiku 5.5 | 53.4% | €0.28 | 62.0% | €0.10 |
-| GPT-6 Luna | 43.0% | €0.17 | 55.8% | €0.063 |
+| Claude Haiku 5.5 | 62.0% | €0.10 | 53.4% | €0.28 |
+| GPT-6 Luna | 55.8% | €0.063 | 43.0% | €0.17 |
 
 This box's cost is its electricity at €0.30/kWh; API costs as billed through OpenRouter on 16 November 2026, at $1.12
 per euro. Haiku and Luna ran at their default
