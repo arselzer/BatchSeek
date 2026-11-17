@@ -101,7 +101,7 @@ accepts it), and the cost of the 2026 job:
 
 | Who runs the model | BIRD 2026 accuracy | cost | Original accuracy | cost |
 |---|---:|---:|---:|---:|
-| **This box** (default mode, BIRD training profile) | **50.6%** | **€0.13** at €0.30/kWh | **61.8%** | **€0.012** |
+| **This box** (default mode, BIRD training profile) | **50.6%** | **€0.13** | **61.8%** | **€0.012** |
 | DeepSeek API | 50.8% | €0.22 | 59.8% | €0.031 |
 | DeepInfra | 47.2% | €0.12 | 60.2% | €0.015 |
 | Wafer | 49.0% | €0.16 | 60.2% | €0.021 |
@@ -109,7 +109,8 @@ accepts it), and the cost of the 2026 job:
 | Claude Haiku 5.5 | 53.4% | €0.28 | 62.0% | €0.10 |
 | GPT-6 Luna | 43.0% | €0.17 | 55.8% | €0.063 |
 
-API costs as billed through OpenRouter on 16 November 2026, at $1.12 per euro. Haiku and Luna ran at their default
+This box's cost is its electricity at €0.30/kWh; API costs as billed through OpenRouter on 16 November 2026, at $1.12
+per euro. Haiku and Luna ran at their default
 sampling, as they don't accept temperature 0. Differences of a few points are noise.
 
 The model file carries no profile. Without one, the experts kept on the GPUs are an arbitrary fixed set; the RAM cache
