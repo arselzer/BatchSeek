@@ -91,7 +91,7 @@ revision's official prompts for reasoning before the SQL (replies up to 2,048 to
 | 64 | 53 | 50 | 2.9 |
 | 256 | 101 | 94 | 1.83 |
 | 500 | 155 | 137 | 1.34 |
-| Dev set, 1,534 through 512 slots (continuous) | 197 | 154 | 1.20 |
+| 1,534 (dev, continuous) | 197 | 154 | 1.20 |
 
 "Generating": output tokens over the server's generation time; "whole job": over the time from the first request to the
 last reply, prompts included. Wh/1k: watt-hours per 1,000 output tokens. The 1, 8 and 64 rows use the first 8 or 64 questions of each set; the 8 row sent them in eight waves of 8 (the
