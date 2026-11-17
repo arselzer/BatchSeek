@@ -119,7 +119,7 @@ adapts either way, filling with the experts the job uses while it runs. The same
 | None | 221 s |
 | Recorded from 64 public BIRD *training* questions (different databases) | **146 s** |
 
-The 500-question run used the release's official FP8 Engram tables (`--engram-file`); the other BIRD runs used the
+The results above used the release's official FP8 Engram tables (`--engram-file`); the profile comparison used the
 IQ4_NL tables from [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)'s GGUF
 release that are bundled in `model.rad`. Both ran at the same speed (170 s vs 172 s on 256 BIRD questions) with similar
 accuracy.
