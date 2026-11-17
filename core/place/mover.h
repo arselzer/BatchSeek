@@ -1005,6 +1005,21 @@ public:
     int   relay_packed_unit_block(const HostUnit& hu, uint8_t* dst, int64_t cap, std::vector<uint8_t>* scales) const;
     int   pack_unit_for_ring(const HostPlanes& p, uint8_t* dst, int64_t cap, bool* packed,
                              int64_t bytes[2]) const;   /* bytes: gate_up's and down's, as written */
+    /* pack_unit_into_cache  an admitted drive miss packed once (the card path's packer, ds41p1::kPackOnceEnv):
+     *                   each weight packed straight into a reserved slot of the packed RAM cache -- pack_plan,
+     *                   pack_planes with the cache's raw budgets, the round-trip check: insert_unit_packed's steps,
+     *                   so the slot's bytes are the ones pack_unit_for_ring writes into a ring slot and the
+     *                   background insert would write into the cache -- published, and its lease kept in *out
+     *                   (empty on entry) as borrow_host_unit(touch) lends a hit: the plan's weight order, dev the
+     *                   address the card's DMA reads. A weight the cache holds already is borrowed (touched).
+     *                   1: *out holds both leases, which the caller lets go (release_host_unit) once the copy
+     *                   reading them has passed. 0: the cache did not take the unit whole (no packed cache, a
+     *                   weight over its raw budget, a reservation refused: no room, a busy key; another epoch; a
+     *                   failed round trip, counted): *out is empty, nothing is leased, and the caller packs the
+     *                   unit as before and hands it to the insert threads (which count an over-budget unit). A
+     *                   weight published before the other was refused stays cached, as an insert leaves it.
+     *                   Thread-safe (the cache locks), for the packer thread. */
+    int   pack_unit_into_cache(const HostPlanes& p, HostUnit* out);
     char* file_buffer(int i) const {
         return (file_vram_ && (i == 0 || i == 1)) ? file_vram_ + i * file_buf_bytes_ : nullptr;
     }

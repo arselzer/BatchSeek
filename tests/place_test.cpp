@@ -4466,17 +4466,17 @@ TEST(source_localized_decode_profile_ranks_whole_GU_DN_units_without_budget_chan
  * as model payload or executed. No Engine, GPU, serving process or real model. */
 TEST(decode_profile_file_to_four_rank_planner_checks_local_identity_and_source_generation) {
     struct Files {
-        std::string directory, model, profile, link, backup;
+        std::string directory, model, profile, link, backup, portable;
         Files() {
             std::string name = radtest::tmpdir() + "/decode_profile.XXXXXX";
             if (::mkdtemp(name.data())) {
                 directory = name; model = name + "/metadata.rad";
                 profile = name + "/profile.json"; link = name + "/profile-link";
-                backup = name + "/metadata-old.rad";
+                backup = name + "/metadata-old.rad"; portable = name + "/portable.json";
             }
         }
         ~Files() {
-            for (const auto* path : {&link, &profile, &model, &backup})
+            for (const auto* path : {&link, &profile, &model, &backup, &portable})
                 if (!path->empty()) ::unlink(path->c_str());
             if (!directory.empty()) ::rmdir(directory.c_str());
         }
@@ -4545,6 +4545,52 @@ TEST(decode_profile_file_to_four_rank_planner_checks_local_identity_and_source_g
     std::string reason;
     REQUIRE(read_native_decode_profile(files.profile, identity, &full, &reason) == RAD_OK);
     REQUIRE(full.rows.size() == 40 * 384);
+    CHECK(!full.portable);
+    {
+        /* Portable form: container "" and zero device/inode/mtime/ctime. Accepted on any path and stat
+         * when model, geometry, file/metadata sizes and the metadata sha256 match; refused otherwise. */
+        const auto write_portable = [&](const Json& d) {
+            std::ofstream output(files.portable, std::ios::binary | std::ios::trunc);
+            output << d.dump(); output.close(); return bool(output);
+        };
+        Json portable = doc;
+        portable["container"] = "";
+        for (const char* key : {"device", "inode", "mtime_ns", "ctime_ns"}) portable["source_identity"][key] = 0;
+        REQUIRE(write_portable(portable));
+        NativeDecodeProfile shared;
+        CHECK(read_native_decode_profile(files.portable, identity, &shared, &reason) == RAD_OK);
+        CHECK(shared.portable); CHECK_EQ(shared.rows.size(), full.rows.size());
+        CHECK_EQ(shared.decode_tokens, full.decode_tokens);
+        for (size_t i = 0; i < shared.rows.size(); ++i) CHECK_EQ(shared.rows[i].share, full.rows[i].share);
+        // Another machine: different path and stat, same bytes.
+        NativeProfileIdentity elsewhere = identity;
+        elsewhere.container = "/elsewhere/metadata.rad"; ++elsewhere.device; ++elsewhere.inode;
+        elsewhere.mtime_ns += 7; elsewhere.ctime_ns += 9;
+        CHECK(read_native_decode_profile(files.portable, elsewhere, &shared, &reason) == RAD_OK);
+        // A different header hash or size is another model generation.
+        NativeDecodeProfile refused;
+        NativeProfileIdentity other_hash = elsewhere;
+        other_hash.metadata_sha256[0] = other_hash.metadata_sha256[0] == '0' ? '1' : '0';
+        CHECK(read_native_decode_profile(files.portable, other_hash, &refused, &reason) == RAD_E_FORMAT);
+        CHECK(reason.find("source identity") != std::string::npos);
+        NativeProfileIdentity other_size = elsewhere; ++other_size.file_bytes;
+        CHECK(read_native_decode_profile(files.portable, other_size, &refused, &reason) == RAD_E_FORMAT);
+        NativeProfileIdentity other_meta = elsewhere; ++other_meta.metadata_bytes;
+        CHECK(read_native_decode_profile(files.portable, other_meta, &refused, &reason) == RAD_E_FORMAT);
+        NativeProfileIdentity other_model = elsewhere; other_model.model = "another-model";
+        CHECK(read_native_decode_profile(files.portable, other_model, &refused, &reason) == RAD_E_FORMAT);
+        CHECK(refused.rows.empty());
+        // Half-stripped profiles stay strict: an empty container with a stat field, or zero stats
+        // with a path, must still match this machine exactly.
+        Json half = portable; half["source_identity"]["inode"] = identity.inode;
+        REQUIRE(write_portable(half));
+        CHECK(read_native_decode_profile(files.portable, identity, &refused, &reason) == RAD_E_FORMAT);
+        half = portable; half["container"] = identity.container;
+        REQUIRE(write_portable(half));
+        CHECK(read_native_decode_profile(files.portable, identity, &refused, &reason) == RAD_E_FORMAT);
+        // The strict profile is refused elsewhere, as before.
+        CHECK(read_native_decode_profile(files.profile, elsewhere, &refused, &reason) == RAD_E_FORMAT);
+    }
     const std::array<int, 4> hot_local{1, 4, 8, 12};
     for (int rank = 0; rank < 4; ++rank) {
         Fixture f;

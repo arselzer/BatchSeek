@@ -161,6 +161,27 @@ constexpr const char* kGraceEnv    = "RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS";
  * takes the ring's. The deepseek41 plugin declares at a smaller step (RadArchProbe::shape_probe_ok)
  * only beside this switch and kEnv (lend_arena_asked), so without them nothing changes. */
 constexpr const char* kLendArenaEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA";
+/* The lent arena's own take-back (kLendArenaSplitEnv=1; 0 / unset / empty off, the default, and then nothing
+ * changes): the arena's slots are taken back only by a step at the full plan, the only step whose buffers reach
+ * them; a card-path pass below it (an armed decode pass of at most the smallest level's rows above all) takes the
+ * ring's slots back as before and leaves the arena's residents published, as it leaves the slab's. The arena's
+ * slots have a grace of their own (kGraceEnv, from the last full step), so they come back during armed decode;
+ * in a pass that takes the ring a reload of an arena slot begins only from the RAM cache, never from the drive,
+ * and the kept slab's reloads still wait for both. Needs kLendArenaEnv. Residency moves, bytes do not
+ * (card_expert_stager.h, the lent arena). */
+constexpr const char* kLendArenaSplitEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT";
+/* The KV pool's free tail lent to expert slots (kKvLendEnv=1; 0 / unset / empty off, the default, and then nothing
+ * changes): the static pool (--max-model-len) keeps its size, but the blocks above the cache's held blocks plus a
+ * margin (kKvLendMarginEnv tokens; unset: two chunks, 2 x --max-num-batched-tokens) are lent through the KV cache's
+ * in-place loan (KVManager::set_loan) to whole lent slots carved from the top of each FULL group's layer stripes.
+ * A slot holds a file-tier unit as a decode resident while the loan covers it; when the cache needs the blocks back
+ * (an allocation short of free blocks, or the margin) the loan shrinks at once on the scheduler's side and every
+ * rank withdraws the uncovered residents and fences their queued copies at the begin of the next pass, before that
+ * pass's first op (the first that can write those blocks); a slot the loan covers again reloads behind the end of
+ * the pass before. Needs kEnv, kLendArenaEnv (the lender's bring-up) and a static plan without the expert slab's
+ * own KV loan. Residency moves, bytes do not. */
+constexpr const char* kKvLendEnv = "RADIANCE_EXPERIMENTAL_DS41_KV_LEND";
+constexpr const char* kKvLendMarginEnv = "RADIANCE_EXPERIMENTAL_DS41_KV_LEND_MARGIN";
 /* The lent slots follow live decode routing (kLendHeatEnv=S; 0 off, the default; 1-kMaxLendHeat: at most S
  * slots a rank handed to another unit a pass). Each rank keeps, by file-tier unit, a decayed count of the
  * decode rows routed to it (pure trunk decode passes only; it halves every kLendHeatHalfEnv decode rows,
@@ -223,11 +244,56 @@ constexpr bool decode_rows_ok(long n) { return n == 0 || (n >= kMinArmRows && n 
  * units are skip-marked and in no wave, and their rows are copied over the down projection's before the gather as
  * the CPU path's are. kHybridAdaptEnv=0 holds the share at P (1 / unset / empty: it adapts per rank from each
  * layer's outcome, at most P). Needs kDecodeRowsEnv; refused beside the host verify (kVerifyEnv), the CPU path's
- * verify policy, speculation, a drafter and the aux expert worker. Prefill passes never split. Not yet measured
- * on the cards. */
+ * verify policy, speculation, a drafter and the aux expert worker. Prefill passes split only under
+ * kHybridPrefillEnv. Not yet measured on the cards. */
 constexpr const char* kHybridEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID";
 constexpr const char* kHybridAdaptEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT";
 constexpr int kMaxHybridPct = 400;
+/* Hybrid prefill (kHybridPrefillEnv=P; 0 off, the default; else 1 to kMaxHybridPct): the same split in a prefill
+ * pass armed for the card path (kEnv, at least kMinRowsEnv rows): each card-path routed layer gives the CPU pool the
+ * RAM-cache units with the fewest rows while the pool's predicted time stays within P percent of the card's
+ * predicted link time for the rest, with a share of its own (adapted per rank as kHybridAdaptEnv says) and counts of
+ * its own. A card's prefill MoE time is its link time for the units it stages, which differs between the ranks layer
+ * by layer (EPBAL-20261115.md: the slowest rank stages ~10% above the mean, ~7 ms a layer at the MoE all-reduce);
+ * the pool is shared, so a rank with more to stage keeps more of it and the CPU evens the ranks out as well as
+ * shortening them. Exact as the decode split: the CPU's rows are written into the owning rank's down-projection
+ * rows before its gather, the same bytes the card path writes (core/place/p1_hybrid.h). Independent of kHybridEnv
+ * (either or both); the same refusals, except that it does not need kDecodeRowsEnv. */
+constexpr const char* kHybridPrefillEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL";
+/* Hybrid calibration (kHybridCalEnv=M; 0 off, the default; else a mask of kHybridCalRate | kHybridCalCouple, 1 to 3;
+ * needs kHybridEnv or kHybridPrefillEnv; core/place/p1_hybrid.h "calibration"):
+ *  - kHybridCalRate: the split's CPU rate is learnt from each split layer's completion (the pool's submit-to-finish
+ *    time over the cost it had to drain: the backlog the choice saw plus its own), an EWMA a pass kind, process-wide,
+ *    in place of the pool's model rate (78 GB/s, which the pool runs ~2.6x below beside four cards' DMA); the share
+ *    keeps adapting as the safety loop, with its ceiling lifted to 4P (at most kMaxHybridPct), since P was chosen
+ *    against the model rate;
+ *  - kHybridCalCouple: one share a pass kind for every rank, adapted from every rank's layer outcomes (per rank, the
+ *    rank whose jobs sat last in the shared pool's oldest-first order took the lateness and backed off alone: H55's
+ *    N512 prefill shares settled at 52.9 / 39.0 / 20.7 / 27.7%), and the choice and its reservation made under one
+ *    lock, so ranks deciding at once see each other's choices whole (choose-then-reserve let two ranks both fit
+ *    into the same backlog).
+ * Selection only: which side computes a unit never changes its rows' bytes. */
+constexpr const char* kHybridCalEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_CAL";
+constexpr int kHybridCalRate = 1, kHybridCalCouple = 2, kMaxHybridCal = 3;
+/* Early ring copies (kEarlyEnv=K; 0 off, the default; else 1 to kMaxEarly, at most the ring's slots used): right
+ * after a card-path layer's waves are issued, up to K RAM-cache units of the pass's next card-path layer, by the
+ * sealed profile's share, are copied into the ring on the DMA lane, so the link works through that layer's
+ * attention and router instead of waiting for its routing counts (card_expert_stager.h, "early copies"). A unit
+ * the next layer selects is then a wave's like any ring unit (its bytes are its RAM-cache lease's, as add_ram's
+ * copy would be); one it does not select is never read and its slot is reused. Scheduling only: which unit a
+ * wave computes, from which bytes, and every row it writes are as without it. */
+constexpr const char* kEarlyEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_EARLY";
+constexpr int kMaxEarly = 64;
+/* Pack once (kPackOnceEnv=1; 0 / unset off, the default): a drive miss the RAM cache admits (the prompt's last
+ * rows select it) is packed by the card path's packer straight into reserved slots of the packed RAM cache
+ * (Mover::pack_unit_into_cache: pack_plan, pack_planes and the round-trip check, the insert's own steps), published
+ * there, and its ring copy reads the cache slots under the cache's lease until the copy has passed -- instead of
+ * being packed into a pinned ready slot for the ring and packed a second time from its planes by the background
+ * insert threads. The same bytes end up in the cache and on the card (both are pack_planes of the same planes with
+ * the cache's raw budgets). A unit the cache does not take whole (over its raw budget, no room, a busy key, another
+ * epoch) is packed for the ring and handed to the insert threads as without it. Needs the packed RAM cache. */
+constexpr const char* kPackOnceEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_PACK_ONCE";
+constexpr const char* kLogPackOnce = "ds41 p1: pack once on";
 constexpr const char* kLendRestEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_REST_MS";
 constexpr int kDefLendRestMs = 5000, kMaxLendRestMs = 600000;
 constexpr int kDefWave = 2, kDefInflight = 16, kDefReady = 6, kDefAhead = 8, kDefMinRows = 320;
@@ -267,12 +333,15 @@ constexpr const char* kLogStats = "ds41 p1 stats, rank";        /* each rank, at
 constexpr const char* kLogChunk = "ds41 p1 chunk:";             /* rank 0, after each card-path chunk */
 constexpr const char* kLogLend  = "ds41 p1: lent ring";         /* rank 0, at startup, with kLendEnv */
 constexpr const char* kLogLendArena = "ds41 p1: lent arena";    /* rank 0, at startup, with kLendArenaEnv */
+constexpr const char* kLogLendArenaSplit = "ds41 p1: lent arena split";   /* rank 0, at startup, with kLendArenaSplitEnv */
+constexpr const char* kLogKvLend = "ds41 p1: lent KV";   /* engine, at startup, with kKvLendEnv */
 constexpr const char* kLogLendHeat = "ds41 p1: lent heat";      /* rank 0, at startup, with kLendHeatEnv */
 constexpr const char* kLogLendSlab = "ds41 p1: lent slab";      /* rank 0, at startup, with kLendSlabEnv */
 constexpr const char* kLogLendAudit = "ds41 p1: lent audit";    /* rank 0, at startup, with kLendAuditEnv; and every difference */
 constexpr const char* kLogLendRest = "ds41 p1: lent rest";      /* rank 0, at startup, with a rest (kLendRestEnv) */
 constexpr const char* kLogDecode = "ds41 p1: decode passes on the cards";   /* rank 0, at startup, with kDecodeRowsEnv */
 constexpr const char* kLogHybrid = "ds41 p1: hybrid decode on";   /* rank 0, at startup, with kHybridEnv */
+constexpr const char* kLogHybridPrefill = "ds41 p1: hybrid prefill on";   /* rank 0, at startup, with kHybridPrefillEnv */
 
 /* Whether the lent arena is asked for (kEnv `p1` on, kLendArenaEnv `lend` a count from 1 to kMaxLend):
  * the deepseek41 plugin then declares at a smaller step too. A value the core refuses counts as not
@@ -320,6 +389,65 @@ constexpr const char* kLogTiled       = "ds41 p1: register-tiled twin on, rank";
 constexpr const char* kTiledCheckMode = "p1tiled";
 inline int tiled_state() {
     static const int s = env_state(std::getenv(kTiledEnv));
+    return s;
+}
+
+/* ---- the WMMA twin (fast prefill, inexact) ----------------------------------------------------------
+ *
+ * kWmmaEnv: "1" beside kEnv puts the twin row's calls on libr4d's matrix-core kernel (r4d_ds41_mxfp4.hip,
+ * mx_p1w_kernel), ahead of kTiledEnv. NOT EXACT, by design and opt-in only: the weights (e2m1 codes, exact in
+ * bf16) and the bf16 activations are the exact twin's; each 32-value block's products are summed in f32 by
+ * v_wmma_f32_16x16x16_bf16, scaled by the block's e8m0 and added to the running f32 sum, so only the f32 summation
+ * order differs from T1's decode band (the bf16 outputs mostly identical, rare 1-ulp differences; replies are not
+ * byte-identical to the exact engine). T1 is relaxed to that; T2-T6 hold unchanged, and each output's order is
+ * fixed (16-row tiles, K blocks ascending, no split-K): batch-invariant at the kernel, whatever M, the grid or the
+ * other rows. The core refuses the switch without P1, an invalid value, beside the host verify (kVerifyEnv, which
+ * would count every rounding difference), on a device whose arch is not gfx12, or with a libr4d whose P1 row does
+ * not name kWmmaMark; each rank says kLogWmma at startup. The window measures a Qw arm only on the libr4d.so its
+ * device check (kWmmaCheckMode) passed on, and never reads its replies as an exactness result. */
+constexpr const char* kWmmaEnv       = "RADIANCE_EXPERIMENTAL_DS41_P1_WMMA";
+constexpr const char* kWmmaMark      = "the WMMA P1 twin (inexact: f32 summation order)";
+constexpr const char* kLogWmma       = "ds41 p1: WMMA twin on (inexact), rank";   /* each rank, at startup */
+constexpr const char* kWmmaCheckMode = "p1wmma";
+inline int wmma_state() {
+    static const int s = env_state(std::getenv(kWmmaEnv));
+    return s;
+}
+
+/* ---- the dense GEMMs and the sparse attention on the fast forms ---------------------------------------
+ *
+ * kDenseTiledEnv: "1" puts gemm_nt_bf16f8 (the FP8-stored dense linears) above 64 rows on libr4d's LDS-tiled form
+ * (r4d_gemm_bf16f8_nt_m64.hip, r4d_gemm_bf16f8_nt_tiled_kernel). EXACT by construction: the same WMMA operands,
+ * chains and slice sums as gemm_bf16f8_nt_m64, so every output is that kernel's bits at every height (as
+ * gemm_bf16_nt_tiled is gemm_bf16_nt_m64's). The window measures a Qg arm only on the libr4d.so its device check
+ * (kDenseTiledCheckMode, byte equality) passed on.
+ *
+ * kAttnWmmaEnv: "1" puts attn_sparse_sink at every height on libr4d's matrix-core form (r4d_ds41_sparse.hip,
+ * ds41_attn_fast_kernel). NOT EXACT, by design and opt-in only: q.k summed by v_wmma_f32_16x16x16_bf16 (exact
+ * products, another order), then the exact kernel's scale, max, glibc expf and key-order sum p; sum p k on WMMA over
+ * p as three exact bf16 pieces (another order, and no per-product rounding). A row's bits depend only on the row, and
+ * every height takes it, so it is batch-invariant at the kernel and the engine. The window measures a Qx arm only
+ * on the libr4d.so its device check (kAttnWmmaCheckMode) passed on, and never reads its replies as an exactness
+ * result.
+ *
+ * Both: 1 on, unset / empty / 0 off, anything else refused by the core; only beside LCP (they act on the tall
+ * passes LCP admits; the core checks every resolved row names the form, kDenseTiledMark / kAttnWmmaMark, and refuses
+ * the switch otherwise); each rank says kLogDenseTiled / kLogAttnWmma at startup. libr4d's own constants
+ * (r4d_ds41_tall.h) must agree; ds41_mxfp4_device_check static_asserts that. */
+constexpr const char* kDenseTiledEnv       = "RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED";
+constexpr const char* kDenseTiledMark      = "the tiled bf16f8 GEMM above 64 rows (exact: the m64 kernel's bits)";
+constexpr const char* kLogDenseTiled       = "ds41 dense: tiled bf16f8 GEMM on (exact), rank";
+constexpr const char* kDenseTiledCheckMode = "dtiled";
+constexpr const char* kAttnWmmaEnv         = "RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA";
+constexpr const char* kAttnWmmaMark        = "the WMMA sparse attention at every height (inexact: f32 summation order)";
+constexpr const char* kLogAttnWmma         = "ds41 attn: WMMA sparse attention on (inexact), rank";
+constexpr const char* kAttnWmmaCheckMode   = "attnwm";
+inline int dense_tiled_state() {
+    static const int s = env_state(std::getenv(kDenseTiledEnv));
+    return s;
+}
+inline int attn_wmma_state() {
+    static const int s = env_state(std::getenv(kAttnWmmaEnv));
     return s;
 }
 

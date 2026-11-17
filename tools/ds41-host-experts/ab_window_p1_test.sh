@@ -33,6 +33,21 @@
 #      the held share) and every other switch as the fast arm, every arm without the part states it 0 and the adapt
 #      switch empty, while Qy without Qd, beside Sg8, Qv8 or Ax, Qy0, two Qy parts and Qy without P1 are skipped
 #      with the reason.
+#   6c. QypP (hybrid prefill, ..._P1_HYBRID_PREFILL): qyp_gate on synthetic logs (a Qyp arm is measured only with
+#      rank 0's hybrid prefill line naming its share, and at exit only when every rank's stats line counts its prefill
+#      splits and some rank split one; an arm without the part only without the line and with none split; the decode
+#      hybrid's line and counts never stand in for it, nor its for them); in the arm loop Qyp30 on the fast arm (no Qd
+#      needed) and Qd64-Qy60-Qyp30 are launched with the switch and every other switch as the fast arm (Qy60's
+#      decode switch unchanged beside it), every arm without the part states it 0, while Qyp beside Sg8, Qv8 or Ax,
+#      Qyp0, two Qyp parts and Qyp without P1 are skipped with the reason.
+#   6d. Qyk (kernel costs, ..._HOST_EXPERTS_KERNEL_COST): qyk_gate on synthetic logs (the pool's line in a Qyk arm
+#      only); in the arm loop Qd64-Qy60-Qyk and Qd64-Qy60-Qyp60-Qyk on the fast arm state it 1, every other arm 0,
+#      and two Qyk parts are skipped.
+#   6e. QycM (the hybrid split's calibration, ..._P1_HYBRID_CAL): qyc_gate on synthetic logs (rank 0's line naming M
+#      once at startup; at exit every rank's calibration counts, with bit 1 some completion sample, with bit 2 the
+#      coupled shares; an arm without the part only without the line); in the arm loop Qd64-Qy60-Qyp60-Qyk-Qyc3 on the
+#      fast arm states it 3 and every other switch as the arm without it, every arm without the part states it 0,
+#      while Qyc without Qy or Qyp, Qyc4 and two Qyc parts are skipped with the reason.
 #   7. Ctp / CtpN (the prefill chain trace, ..._CHAIN_TRACE_PREFILL): the fast arm with Ctp traces one armed
 #      prefill pass in 4 into chain-<arm>, with Qd64 Ct16 Ctp2 both traces at their N into the same files;
 #      Ctp without P1 and Ctp0 are skipped with the reason; arms without the part do not set it; and
@@ -46,6 +61,10 @@
 #      refused and some started; an arm without the part only without either line); in the arm loop the fast
 #      arm with Ee (and with Qd64-Qy60-Ee) is launched with the switch and every other switch as without it,
 #      and arms without the part do not set it.
+#   8d. Dt / Aw (the tiled bf16f8 GEMM, exact; the WMMA sparse attention, inexact): the switches at 1 on the preset arm,
+#      every other arm states them 0; Dt without Lc or F8, Aw without Lc, Aw with Kld before a reference skipped;
+#      with a reference an Aw Kld arm scores against it (--kld-ref) and a Dt Kld arm records; without their receipts
+#      refused while the fast arm runs; dt_gate / aw_gate on synthetic logs.
 # Exit 0 when every check passes.
 set -u
 W=${1:-$(dirname "$0")/ab_window.sh}
@@ -62,6 +81,10 @@ eval "$(sed -n '/^qd_gate() {/,/^}/p' "$W")"
 declare -F qd_gate >/dev/null || { echo "FAIL no qd_gate in $W"; exit 1; }
 eval "$(sed -n '/^qy_gate() {/,/^}/p' "$W")"
 declare -F qy_gate >/dev/null || { echo "FAIL no qy_gate in $W"; exit 1; }
+eval "$(sed -n '/^qyp_gate() {/,/^}/p' "$W")"
+eval "$(sed -n '/^qyk_gate() {/,/^}/p' "$W")"
+declare -F qyk_gate >/dev/null || { echo "FAIL no qyk_gate in $W"; exit 1; }
+declare -F qyp_gate >/dev/null || { echo "FAIL no qyp_gate in $W"; exit 1; }
 eval "$(sed -n '/^ee_gate() {/,/^}/p' "$W")"
 declare -F ee_gate >/dev/null || { echo "FAIL no ee_gate in $W"; exit 1; }
 OUT=$T/logs
@@ -228,6 +251,63 @@ qylc 1 "lcp_check: the P1 arm with Qd64-Qy25, no hybrid line"        qd64lc 25 "
 qylc 1 "lcp_check: the P1 arm without Qy on a server that splits"    qy25lc "" ""
 qylc 0 "lcp_check: the P1 arm with Qd64 without Qy, as before"       qd64lc "" ""
 
+# ---- 6c. QypP: qyp_gate on synthetic logs, alone and through lcp_check.
+qyp_line() { echo "I[0] ds41 p1: hybrid prefill on: in a prefill pass armed for the cards (320 rows or more), each card-path routed layer gives the CPU pool the RAM-cache units with the fewest rows while the pool's predicted time stays within $1% of the card's predicted link time for the rest (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL=$1; pool 78.0 GB/s, link 20.0 GB/s, a share of its own that adapts per rank from each layer's outcome, at most that); ..."; }
+qyp_stats() {   # rank, decode split, prefill split (empty: no prefill counts)
+  echo "I[$1] ds41 p1 stats, rank $1: passes 40, ...; touched experts 900: VRAM residents 1, slab 2, ring 3, CPU pool 4; ...; decode passes armed 12, rows 3072 (at most 256 a pass), issue 20.500 s; decode passes of 17 to 63 rows on the CPU path 3; hybrid: passes split $2 of 12 armed, layers 400, units CPU 900 / card 3000 (fell back 0, layers without rows 0), CPU rows 2000, ..., share 25.0% (lowest 12.0%)${3:+; hybrid prefill: passes split $3 of 30 armed, layers 1200, units CPU 9000 / card 60000 (fell back 0, layers without rows 0, rows at the other arena level 0), CPU rows 20000, CPU 12.000 s (0.4000 s a pass) against issue 3.5000 s a pass, predicted CPU 9.000 s / card 70.000 s, gather wait 1.000 s, late layers 3 (wait 0.010 s), early layers 900, share 30.0% (lowest 20.0%)}"
+}
+mk qyp30 "$lc_line" "$(p1_line 320)" "$(qyp_line 30)"
+mk qyp30qy "$lc_line" "$(p1_line 320)" "$(qd_line 64 2048)" "$(qy_line 60 "$qy_adapt")" "$(qyp_line 30)"
+{ cat "$OUT/qyp30.server.log"; for r in 0 1 2 3; do qyp_stats $r 0 7; done; } > "$OUT/qypexit.server.log"
+{ cat "$OUT/qyp30.server.log"; for r in 0 1 2 3; do qyp_stats $r 0 0; done; } > "$OUT/qypidle.server.log"
+{ cat "$OUT/qyp30.server.log"; for r in 0 1 2 3; do qyp_stats $r 9 ""; done; } > "$OUT/qypnocount.server.log"
+{ cat "$OUT/qyp30.server.log"; qyp_stats 0 0 5; qyp_stats 1 0 ""; } > "$OUT/qypodd.server.log"
+{ cat "$OUT/qy25.server.log"; for r in 0 1 2 3; do qyp_stats $r 4 6; done; } > "$OUT/qypstray.server.log"
+{ cat "$OUT/qy25.server.log"; for r in 0 1 2 3; do qyp_stats $r 4 ""; done; } > "$OUT/qydeconly.server.log"
+qypexpect() {   # want(0/1) what log QYP stage
+  local want=$1 what=$2 rc
+  qyp_gate "$OUT/$3.server.log" "$4" "$5" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$what"; else bad "$what: exit $rc, want $want ($(qyp_gate "$OUT/$3.server.log" "$4" "$5"))"; fi
+}
+qypexpect 0 "Qyp30, its line"                                              qyp30      30 start
+qypexpect 0 "Qyp30 beside Qy60, its line"                                  qyp30qy    30 start
+qypexpect 1 "Qyp60 on a server that took 30"                               qyp30      60 start
+qypexpect 1 "Qyp30, only the decode hybrid's line"                         qy25       30 start
+qypexpect 1 "Qyp30, no hybrid line"                                        qd200      30 start
+qypexpect 1 "no Qyp part on a server that splits prefill passes"           qyp30      "" start
+qypexpect 0 "no Qyp part, the decode hybrid's line only"                   qy25       "" start
+qypexpect 0 "Qyp30 at exit: ranks split prefill passes"                    qypexit    30 exit
+qypexpect 1 "Qyp30 at exit: no rank split one (the switch never acted)"    qypidle    30 exit
+qypexpect 1 "Qyp30 at exit: decode splits only, no prefill counts"         qypnocount 30 exit
+qypexpect 1 "Qyp30 at exit: a stats line without its prefill counts"       qypodd     30 exit
+qypexpect 1 "Qyp30 at exit: no stats line"                                 qyp30      30 exit
+qypexpect 1 "no Qyp part at exit, but a rank split prefill passes"         qypstray   "" exit
+qypexpect 0 "no Qyp part at exit, decode splits only"                      qydeconly  "" exit
+qyexpect 0 "Qy25 at exit beside prefill counts: the decode gate unchanged" qypstray   25 ""  exit
+qyplc() {   # want(0/1) what log QYP
+  local want=$1 what=$2 rc
+  ARM_LC=2048 ARM_P1=1 ARM_QM=320 ARM_QL="" ARM_QE="" ARM_QD="" ARM_QY="" ARM_QYF="" ARM_QYP=$4 lcp_check "$3" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$what"; else bad "$what: exit $rc, want $want ($(tail -1 "$OUT/window.log"))"; fi
+}
+mk qyp30lc "${lc_line//1024/2048}" "$(p1_line 320 | sed 's/320 to 1024/320 to 2048/')" "$(qyp_line 30)"
+mk p1lc "${lc_line//1024/2048}" "$(p1_line 320 | sed 's/320 to 1024/320 to 2048/')"
+qyplc 0 "lcp_check: the P1 arm with Qyp30, its line"                 qyp30lc 30
+qyplc 1 "lcp_check: the P1 arm with Qyp30, no hybrid prefill line"   p1lc    30
+qyplc 1 "lcp_check: the P1 arm without Qyp on a server that splits"  qyp30lc ""
+qyplc 0 "lcp_check: the P1 arm without Qyp, as before"               p1lc    ""
+
+# ---- 6d. Qyk: qyk_gate on synthetic logs.
+mk qyk "$lc_line" "$(p1_line 320)" "I host experts: kernel costs (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST=1): a job's further rows at the rate of the kernel it runs (the many-row one from 4 rows), and the hybrid split takes units by cost"
+qykexpect() {   # want(0/1) what log QYK
+  local want=$1 what=$2 rc
+  qyk_gate "$OUT/$3.server.log" "$4" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$what"; else bad "$what: exit $rc, want $want"; fi
+}
+qykexpect 0 "Qyk, its line"                            qyk    1
+qykexpect 1 "Qyk, no kernel-cost line"                 qyp30  1
+qykexpect 1 "no Qyk part on a server with kernel costs" qyk   ""
+qykexpect 0 "no Qyk part, no line"                     qyp30  ""
+
 # Qsp's startup and useful-work gates, independent of ordinary P1 startup admission.
 eval "$(sed -n '/^qsp_gate() {/,/^}/p' "$W")"
 declare -F qsp_gate >/dev/null || { echo "FAIL no qsp_gate in $W"; exit 1; }
@@ -297,6 +377,129 @@ zexpect 0 'Qz idle at startup' "$T/qz-idle.log" 1 start
 zexpect 1 'Qz no fill skipped' "$T/qz-idle.log" 1 exit
 zexpect 1 'Qz unrequested activation' "$T/qz-good.log" '' start
 zexpect 0 'Qz explicitly off' "$T/qt-off.log" '' exit
+
+# Qx's gates: rank 0's early-copies line naming K once at startup, and at exit some rank's bound early copies above 0.
+eval "$(sed -n '/^qx_gate() {/,/^}/p' "$W")"
+declare -F qx_gate >/dev/null || { echo "FAIL no qx_gate in $W"; exit 1; }
+{
+  echo "I ds41 p1: early ring copies on (RADIANCE_EXPERIMENTAL_DS41_P1_EARLY=12): behind each card-path layer's waves, ..."
+  for rank in 0 1 2 3; do
+    echo "I[$rank] ds41 p1 stats, rank $rank: passes 3; wave tail fills skipped 412; early copies 960 ($((rank * 100)) bound to their layer, 12 unread, 0 not in the RAM cache when posted)"
+  done
+} > "$T/qx-good.log"
+sed -E 's/\(([0-9]+) bound/(0 bound/' "$T/qx-good.log" > "$T/qx-idle.log"
+sed 's/P1_EARLY=12/P1_EARLY=8/' "$T/qx-good.log" > "$T/qx-other.log"
+cat "$T/qx-good.log" "$T/qx-good.log" > "$T/qx-twice.log"
+xexpect() {
+  local want=$1 label=$2 rc; shift 2
+  qx_gate "$@" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$label"; else bad "$label: exit $rc, want $want"; fi
+}
+xexpect 0 'Qx startup line' "$T/qx-good.log" 12 start
+xexpect 0 'Qx bound copies at exit' "$T/qx-good.log" 12 exit
+xexpect 1 'Qx line names another K' "$T/qx-other.log" 12 start
+xexpect 1 'Qx line twice' "$T/qx-twice.log" 12 start
+xexpect 0 'Qx idle at startup' "$T/qx-idle.log" 12 start
+xexpect 1 'Qx never bound a copy' "$T/qx-idle.log" 12 exit
+xexpect 1 'Qx unrequested activation' "$T/qx-good.log" '' start
+xexpect 0 'Qx explicitly off' "$T/qt-off.log" '' exit
+xexpect 1 'Qx asked, no line' "$T/qt-off.log" 12 start
+
+# ---- 6e. Qyc's gates: rank 0's calibration line naming M once at startup; at exit every rank's calibration counts,
+# some completion sample with bit 1, the coupled shares with bit 2.
+eval "$(sed -n '/^qyc_gate() {/,/^}/p' "$W")"
+declare -F qyc_gate >/dev/null || { echo "FAIL no qyc_gate in $W"; exit 1; }
+{
+  echo "I ds41 p1: hybrid calibration on (RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_CAL=3): the split's CPU rate learnt from ..."
+  for rank in 0 1 2 3; do
+    echo "I[$rank] ds41 p1 stats, rank $rank: passes 3; ...; hybrid prefill: passes split 9 of 9 armed, ..., share 40.0% (lowest 20.0%), pool done 1.000 s after the submits (0.1000 s a pass, 300 layers), cost 12.0 GB; hybrid calibration 3: pool rate decode 31.2 GB/s (0 samples), prefill 28.4 GB/s ($((rank * 100)) samples), model 78.0 GB/s; shares coupled, decode 60.0% (lowest 60.0%), prefill 85.0% (lowest 30.0%)"
+  done
+} > "$T/qyc-good.log"
+sed -E 's/\(([0-9]+) samples\)/(0 samples)/g' "$T/qyc-good.log" > "$T/qyc-idle.log"
+sed 's/; shares coupled, .*/; shares a rank'"'"'s own/' "$T/qyc-good.log" > "$T/qyc-uncoupled.log"
+sed 's/P1_HYBRID_CAL=3/P1_HYBRID_CAL=1/; s/hybrid calibration 3:/hybrid calibration 1:/' "$T/qyc-uncoupled.log" > "$T/qyc-rate.log"
+sed 's/P1_HYBRID_CAL=3/P1_HYBRID_CAL=2/; s/hybrid calibration 3:/hybrid calibration 2:/' "$T/qyc-idle.log" > "$T/qyc-couple.log"
+grep -v 'rank 2:' "$T/qyc-good.log" > "$T/qyc-partial.log"
+sed '3s/; hybrid calibration .*//' "$T/qyc-good.log" > "$T/qyc-onemissing.log"
+cat "$T/qyc-good.log" "$T/qyc-good.log" > "$T/qyc-twice.log"
+cexpect() {
+  local want=$1 label=$2 rc; shift 2
+  qyc_gate "$@" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$label"; else bad "$label: exit $rc, want $want"; fi
+}
+cexpect 0 'Qyc startup line' "$T/qyc-good.log" 3 start
+cexpect 0 'Qyc counts at exit' "$T/qyc-good.log" 3 exit
+cexpect 0 'Qyc partial ranks still every line counted' "$T/qyc-partial.log" 3 exit
+cexpect 1 'Qyc line names another mask' "$T/qyc-rate.log" 3 start
+cexpect 1 'Qyc line twice' "$T/qyc-twice.log" 3 start
+cexpect 1 'Qyc3 never sampled' "$T/qyc-idle.log" 3 exit
+cexpect 1 'Qyc3 shares not coupled' "$T/qyc-uncoupled.log" 3 exit
+cexpect 1 'Qyc3 a rank without its counts' "$T/qyc-onemissing.log" 3 exit
+cexpect 0 'Qyc1 sampled, uncoupled' "$T/qyc-rate.log" 1 exit
+cexpect 0 'Qyc2 coupled, no samples needed' "$T/qyc-couple.log" 2 exit
+cexpect 1 'Qyc unrequested activation' "$T/qyc-good.log" '' start
+cexpect 0 'Qyc explicitly off' "$T/qt-off.log" '' exit
+cexpect 1 'Qyc asked, no line' "$T/qt-off.log" 3 start
+# Qes's gates: rank 0's lent arena split line once at startup, and at exit some rank's arena residents kept through
+# armed passes above 0. mS's: the budget's per-sequence term names the arm's MiB (32 without the part).
+eval "$(sed -n '/^qes_gate() {/,/^}/p;/^ms_gate() {/,/^}/p' "$W")"
+declare -F qes_gate >/dev/null && declare -F ms_gate >/dev/null || { echo "FAIL no qes_gate / ms_gate in $W"; exit 1; }
+{
+  echo "I ds41 p1: lent arena split: on (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT=1): the 38 arena slots are taken back only by a step at the full plan ..."
+  for rank in 0 1 2 3; do
+    echo "I[$rank] ds41 p1 stats, rank $rank: passes 3; lent ring: 38 slots (38 in the activation arena), 38 residents now; 4 bursts took them back (152 residents withdrawn), 5 returns; lent arena split: 1200 passes took the ring's slots and left the arena's ($((rank * 1000)) arena residents through them), 38 arena loads begun in them from the RAM cache, the arena resident now"
+  done
+} > "$T/qes-good.log"
+sed -E "s/left the arena's \(([0-9]+) arena/left the arena's (0 arena/" "$T/qes-good.log" > "$T/qes-idle.log"
+cat "$T/qes-good.log" "$T/qes-good.log" > "$T/qes-twice.log"
+eexpect() {
+  local want=$1 label=$2 rc; shift 2
+  qes_gate "$@" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$label"; else bad "$label: exit $rc, want $want"; fi
+}
+eexpect 0 'Qes startup line' "$T/qes-good.log" 1 start
+eexpect 0 'Qes arena residents kept at exit' "$T/qes-good.log" 1 exit
+eexpect 1 'Qes line twice' "$T/qes-twice.log" 1 start
+eexpect 0 'Qes idle at startup' "$T/qes-idle.log" 1 start
+eexpect 1 'Qes never kept an arena resident' "$T/qes-idle.log" 1 exit
+eexpect 1 'Qes unrequested activation' "$T/qes-good.log" '' start
+eexpect 0 'Qes explicitly off' "$T/qt-off.log" '' exit
+eexpect 1 'Qes asked, no line' "$T/qt-off.log" 1 start
+# Kvl's gates: the lent KV line once at startup, and at exit some rank's peak KV residents above 0.
+eval "$(sed -n '/^kvl_gate() {/,/^}/p' "$W")"
+declare -F kvl_gate >/dev/null || { echo "FAIL no kvl_gate in $W"; exit 1; }
+{
+  echo "I ds41 p1: lent KV: on (RADIANCE_EXPERIMENTAL_DS41_KV_LEND=1): 52 lent slots a rank carved from the top of ..."
+  for rank in 0 1 2 3; do
+    echo "I[$rank] ds41 p1 stats, rank $rank: passes 3; lent ring: 90 slots (38 in the activation arena), 60 residents now; lent KV: 52 slots, 20 available and 18 resident now, peak 40 available and $((rank * 10)) resident (12.5 resident a pass), 60 made available, 20 withdrawn in 3 reclaims, largest loan 200000 tokens, 0.010 ms a pass in the sync"
+  done
+} > "$T/kvl-good.log"
+sed -E 's/available and [0-9]+ resident \(/available and 0 resident (/' "$T/kvl-good.log" > "$T/kvl-idle.log"
+cat "$T/kvl-good.log" "$T/kvl-good.log" > "$T/kvl-twice.log"
+kexpect() {
+  local want=$1 label=$2 rc; shift 2
+  kvl_gate "$@" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$label"; else bad "$label: exit $rc, want $want"; fi
+}
+kexpect 0 'Kvl startup line' "$T/kvl-good.log" 1 start
+kexpect 0 'Kvl KV residents at exit' "$T/kvl-good.log" 1 exit
+kexpect 1 'Kvl line twice' "$T/kvl-twice.log" 1 start
+kexpect 1 'Kvl never held a KV resident' "$T/kvl-idle.log" 1 exit
+kexpect 1 'Kvl unrequested activation' "$T/kvl-good.log" '' start
+kexpect 0 'Kvl explicitly off' "$T/qt-off.log" '' exit
+kexpect 1 'Kvl asked, no line' "$T/qt-off.log" 1 start
+echo "I ram budget: later 16384 MiB  per-sequence growth, 32 MiB x --max-num-seqs 512 (measured ...)" > "$T/ms-32.log"
+echo "I ram budget: later  8192 MiB  per-sequence growth, 16 MiB x --max-num-seqs 512 (measured ...)" > "$T/ms-16.log"
+mexpect() {
+  local want=$1 label=$2 rc; shift 2
+  ms_gate "$@" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$label"; else bad "$label: exit $rc, want $want"; fi
+}
+mexpect 0 'mS16 named' "$T/ms-16.log" 16
+mexpect 1 'mS16 but 32 reserved' "$T/ms-32.log" 16
+mexpect 0 'no mS: the default 32' "$T/ms-32.log" ''
+mexpect 1 'no mS, but 16 reserved' "$T/ms-16.log" ''
+mexpect 0 'no RAM budget: nothing to check' "$T/qt-off.log" 16
 
 # ---- the balance receipt: an old generic PASS is not requested-height evidence
 eval "$(sed -n '/^bal_receipt_bound() {/,/^}/p' "$W")"
@@ -388,6 +591,17 @@ CTP0=$FAST-Ctp0
 EE=$FAST-Ee
 EEQY=$FAST-Qd64-Qy60-Ee
 QY60=$FAST-Qd64-Qy60
+QYP30=$FAST-Qyp30
+QYPQY=$FAST-Qd64-Qy60-Qyp30
+QYPSG=$FAST-Qyp30-Sg8
+QYPV=$FAST-Qyp30-Qv8
+QYPAX=$FAST-Qyp30-Ax
+QYP0=$FAST-Qyp0
+QYPTWO=$FAST-Qyp30-Qyp60
+QYPNOP=$REF-Qyp30
+QYK=$FAST-Qd64-Qy60-Qyk
+QYKP=$FAST-Qd64-Qy60-Qyp60-Qyk
+QYKTWO=$FAST-Qd64-Qy60-Qyk-Qyk
 ARMS="$REF $NEW $NEWG $SHORTM $Q17 $OVERL $GNOL $LNOP $BIG $BIGG $BIGM $ENOP $COLD4K $PC4K $NOINT4K $LOWINT4K $NOPC4K $OVER4K"
 ARMS="$ARMS $FAST $SG8 $SGA8 $SG15 $SG16 $N2SG7 $N2SG8 $N8SG2 $SG0"
 ARMS="$ARMS $QD200 $QD4096 $QD16 $QDTB $QDNOP"
@@ -401,13 +615,86 @@ QTQZ=$FAST-Qsp-Qt-Qz
 QZNOP=$REF-Qz
 ARMS="$ARMS $QT $QTQSP $QTNOP $QZ $QTQZ $QZNOP"
 ARMS="$ARMS $EE $EEQY $QY60"
+ARMS="$ARMS $QYP30 $QYPQY $QYPSG $QYPV $QYPAX $QYP0 $QYPTWO $QYPNOP $QYK $QYKP $QYKTWO"
+# Qw: the WMMA P1 twin (inexact by design) on the N256-like preset (Qsp-Qt-Qz), beside Qv, without P1, with Kld (no
+# reference yet in the loop: skipped; with KLD_REF set: --kld-ref), and the wave part Qw2 (unchanged: the wave size).
+# Qo's gates: rank 0's pack-once line once at startup, and at exit some rank's units packed once above 0.
+eval "$(sed -n '/^qo_gate() {/,/^}/p' "$W")"
+declare -F qo_gate >/dev/null || { echo "FAIL no qo_gate in $W"; exit 1; }
+{
+  echo "I[0] ds41 p1: pack once on (RADIANCE_EXPERIMENTAL_DS41_P1_PACK_ONCE=1): an admitted drive miss is packed once, ..."
+  for rank in 0 1 2 3; do
+    echo "I[$rank] ds41 p1 stats, rank $rank: passes 3; wave tail fills skipped 412; packed once into the RAM cache $((rank * 100)) (1.80 GB, ring copies from the cache slots), 3 admitted misses the cache did not take whole (packed for the ring and inserted as before); early copies 960 (12 bound to their layer, 12 unread, 0 not in the RAM cache when posted)"
+  done
+} > "$T/qo-good.log"
+sed -E 's/RAM cache [0-9]+ \(/RAM cache 0 (/' "$T/qo-good.log" > "$T/qo-idle.log"
+cat "$T/qo-good.log" "$T/qo-good.log" > "$T/qo-twice.log"
+oexpect() {
+  local want=$1 label=$2 rc; shift 2
+  qo_gate "$@" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$label"; else bad "$label: exit $rc, want $want"; fi
+}
+oexpect 0 'Qo startup line' "$T/qo-good.log" 1 start
+oexpect 0 'Qo units packed once at exit' "$T/qo-good.log" 1 exit
+oexpect 1 'Qo line twice' "$T/qo-twice.log" 1 start
+oexpect 0 'Qo idle at startup' "$T/qo-idle.log" 1 start
+oexpect 1 'Qo never packed a unit once' "$T/qo-idle.log" 1 exit
+oexpect 1 'Qo unrequested activation' "$T/qo-good.log" '' start
+oexpect 0 'Qo explicitly off' "$T/qt-off.log" '' exit
+oexpect 1 'Qo asked, no line' "$T/qt-off.log" 1 start
+
+QW=$FAST-Qsp-Qt-Qz-Qw
+QWV=$FAST-Qw-Qv8
+QWNOP=$REF-Qw
+QWKLD=$FAST-Qw-Kld
+QW2=$FAST-Qw2
+ARMS="$ARMS $QW $QWV $QWNOP $QWKLD $QW2"
+# Dt / Aw: the tiled bf16f8 GEMM (exact) and the WMMA sparse attention (inexact) on the preset; Dt without Lc and
+# without F8, Aw without Lc, and both with Kld.
+DTAW=$FAST-Qsp-Qt-Qz-Dt-Aw
+DTNOLC=$pre-M16-$mid-B6-${post%-Lc1024}-Dt
+DTNOF8=${FAST/-F8-/-}-Dt
+AWNOLC=$pre-M16-$mid-B6-${post%-Lc1024}-Aw
+AWKLD=$FAST-Aw-Kld
+DTKLD=$FAST-Dt-Kld
+AWONLY=$FAST-Aw
+ARMS="$ARMS $DTAW $DTNOLC $DTNOF8 $AWNOLC $AWKLD $DTKLD $AWONLY"
+QX=$FAST-Qd64-Qy60-Qx12
+QXNOP=$REF-Qx12
+QXBIG=$FAST-Qx65
+QXTWO=$FAST-Qx4-Qx8
+ARMS="$ARMS $QX $QXNOP $QXBIG $QXTWO"
+QO=$FAST-Qd64-Qy60-Qo
+QONOP=$REF-Qo
+QONOK=${FAST/-K-/-}-Qo
+ARMS="$ARMS $QO $QONOP $QONOK"
+QYC=$FAST-Qd64-Qy60-Qyp60-Qyk-Qyc3
+QYCBASE=$FAST-Qd64-Qy60-Qyp60-Qyk
+QYCNOH=$FAST-Qyc1
+QYCBIG=$FAST-Qd64-Qy60-Qyc4
+QYCTWO=$FAST-Qd64-Qy60-Qyc1-Qyc2
+ARMS="$ARMS $QYC $QYCBASE $QYCNOH $QYCBIG $QYCTWO"
+QES=$FAST-Qd64-Qy60-Qes
+QESNOQE=${FAST/-Qe64/}-Qes
+QESNOP=$REF-Qes
+QESTWO=$FAST-Qes-Qes
+LK=$FAST-N8-Lk452
+LKL=$FAST-L1024-N8-Lk452
+LKNON=$FAST-Lk452
+LKLOW=$FAST-N8-Lk8
+MS=$FAST-mA-mS16
+MSNOMA=$FAST-mS16
+KVL=$FAST-Qd64-Kvl
+KVLNOQE=${FAST/-Qe64/}-Kvl
+KVLTWO=$FAST-Kvl-Kvl
+ARMS="$ARMS $QES $QESNOQE $QESNOP $QESTWO $LK $LKL $LKNON $LKLOW $MS $MSNOMA $KVL $KVLNOQE $KVLTWO"
 run_loop() {   # actual balance-oracle bound; every model action remains stubbed
  (
   set +u
   log() { echo "LOG: $*"; }
   power_set() { :; }; power_restore() { :; }
   vpack_gate() { return 0; }
-  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; echo "  ARM_QD: ${ARM_QD:-}"; echo "  ARM_QY: ${ARM_QY:-}"; echo "  ARM_QYF: ${ARM_QYF:-}"; echo "  ARM_QT: ${ARM_QT:-}"; echo "  ARM_EE: ${ARM_EE:-}"; }
+  arm() { echo "ARM $1"; shift; printf '    %s\n' "$@"; echo "  ARGS: ${ARGS[*]}"; echo "  ARM_SG: ${ARM_SG:-}"; echo "  ARM_QD: ${ARM_QD:-}"; echo "  ARM_QY: ${ARM_QY:-}"; echo "  ARM_QYF: ${ARM_QYF:-}"; echo "  ARM_QYP: ${ARM_QYP:-}"; echo "  ARM_QYK: ${ARM_QYK:-}"; echo "  ARM_QW: ${ARM_QW:-}"; echo "  ARM_DT: ${ARM_DT:-}"; echo "  ARM_AW: ${ARM_AW:-}"; echo "  ARM_QT: ${ARM_QT:-}"; echo "  ARM_EE: ${ARM_EE:-}"; }
   HX_THREADS=16 SILU=/dev/null RHOME=$H RADIANCE_HOME_DIR2=$H MIRROR=$T
   PROMPTS=$T/prompts.json
   unset RADIANCE_TUNE
@@ -417,6 +704,11 @@ run_loop() {   # actual balance-oracle bound; every model action remains stubbed
   BAL_OK=1 BAL_WHY=test BAL_SUM=$SUM BAL_LIB=$LIB BAL_MAX_M=$1 P1_OK=1 P1_WHY=test P1_SUM=$SUM P1_LIB=$LIB
   if [[ ${2:-} == no-p1t ]]; then P1T_OK="" P1T_WHY="no p1tiled check (test)" P1T_SUM="" P1T_LIB=""
   else P1T_OK=1 P1T_WHY=test P1T_SUM=$SUM P1T_LIB=$LIB; fi
+  if [[ ${2:-} == no-p1w ]]; then P1W_OK="" P1W_WHY="no p1wmma check (test)" P1W_SUM="" P1W_LIB=""
+  else P1W_OK=1 P1W_WHY=test P1W_SUM=$SUM P1W_LIB=$LIB; fi
+  if [[ ${2:-} == no-fast ]]; then DT_OK="" DT_WHY="no dtiled check (test)" DT_SUM="" DT_LIB="" AW_OK="" AW_WHY="no attnwm check (test)" AW_SUM="" AW_LIB=""
+  else DT_OK=1 DT_WHY=test DT_SUM=$SUM DT_LIB=$LIB AW_OK=1 AW_WHY=test AW_SUM=$SUM AW_LIB=$LIB; fi
+  KLD_REF=${3:-}
   OUT=$T/out; mkdir -p "$OUT"; CANCEL_FILE=/nonexistent/cancel; CANCEL=$CANCEL_FILE
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
   eval "$(sed -n '/^trace_base() {/,/^}/p' "$W")"
@@ -431,6 +723,7 @@ run_loop() {   # actual balance-oracle bound; every model action remains stubbed
 mkdir -p "$T/out"
 echo 'p1: PASS: moe_gemm_ggml_mxfp4_gemv_tall_p1 at M 17..4096: ... splits and full/span SwiGLU waves of 1-3 equal to one launch, also with the tail filled once (52 cases)' > "$T/out/devcheck-p1.log"
 echo 'p1tiled: PASS: moe_gemm_ggml_mxfp4_gemv_tall_p1 served on the register-tiled P1 twin at M 17..4096: ... equal to one launch, also with the tail filled once (54 cases)' > "$T/out/devcheck-p1tiled.log"
+echo '{"prompt": "a test document"}' > "$T/out/kld-corpus.jsonl"
 out=$(run_loop 4096)
 echo "$out" > "$T/loop.txt"
 section() { awk -v a="ARM $1" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' "$T/loop.txt"; }
@@ -599,6 +892,52 @@ qdskip "$QYAX" "Qy25 beside the aux expert worker.*skipped"
 qdskip "$QY0" "Qy0: Qy takes 1-400.*skipped"
 qdskip "$QYTWO" "two Qy parts.*skipped"
 qdskip "$QYNOP" "the Q parts (.*RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID=25.*) need P1.*skipped"
+# ---- 6c. QypP in the arm loop.
+for spec in "$QYP30:30:" "$QYPQY:30:60"; do
+  IFS=: read -r a n qyn <<< "$spec"
+  sec=$(section "$a")
+  if [[ -z "$sec" ]]; then bad "the Qyp$n arm was not launched: $(grep -m3 "arm $a" "$T/loop.txt")"; continue; fi
+  has "Qyp$n${qyn:+ beside Qy$qyn}" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL "$n"
+  has "Qyp$n${qyn:+ beside Qy$qyn}" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID "${qyn:-0}"
+  has "Qyp$n${qyn:+ beside Qy$qyn}" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_ADAPT ""
+  has "Qyp$n${qyn:+ beside Qy$qyn}" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS "$([[ -n "$qyn" ]] && echo 64 || echo 0)"
+  grep -qx "  ARM_QYP: $n" <<< "$sec" && ok "Qyp$n: the arm is gated on its hybrid prefill line (ARM_QYP=$n)" || bad "Qyp$n: ARM_QYP is '$(grep '  ARM_QYP:' <<< "$sec")'"
+  grep -qx "  ARM_QY: $qyn" <<< "$sec" && ok "Qyp$n: ARM_QY='$qyn'" || bad "Qyp$n: ARM_QY is '$(grep '  ARM_QY:' <<< "$sec")'"
+  for v in RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA \
+           RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES \
+           RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS RADIANCE_EXPERIMENTAL_SCHED_TBO RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY; do
+    has "Qyp$n as the fast arm" "$sec" "$v" "$(val "$fast" "$v")"
+  done
+done
+for a in "$REF" "$NEW" "$BIG" "$FAST" "$SG8" "$QD200" "$QY25" "$QY60"; do
+  has "no Qyp part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL 0
+  grep -qx "  ARM_QYP: " <<< "$(section "$a")" && ok "no Qyp part ($a): ARM_QYP empty" || bad "no Qyp part ($a): ARM_QYP is '$(grep '  ARM_QYP:' <<< "$(section "$a")")'"
+done
+qdskip "$QYPSG" "Qyp30 beside Sg8 (speculation.*skipped"
+qdskip "$QYPV" "Qyp30 beside Qv8 (the host verify.*skipped"
+qdskip "$QYPAX" "Qyp30 beside the aux expert worker.*skipped"
+qdskip "$QYP0" "Qyp0: Qyp takes 1-400.*skipped"
+qdskip "$QYPTWO" "two Qyp parts.*skipped"
+qdskip "$QYPNOP" "the Q parts (.*RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL=30.*) need P1.*skipped"
+# ---- 6d. Qyk in the arm loop.
+for spec in "$QYK::60" "$QYKP:60:60"; do
+  IFS=: read -r a pf qyn <<< "$spec"
+  sec=$(section "$a")
+  if [[ -z "$sec" ]]; then bad "the Qyk arm $a was not launched: $(grep -m3 "arm $a" "$T/loop.txt")"; continue; fi
+  has "Qyk${pf:+ Qyp$pf}" "$sec" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST 1
+  has "Qyk${pf:+ Qyp$pf}" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID "$qyn"
+  has "Qyk${pf:+ Qyp$pf}" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL "${pf:-0}"
+  grep -qx "  ARM_QYK: 1" <<< "$sec" && ok "Qyk: the arm is gated on the pool's line (ARM_QYK=1)" || bad "Qyk: ARM_QYK is '$(grep '  ARM_QYK:' <<< "$sec")'"
+  for v in RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS \
+           RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS; do
+    has "Qyk as the fast arm" "$sec" "$v" "$(val "$fast" "$v")"
+  done
+done
+for a in "$REF" "$FAST" "$QY60" "$QYP30" "$QYPQY"; do
+  has "no Qyk part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_KERNEL_COST 0
+  grep -qx "  ARM_QYK: " <<< "$(section "$a")" && ok "no Qyk part ($a): ARM_QYK empty" || bad "no Qyk part ($a): ARM_QYK is '$(grep '  ARM_QYK:' <<< "$(section "$a")")'"
+done
+qdskip "$QYKTWO" "two Qyk parts.*skipped"
 # ---- 7. Ctp: the prefill chain trace's switch and output prefix; skipped without P1 or at 0.
 for x in "$CTP 4" "$CTP2 2"; do
   read -r a n <<< "$x"
@@ -710,6 +1049,107 @@ for a in "$REF" "$FAST" "$QD200" "$QY60" "$QY25"; do
   has "no Ee part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_ENGRAM_EARLY ""
   grep -qx "  ARM_EE: " <<< "$(section "$a")" && ok "no Ee part ($a): ARM_EE empty" || bad "no Ee part ($a): ARM_EE is '$(grep '  ARM_EE:' <<< "$(section "$a")")'"
 done
+# ---- 8c. Qx in the arm loop: on the fast arm with Qd64-Qy60 the switch at 12 and every other switch as the fast arm
+# with Qd64-Qy60; every arm without the part states it 0; Qx without P1, Qx65 and two Qx parts skipped.
+sec=$(section "$QX")
+if [[ -z "$sec" ]]; then bad "the Qx arm $QX was not launched: $(grep -m3 "arm $QX" "$T/loop.txt")"
+else
+  has "Qx" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_EARLY 12
+  has "Qx beside Qd64" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS 64
+  has "Qx beside Qy60" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID 60
+  for v in RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA \
+           RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE RADIANCE_EXPERIMENTAL_DS41_P1_TILED; do
+    has "Qx as the fast arm" "$sec" "$v" "$(val "$fast" "$v")"
+  done
+fi
+for a in "$REF" "$NEW" "$FAST" "$QD200" "$QY25" "$QZ" "$QT"; do
+  has "no Qx part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_P1_EARLY 0
+done
+qdskip "$QXNOP" "Qx needs P1; the arm is skipped"
+qdskip "$QXBIG" "Qx65: Qx takes 1-64 (units); the arm is skipped"
+qdskip "$QXTWO" "two Qx parts; the arm is skipped"
+# ---- 8c. Qo in the arm loop: the switch at 1 on the fast arm with Qd64-Qy60, every other switch as the fast arm;
+# every arm without the part states it 0; Qo without P1 or without K (the packed RAM cache) skipped.
+sec=$(section "$QO")
+if [[ -z "$sec" ]]; then bad "the Qo arm $QO was not launched: $(grep -m3 "arm $QO" "$T/loop.txt")"
+else
+  has "Qo" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_PACK_ONCE 1
+  has "Qo with the packed cache" "$sec" RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE 1
+  for v in RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_P1_EARLY \
+           RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE RADIANCE_EXPERIMENTAL_DS41_P1_TILED; do
+    has "Qo as the fast arm" "$sec" "$v" "$(val "$fast" "$v")"
+  done
+fi
+for a in "$REF" "$NEW" "$FAST" "$QD200" "$QX" "$QZ" "$QT"; do
+  has "no Qo part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_P1_PACK_ONCE 0
+done
+qdskip "$QONOP" "Qo needs P1; the arm is skipped"
+qdskip "$QONOK" "Qo packs into the packed RAM cache only (a K part); the arm is skipped"
+# ---- 6e. Qyc in the arm loop: the mask at 3 and every other switch as the arm without it; every other arm states 0;
+# Qyc without Qy or Qyp, Qyc4 and two Qyc parts skipped.
+# $QYCBASE is also $QYKP's name (launched twice): its last section only, and no skipped arm's LOG lines.
+lastsec() { awk -v a="ARM $1" '$0 == a { p = 1; buf = ""; next } /^ARM / { p = 0 } p && !/^LOG: / { buf = buf $0 "\n" } END { printf "%s", buf }' "$T/loop.txt"; }
+sec=$(lastsec "$QYC")
+base=$(lastsec "$QYCBASE")
+if [[ -z "$sec" || -z "$base" ]]; then bad "the Qyc arms $QYC / $QYCBASE were not launched: $(grep -m3 "arm $QYC" "$T/loop.txt")"
+else
+  has "Qyc" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_CAL 3
+  has "Qyc beside Qy60" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID 60
+  has "Qyc beside Qyp60" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_PREFILL 60
+  has "no Qyc part ($QYCBASE)" "$base" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_CAL 0
+  if diff <(grep -v 'HYBRID_CAL\|ARM_QYC\|^ARM \|Qyc' <<< "$sec") <(grep -v 'HYBRID_CAL\|ARM_QYC\|^ARM \|Qyc' <<< "$base") >/dev/null; then
+    ok "Qyc: every other switch and argument as $QYCBASE"
+  else bad "Qyc: differs from $QYCBASE beyond the switch: $(diff <(grep -v 'HYBRID_CAL\|ARM_QYC\|Qyc' <<< "$sec") <(grep -v 'HYBRID_CAL\|ARM_QYC\|Qyc' <<< "$base") | head -4 | tr '\n' ' ')"; fi
+fi
+for a in "$REF" "$NEW" "$FAST" "$QD200" "$QY25" "$QZ" "$QT" "$QX"; do
+  has "no Qyc part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_P1_HYBRID_CAL 0
+done
+qdskip "$QYCNOH" "Qyc1 calibrates the hybrid split, which needs Qy or Qyp; the arm is skipped"
+qdskip "$QYCBIG" "Qyc4: Qyc takes 1-3 (a mask); the arm is skipped"
+qdskip "$QYCTWO" "two Qyc parts; the arm is skipped"
+# ---- 8d. Qes, LkT and mSN in the arm loop: Qes on the fast arm with Qd64-Qy60 states the switch 1 and every other arm 0;
+# Qes without the lent arena, without P1 and twice skipped. Lk452 at N8: --max-model-len 4608 (8 x 576); with an L
+# part, without an N part and under 16 tokens skipped. mS16 with mA states 16, every other arm empty; without mA
+# skipped.
+sec=$(section "$QES")
+if [[ -z "$sec" ]]; then bad "the Qes arm $QES was not launched: $(grep -m3 "arm $QES" "$T/loop.txt")"
+else
+  has "Qes" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT 1
+  has "Qes beside Qe64" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA 64
+  has "Qes beside Qd64" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_DECODE_ROWS 64
+fi
+for a in "$REF" "$FAST" "$QX" "$QZ" "$LK" "$MS"; do
+  has "no Qes part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA_SPLIT 0
+done
+qdskip "$QESNOQE" "Qes needs P1 and the lent arena (a QeK part); the arm is skipped"
+qdskip "$QESNOP" "Qes needs P1 and the lent arena (a QeK part); the arm is skipped"
+qdskip "$QESTWO" "two Qes parts; the arm is skipped"
+sec=$(section "$LK")
+if [[ -z "$sec" ]]; then bad "the Lk arm $LK was not launched: $(grep -m3 "arm $LK" "$T/loop.txt")"
+elif grep -q "  ARGS: .*--max-model-len 4608\b" <<< "$sec" && ! grep -q "  ARGS: .*--max-model-len 4608 .*--max-model-len" <<< "$sec"; then
+  ok "Lk452 at N8: --max-model-len 4608 (8 x 576)"
+else bad "Lk452 at N8: $(grep -oE -- '--max-model-len [0-9]+' <<< "$sec" | tr '\n' ' ')"; fi
+qdskip "$LKL" "Lk452 sizes the KV pool, and an L or Lm part sets it too; the arm is skipped"
+qdskip "$LKNON" "Lk452 sizes the KV pool from the streams, and there is no N part; the arm is skipped"
+qdskip "$LKLOW" "Lk8: Lk takes 16-1048576 (tokens a stream); the arm is skipped"
+sec=$(section "$MS")
+if [[ -z "$sec" ]]; then bad "the mS arm $MS was not launched: $(grep -m3 "arm $MS" "$T/loop.txt")"
+else has "mS16" "$sec" RADIANCE_EXPERIMENTAL_DS41_RAM_PER_SEQ_MIB 16; fi
+for a in "$REF" "$FAST" "$QES" "$LK"; do
+  has "no mS part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_RAM_PER_SEQ_MIB ""
+done
+qdskip "$MSNOMA" "mS16 sets the RAM budget's per-sequence term, which needs mA; the arm is skipped"
+sec=$(section "$KVL")
+if [[ -z "$sec" ]]; then bad "the Kvl arm $KVL was not launched: $(grep -m3 "arm $KVL" "$T/loop.txt")"
+else
+  has "Kvl" "$sec" RADIANCE_EXPERIMENTAL_DS41_KV_LEND 1
+  has "Kvl margin" "$sec" RADIANCE_EXPERIMENTAL_DS41_KV_LEND_MARGIN ""
+fi
+for a in "$REF" "$FAST" "$QES" "$MS"; do
+  has "no Kvl part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_KV_LEND 0
+done
+qdskip "$KVLNOQE" "Kvl needs P1 and the lent arena (a QeK part); the arm is skipped"
+qdskip "$KVLTWO" "two Kvl parts; the arm is skipped"
 
 short_out=$(run_loop 2048)
 for a in "$COLD4K" "$PC4K"; do
@@ -720,6 +1160,101 @@ for a in "$COLD4K" "$PC4K"; do
 done
 grep -qxF "ARM $BIG" <<< "$short_out" && ok 'Mb+Lc2048 still runs on its M2048 balance receipt' ||
   bad 'the shorter balance receipt incorrectly stopped Mb+Lc2048'
+
+# ---- 8c. Qw (the WMMA P1 twin, inexact by design): the switch at 1 on the preset arm with Qsp, Qt and Qz as they are;
+# every other arm states it 0 (Qw2 too: the wave size, ..._P1_WAVE=2); Qw without P1, beside Qv, and with Kld before a
+# reference skipped; with a reference, a Qw Kld arm scores against it (--kld-ref) instead of recording; without a
+# p1wmma receipt refused; the startup gate (every rank's marker, none on a plain arm).
+sec=$(section "$QW")
+if [[ -z "$sec" ]]; then bad "the Qw arm $QW was not launched: $(grep -m3 "arm $QW" "$T/loop.txt")"
+else
+  has "Qw" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_WMMA 1
+  for v in RADIANCE_EXPERIMENTAL_DS41_P1_TILED RADIANCE_EXPERIMENTAL_DS41_P1_TAIL_ONCE RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN; do
+    has "Qw on the Qsp-Qt-Qz preset" "$sec" "$v" 1
+  done
+  for v in RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA; do
+    has "Qw as the fast arm" "$sec" "$v" "$(val "$fast" "$v")"
+  done
+  grep -qx "  ARM_QW: 1" <<< "$sec" && ok "Qw: the arm is gated on its startup markers (ARM_QW=1)" || bad "Qw: ARM_QW is '$(grep '  ARM_QW:' <<< "$sec")'"
+fi
+for a in "$REF" "$FAST" "$QT" "$QTQZ" "$QD200" "$QW2"; do
+  has "no Qw part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_P1_WMMA 0
+done
+has "Qw2 is the wave size" "$(section "$QW2")" RADIANCE_EXPERIMENTAL_DS41_P1_WAVE 2
+qdskip "$QWNOP" "Qw needs P1; the arm is skipped"
+qdskip "$QWV" "Qw beside Qv8 (the host verify.*skipped"
+qdskip "$QWKLD" "Qw with Kld scores against the window's Kld reference, and none has been recorded yet.*skipped"
+ref_out=$(run_loop 4096 "" "$T/out/kld-plain")
+sec=$(awk -v a="ARM $QWKLD" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' <<< "$ref_out")
+if [[ -z "$sec" ]]; then bad "the Qw Kld arm was not launched with a reference: $(grep -m2 "arm $QWKLD" <<< "$ref_out")"
+elif grep -q -- "--kld-ref $T/out/kld-plain --kld-out $T/out/kld-$QWKLD.json" <<< "$sec" && ! grep -q -- "--kld-record" <<< "$sec"; then
+  ok "Qw with Kld: scored against the reference (--kld-ref, --kld-out), not recorded"
+else bad "Qw with Kld: $(grep '  ARGS:' <<< "$sec")"; fi
+nop1w_out=$(run_loop 4096 no-p1w)
+if grep -qxF "ARM $QW" <<< "$nop1w_out"; then bad "a Qw arm launched without a p1wmma receipt"
+elif grep -qF "arm $QW: Qw refused: no p1wmma check (test)" <<< "$nop1w_out"; then ok 'Qw refused without a p1wmma receipt'
+else bad "no p1wmma refusal for arm $QW: $(grep -m1 "arm $QW: " <<< "$nop1w_out")"; fi
+grep -qxF "ARM $FAST" <<< "$nop1w_out" && ok 'the fast arm runs without a p1wmma receipt' || bad 'the fast arm needed a p1wmma receipt'
+eval "$(sed -n '/^qw_gate() {/,/^}/p' "$W")"
+for r in 0 1 2 3; do echo "ds41 p1: WMMA twin on (inexact), rank $r (RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=1): every P1 twin call"; done > "$T/qw.log"
+qw_gate "$T/qw.log" 1 > /dev/null && ok "qw_gate: every rank's marker passes a Qw arm" || bad "qw_gate refused four markers"
+qw_gate "$T/qw.log" "" > /dev/null && bad "qw_gate passed a plain arm with WMMA markers" || ok "qw_gate: a plain arm with the markers is not measured"
+sed -i '/rank 2/d' "$T/qw.log"
+why=$(qw_gate "$T/qw.log" 1) && bad "qw_gate passed three markers" || { [[ $why == *"rank 2 lacks"* ]] && ok "qw_gate: a missing rank's marker is named" || bad "qw_gate: $why"; }
+: > "$T/qw.log"
+qw_gate "$T/qw.log" "" > /dev/null && ok "qw_gate: a plain arm without markers passes" || bad "qw_gate refused a plain arm"
+
+# ---- 8d. Dt / Aw
+sec=$(section "$DTAW")
+if [[ -z "$sec" ]]; then bad "the Dt-Aw arm $DTAW was not launched: $(grep -m3 "arm $DTAW" "$T/loop.txt")"
+else
+  has "Dt" "$sec" RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED 1
+  has "Aw" "$sec" RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA 1
+  for v in RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1 RADIANCE_EXPERIMENTAL_DS41_P1_WMMA RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8; do
+    has "Dt-Aw as the fast arm" "$sec" "$v" "$(val "$(section "$FAST")" "$v")"
+  done
+  grep -qx "  ARM_DT: 1" <<< "$sec" && grep -qx "  ARM_AW: 1" <<< "$sec" && ok "Dt-Aw: gated on both startup markers (ARM_DT=1, ARM_AW=1)" ||
+    bad "Dt-Aw: $(grep -E '  ARM_(DT|AW):' <<< "$sec" | tr '\n' ' ')"
+fi
+for a in "$REF" "$FAST" "$QW" "$QT"; do
+  has "no Dt part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED 0
+  has "no Aw part ($a)" "$(section "$a")" RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA 0
+done
+qdskip "$DTNOLC" "Dt needs Lc.*skipped"
+qdskip "$DTNOF8" "Dt needs F8.*skipped"
+qdskip "$AWNOLC" "Aw needs Lc.*skipped"
+qdskip "$AWKLD" "Aw with Kld scores against the window's Kld reference, and none has been recorded yet.*skipped"
+sec=$(section "$DTKLD")
+if [[ -n "$sec" ]] && grep -q -- "--kld-record $T/out/kld-$DTKLD" <<< "$sec"; then ok "Dt with Kld: recorded (exact), compared as any exact arm"
+else bad "Dt with Kld: $(grep '  ARGS:' <<< "$sec")"; fi
+sec=$(awk -v a="ARM $AWKLD" '$0 == a { p = 1; next } /^ARM / { p = 0 } p' <<< "$ref_out")
+if [[ -z "$sec" ]]; then bad "the Aw Kld arm was not launched with a reference: $(grep -m2 "arm $AWKLD" <<< "$ref_out")"
+elif grep -q -- "--kld-ref $T/out/kld-plain --kld-out $T/out/kld-$AWKLD.json" <<< "$sec" && ! grep -q -- "--kld-record" <<< "$sec"; then
+  ok "Aw with Kld: scored against the reference (--kld-ref, --kld-out), not recorded"
+else bad "Aw with Kld: $(grep '  ARGS:' <<< "$sec")"; fi
+nofast_out=$(run_loop 4096 no-fast)
+if grep -qxF "ARM $DTAW" <<< "$nofast_out" || grep -qxF "ARM $AWONLY" <<< "$nofast_out"; then bad "a Dt / Aw arm launched without its receipts"
+elif grep -qF "arm $DTAW: Dt refused: no dtiled check (test)" <<< "$nofast_out" &&
+     grep -qF "arm $AWONLY: Aw refused: no attnwm check (test)" <<< "$nofast_out"; then ok 'Dt and Aw refused without their receipts'
+else bad "no dtiled / attnwm refusal: $(grep -m1 "arm $DTAW: " <<< "$nofast_out") $(grep -m1 "arm $AWONLY: " <<< "$nofast_out")"; fi
+has "Aw alone" "$(section "$AWONLY")" RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA 1
+has "Aw alone" "$(section "$AWONLY")" RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED 0
+grep -qxF "ARM $FAST" <<< "$nofast_out" && ok 'the fast arm runs without the dtiled / attnwm receipts' || bad 'the fast arm needed them'
+eval "$(sed -n '/^fast_gate() {/,/^}/p;/^dt_gate() {/p;/^aw_gate() {/p' "$W")"
+for r in 0 1 2 3; do
+  echo "ds41 dense: tiled bf16f8 GEMM on (exact), rank $r (RADIANCE_EXPERIMENTAL_DS41_DENSE_TILED=1): 330 gemm_nt_bf16f8 ops"
+  echo "ds41 attn: WMMA sparse attention on (inexact), rank $r (RADIANCE_EXPERIMENTAL_DS41_ATTN_WMMA=1): 43 attn_sparse_sink ops"
+done > "$T/da.log"
+dt_gate "$T/da.log" 1 > /dev/null && aw_gate "$T/da.log" 1 > /dev/null && ok "dt_gate / aw_gate: every rank's marker passes" ||
+  bad "dt_gate / aw_gate refused four markers"
+dt_gate "$T/da.log" "" > /dev/null && bad "dt_gate passed a plain arm with markers" || ok "dt_gate: a plain arm with the markers is not measured"
+aw_gate "$T/da.log" "" > /dev/null && bad "aw_gate passed a plain arm with markers" || ok "aw_gate: a plain arm with the markers is not measured"
+sed -i '/attn.*rank 1/d' "$T/da.log"
+why=$(aw_gate "$T/da.log" 1) && bad "aw_gate passed three markers" || { [[ $why == *"rank 1 lacks"* ]] && ok "aw_gate: a missing rank's marker is named" || bad "aw_gate: $why"; }
+dt_gate "$T/da.log" 1 > /dev/null && ok "dt_gate: unaffected by the attention markers" || bad "dt_gate refused after an attention line was removed"
+: > "$T/da.log"
+dt_gate "$T/da.log" "" > /dev/null && aw_gate "$T/da.log" "" > /dev/null && ok "dt_gate / aw_gate: a plain arm without markers passes" ||
+  bad "dt_gate / aw_gate refused a plain arm"
 
 (( fail )) && { echo "ab_window_p1_test: FAILED (loop output in $T/loop.txt, removed on exit)"; exit 1; }
 echo "ab_window_p1_test: all checks passed"

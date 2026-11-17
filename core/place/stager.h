@@ -589,6 +589,18 @@ public:
     void track_draft_bank_residents() { bank_track_ = true; }
     uint64_t draft_bank_selected_units() const { return bank_selected_; }
     int  p1_lend_arena(char* lo, int64_t bytes, int64_t rows, std::function<bool()> full, std::string* why);
+    /* The KV pool's lent slots (ds41p1::kKvLendEnv, card_expert_stager.h RingLender::set_kv): before
+     * p1_lend_arena, the engine hands over whole slots carved from the top of the KV pool's FULL groups, each with
+     * the loan in tokens that covers it (ascending), and `target`, the loan the cache grants now (an atomic the
+     * scheduler moves). p1_lend_init gives them the next hottest units after the arena's. At each pass's begin
+     * (p1_kv_sync, before the lender's) a slot the target no longer covers is withdrawn and its queued copy fenced
+     * before the pass's first op; one it covers again becomes available behind the end of the pass before. */
+    void p1_kv_set(std::vector<char*> slots, std::vector<int64_t> need, std::function<int64_t()> target) {
+        p1_kv_at_ = std::move(slots);
+        p1_kv_need_ = std::move(need);
+        p1_kv_target_ = std::move(target);
+    }
+    int  p1_kv_lent_slots() const { return p1_ && p1_->lend_kv_slots() > 0 ? p1_->lend_kv_slots() : 0; }
     //Must run before Ctx::shutdown and before Mover/bank/buffer owners disappear.
     int shutdown_head_cache();
 
@@ -783,6 +795,14 @@ private:
     /* The lent ring (card_expert_stager.h, RingLender; ..._P1_LEND): behind the last pass that read a
      * ring resident, recorded at its end; an armed pass's first ring copy waits on it. */
     RadEvent p1_lend_ev_ = nullptr;
+    /* The KV pool's lent slots (p1_kv_set): their addresses and covering loans, the cache's target, the event
+     * recorded at every pass's end (a slot the loan covers again reloads behind it) and whether it was. */
+    std::vector<char*>   p1_kv_at_;
+    std::vector<int64_t> p1_kv_need_;
+    std::function<int64_t()> p1_kv_target_;
+    RadEvent p1_kv_ev_ = nullptr;
+    bool     p1_kv_rec_ = false;
+    void     p1_kv_sync();
     bool     p1_lend_rec_ = false;
     /* ..._P1_LEND_AUDIT (card_expert_stager.h, the read-back audit): on for this rank's lent slots; and, at
      * shutdown with this rank's device current and no pass in flight, every lent resident read back once
@@ -835,7 +855,7 @@ private:
         return (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::steady_clock::now().time_since_epoch()).count();
     }
-    std::vector<int32_t> p1_nonres_, p1_ahead_;
+    std::vector<int32_t> p1_nonres_, p1_ahead_, p1_early_;
     /* By routed layer: its routed units the plan pinned in the host pool, which the card would read
      * across the link once a row pass; an armed layer copies the selected ones to the ring as it does
      * a RAM-cache unit (p1_layer). p1_pool_sel_: this layer's selected ones, published skipped. */
@@ -873,7 +893,8 @@ private:
     int64_t  p1_decode_rows_ = 0;
     bool     p1_decode_pass_ = false;
     uint64_t p1_dec_passes_ = 0, p1_dec_rows_ = 0, p1_dec_max_ = 0, p1_dec_ns_ = 0, p1_dec_below_ = 0;
-    /* ..._P1_HYBRID (p1_hybrid.h; 0 off: none of this acts): this pass is an armed decode pass that may split;
+    /* ..._P1_HYBRID (p1_hybrid.h; 0 off: none of this acts): this pass is an armed decode pass that may split
+     * (or, under ..._P1_HYBRID_PREFILL, an armed prefill pass: p1_decode_pass_ false);
      * the layer whose CPU units are with the pool (-1 none); the event behind its waves (after_op) and whether
      * it was recorded; the submit time; the share. p1_hyb_pick chooses (fills p1_hyb_to_, by want_ index),
      * p1_hyb_take borrows and submits, p1_hyb_done counts a layer at its gather (hx_finish). */
@@ -893,6 +914,24 @@ private:
     RadEvent p1_hyb_ev_ = nullptr;
     std::chrono::steady_clock::time_point p1_hyb_t_sub_{};
     p1hyb::Share p1_hyb_share_;
+    /* ..._P1_HYBRID_PREFILL: the prefill passes' own share (a prefill layer stages far more than a decode one, so
+     * the two adapt apart); p1_hyb_shr() is the share of this pass's kind. */
+    p1hyb::Share p1_hyb_pf_share_;
+    p1hyb::Share& p1_hyb_shr() { return p1_decode_pass_ ? p1_hyb_share_ : p1_hyb_pf_share_; }
+    /* ..._P1_HYBRID_CAL (p1_hybrid.h "calibration"; p1_tun_.hybrid_cal, 0 off): the pass kind (0 decode, 1 prefill);
+     * the share the split runs with and where a layer's outcome goes (the rank's own, or the coupled one); the rate
+     * the choice charges the CPU at (the model's, or RateCal's). */
+    int    p1_hyb_kind() const { return p1_decode_pass_ ? 0 : 1; }
+    bool   p1_hyb_coupled() const { return (p1_tun_.hybrid_cal & ds41p1::kHybridCalCouple) != 0; }
+    bool   p1_hyb_calibrated() const { return (p1_tun_.hybrid_cal & ds41p1::kHybridCalRate) != 0; }
+    double p1_hyb_share_now() { return p1_hyb_coupled() ? p1hyb::coupled_share(p1_hyb_kind()).share() : p1_hyb_shr().share(); }
+    double p1_hyb_cpu_rate() const;
+    /* kHybridCalCouple: the cost reserved at the choice that no borrow has drawn yet (given back by
+     * p1_hyb_release_pre after the layer's borrows); the backlog the choice saw and the cost the layer's submit had to
+     * drain (kHybridCalRate's sample); this rank's samples by kind. */
+    int64_t  p1_hyb_pre_ = 0, p1_hyb_seen_ = 0, p1_hyb_drain_ = 0;
+    uint64_t p1_hyb_cal_n_[2] = { 0, 0 };
+    void     p1_hyb_release_pre();
     std::vector<p1hyb::Cand> p1_hyb_cand_;
     std::vector<uint8_t> p1_hyb_to_;
     std::vector<int> p1_hyb_order_;
@@ -902,8 +941,22 @@ private:
         uint64_t other_level = 0;   /* layers whose operands were last seen at the other arena level */
         uint64_t cpu_rows = 0, cpu_ns = 0, wait_ns = 0, late = 0, late_wait_ns = 0, early = 0;
         double   pred_cpu_ns = 0, pred_card_ns = 0;
-    } p1_hyb_st_;
+        uint64_t issue_ns = 0;      /* prefill only: the armed passes' issue time (decode's is p1_dec_ns_) */
+        /* The pool's own finish: submit to the layer's last job done (HostExpertPool::Ticket::last_ns), which
+         * cpu_ns (submit to the gather's wait) bounds from above; and the cost the taken units reserved. */
+        uint64_t pool_ns = 0, pool_layers = 0;
+        int64_t  cost_bytes = 0;
+    } p1_hyb_st_, p1_hyb_pf_st_;   /* decode passes', and (..._P1_HYBRID_PREFILL) prefill passes' */
+    HybStats& p1_hyb_cur() { return p1_decode_pass_ ? p1_hyb_st_ : p1_hyb_pf_st_; }
+    /* Whether an armed pass may split, from its kind and the two switches (the event is the switches' common
+     * resource). */
+    static bool p1_hyb_arms(bool armed, bool decode, int hybrid, int hybrid_prefill, bool have_event) {
+        return armed && have_event && (decode ? hybrid > 0 : hybrid_prefill > 0);
+    }
     int  p1_hyb_pick(int32_t li);
+    /* ds41p1::kEarlyEnv: behind layer li's waves, the next card-path layer's RAM-cache units (not lent, not
+     * in the slab or the host pool), the sealed profile's likeliest first, copied into the ring early. */
+    int  p1_early(int32_t li);
     bool p1_hyb_borrow(int32_t u, int rows, bool admit);
     int  p1_hyb_submit(int32_t li);
     void p1_hyb_done(bool early, uint64_t waited_ns);
@@ -927,6 +980,7 @@ private:
     int64_t lcp_reach_ = 0;            /* the twin's bound, as its bands state it */
     int     lcp_moe_ = 0, lcp_twin_ = 0, lcp_split_ = 0, lcp_runs_ = 0, lcp_ops_ = 0, lcp_pair_ops_ = 0;
     std::string lcp_pairs_;            /* the multi-kernel ops admitted, by family */
+    int     lcp_dense_ops_ = 0, lcp_attn_ops_ = 0;   /* ops on the fast forms (ds41p1::kDenseTiledEnv, kAttnWmmaEnv) */
     /* Batch eligibility only. start() additionally requires this exact native EP layer;
      * selected-routed starts always use Normal. Immutable copy passed per mover call. */
     NativeFileCacheReadPolicy pass_cache_policy_ = NativeFileCacheReadPolicy::Normal;

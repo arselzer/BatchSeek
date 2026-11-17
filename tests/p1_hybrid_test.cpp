@@ -15,6 +15,12 @@
  *    the selected units, the borrows come in the layer's order with the admission's touch, the pool's
  *    reservation is given back in full, and a fixed-order weighted combine over each token's top-k rows (the
  *    gather's shape) is bit-identical to the base's whatever the split;
+ *  - hybrid prefill (..._P1_HYBRID_PREFILL, EPBAL-20261115.md): the switch's tunable (0-400, off by default, apart
+ *    from ..._P1_HYBRID), which armed passes may split (p1_hyb_arms: a decode pass by ..._P1_HYBRID, a prefill pass
+ *    by ..._P1_HYBRID_PREFILL, never without the event), and the same layer as above in a prefill pass of up to
+ *    96 tokens (experts of more rows than a CPU job takes, so their rows go as several jobs): every live slot and
+ *    the combine as the base's at every share, with the prefill share and the prefill counts, the decode ones
+ *    untouched;
  *  - the H31 failure (window ab-20261113T072152Z, N128 and BIRD N256 arms with Qy60): the first armed decode pass
  *    after prefill chunks at the activation arena's full plan read the rows and the sorted order from the full
  *    plan's addresses while it ran at the lent arena's smaller level ("expert 92 has 0 rows in the sorted order
@@ -22,7 +28,14 @@
  *    only when its gate_up operands were last seen at this pass's level (p1_hyb_layer_ok): the pass sequence
  *    full-plan prefill -> 256-row-level decode declines (counted), its gate_up records that level's addresses,
  *    the next decode pass splits; at the 1024-row level and back at the full plan it declines again; and the live check that failed on the
- *    card refuses the moved operands as it did there. */
+ *    card refuses the moved operands as it did there.
+ *  - ..._P1_HYBRID_CAL (p1_hybrid.h "calibration"): RateCal learns a pass kind's rate from completions on a fake clock
+ *    (and ignores the other kind, empty samples and the bulk of a stall), choose() at the calibrated rate keeps the
+ *    real CPU time within the share where the model rate overcommits, a calibrated share grows to 4P and still backs
+ *    off, the coupled share moves with every rank's outcomes (none lost across threads), the mask's tunable (0-3), a
+ *    coupled choice reserves its whole cost so the next rank's choice sees it (choose-then-reserve did not) and gives
+ *    back what no borrow drew, and the hybrid decode and prefill layers stay byte-identical to the base under every
+ *    mask with each split layer a sample of its own kind. */
 #include "rad_test.h"
 
 #include "rad_internal.h"
@@ -37,10 +50,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define REQUIRE_OK(expr) REQUIRE((expr) >= 0)
@@ -162,6 +177,88 @@ TEST(choose_takes_cached_units_fewest_rows_first_while_they_fit) {
     CHECK_EQ((int)tt[0], 1);
 }
 
+/* ..._HOST_EXPERTS_KERNEL_COST: MAX_ROWS=32 (Mr32, the batch arms) as the pool's costs: the default's (the many-row
+ * rate from 5 rows) and the kernel's (from 4, many_from()). */
+static int64_t cost_mr32_default(int rows) { return HostExpertPool::cost_rows_for(rows, 32, HostExpertPool::kMaxRowsDefault + 1); }
+static int64_t cost_mr32_kernel(int rows) { return HostExpertPool::cost_rows_for(rows, 32, 4); }
+
+TEST(the_default_costs_are_not_monotonic_past_four_rows_and_the_kernel_costs_follow_the_kernel) {
+    /* MAX_ROWS=32: 1 row 1x, 2 1.5x, 3 2x, 4 2.5x, then 5 rows 1.5x (the default's threshold), 6 1.625x. */
+    CHECK_EQ(cost_mr32_default(1), kB);
+    CHECK_EQ(cost_mr32_default(3), kB + 2 * (kB / 2));
+    CHECK_EQ(cost_mr32_default(4), kB + 3 * (kB / 2));
+    CHECK_EQ(cost_mr32_default(5), kB + 4 * (kB / 8));
+    CHECK(cost_mr32_default(5) < cost_mr32_default(3));   /* the inversion */
+    /* The kernel's: four rows already the many-row rate. */
+    CHECK_EQ(cost_mr32_kernel(4), kB + 3 * (kB / 8));
+    CHECK_EQ(cost_mr32_kernel(3), cost_mr32_default(3));
+    CHECK_EQ(cost_mr32_kernel(40), cost_mr32_default(40));   /* two jobs of 20 */
+    /* At the default MAX_ROWS (4, this process) the switch changes no cost: no job runs the many-row kernel. */
+    REQUIRE(HostExpertPool::max_rows() == HostExpertPool::kMaxRowsDefault);
+    std::vector<int64_t> off;
+    HostExpertPool::kernel_cost_set_for_test(0);
+    for (int r = 1; r <= 300; ++r) off.push_back(HostExpertPool::cost_rows(r));
+    HostExpertPool::kernel_cost_set_for_test(1);
+    for (int r = 1; r <= 300; ++r) CHECK_EQ(HostExpertPool::cost_rows(r), off[(size_t)(r - 1)]);
+    CHECK_EQ(HostExpertPool::job_cost(4), kB + 3 * (kB / 2));
+    HostExpertPool::kernel_cost_set_for_test(-1);
+    CHECK(!HostExpertPool::kernel_cost());   /* the environment: unset */
+}
+
+TEST(choose_by_cost_takes_what_a_dearer_few_row_unit_blocked_in_rows_order) {
+    /* The review's case at Mr32: CPU 78 GB/s, link 20 GB/s, share 0.4, the other ranks' backlog 12.5 experts. A
+     * 3-row unit (2x) heads the rows order and does not fit, so the old scan stops there; nine 5-row units (1.5x)
+     * behind it each fit alone. Cheapest first takes one of them. */
+    std::vector<int> order;
+    std::vector<Cand> c = { { 3, kB, true } };
+    for (int k = 0; k < 9; ++k) c.push_back({ 5, kB, true });
+    std::vector<uint8_t> to(c.size());
+    const double cpu = 78.0, link = 20.0, share = 0.4;
+    const int64_t backlog = 12 * kB + kB / 2;
+    Split s = rad::p1hyb::choose(c.data(), (int)c.size(), backlog, cpu, link, share, to.data(), &order, false,
+                                 &cost_mr32_default);
+    CHECK_EQ(s.n_cpu, 0);   /* the old selection: blocked by the 3-row unit */
+    s = rad::p1hyb::choose(c.data(), (int)c.size(), backlog, cpu, link, share, to.data(), &order, true,
+                           &cost_mr32_default);
+    CHECK_EQ(s.n_cpu, 1);
+    CHECK_EQ((int)to[0], 0);
+    CHECK_EQ((int)to[1], 1);   /* the first 5-row unit (stable) */
+    CHECK_EQ(s.cpu_cost, cost_mr32_default(5));
+    /* The kernel's costs put the 4-row unit first: 1.375x. */
+    std::vector<Cand> d = { { 2, kB, true }, { 3, kB, true }, { 4, kB, true }, { 5, kB, true }, { 1, kB, true } };
+    std::vector<uint8_t> td(d.size());
+    s = rad::p1hyb::choose(d.data(), (int)d.size(), 0, cpu, link, 1e9, td.data(), &order, true, &cost_mr32_kernel);
+    const int want[5] = { 4, 2, 0, 3, 1 };   /* 1 row 1x, 4 rows 1.375x, 2 rows 1.5x, 5 rows 1.5x, 3 rows 2x */
+    CHECK(order == std::vector<int>(want, want + 5));
+    /* Every one but the dearest: the last would leave the card no bytes to bound the CPU by. */
+    CHECK_EQ(s.n_cpu, 4);
+    CHECK(td[4] && td[2] && td[0] && td[3] && !td[1]);
+    /* Random layers: by cost, the taken units are a cheapest prefix (no untaken cached unit is cheaper than a taken
+     * one), the bound holds, and the next one in cost order would break it. */
+    std::mt19937 rng(77);
+    for (int trial = 0; trial < 400; ++trial) {
+        const int n = 1 + (int)(rng() % 40);
+        std::vector<Cand> r((size_t)n);
+        for (auto& x : r) x = { 1 + (int)(rng() % 70), kB, (rng() % 5) != 0 };
+        std::vector<uint8_t> tr((size_t)n);
+        const double sh = 0.05 + 0.1 * (double)(rng() % 20);
+        const int64_t bl = (int64_t)(rng() % 20) * kB / 2;
+        for (auto* f : { &cost_mr32_default, &cost_mr32_kernel }) {
+            const Split q = rad::p1hyb::choose(r.data(), n, bl, cpu, link, sh, tr.data(), &order, true, f);
+            int64_t taken_max = 0, untaken_min = INT64_MAX, sum = 0;
+            for (int i = 0; i < n; ++i) {
+                if (!r[(size_t)i].cached) { CHECK_EQ((int)tr[(size_t)i], 0); continue; }
+                const int64_t ci = f(r[(size_t)i].rows);
+                if (tr[(size_t)i]) { taken_max = std::max(taken_max, ci); sum += ci; }
+                else untaken_min = std::min(untaken_min, ci);
+            }
+            CHECK(taken_max <= untaken_min);
+            CHECK_EQ(q.cpu_cost, sum);
+            if (sum > 0) CHECK((double)(bl + sum) / cpu <= sh * (double)q.card_bytes / link * (1 + 1e-12));
+        }
+    }
+}
+
 TEST(choose_random_layers_hold_the_bound_and_its_maximality) {
     std::mt19937 rng(12345);
     std::vector<int> order;
@@ -254,6 +351,34 @@ TEST(tunables_take_the_hybrid_switches) {
     CHECK(why.find(ds41p1::kHybridAdaptEnv) != std::string::npos);
 }
 
+TEST(tunables_take_the_hybrid_prefill_switch_apart_from_the_decode_one) {
+    auto parse = [](const char* hy, const char* pf, rad::p1::Tunables* t, std::string* why) {
+        return rad::p1::parse_tunables([&](const char* k) -> const char* {
+            if (!std::strcmp(k, ds41p1::kHybridEnv)) return hy;
+            if (!std::strcmp(k, ds41p1::kHybridPrefillEnv)) return pf;
+            return nullptr;
+        }, t, why);
+    };
+    rad::p1::Tunables t;
+    std::string why;
+    REQUIRE(parse(nullptr, nullptr, &t, &why));
+    CHECK_EQ(t.hybrid_prefill, 0);   /* off by default */
+    REQUIRE(parse(nullptr, "", &t, &why));
+    CHECK_EQ(t.hybrid_prefill, 0);
+    REQUIRE(parse(nullptr, "0", &t, &why));
+    CHECK_EQ(t.hybrid_prefill, 0);
+    REQUIRE(parse(nullptr, "60", &t, &why));
+    CHECK_EQ(t.hybrid_prefill, 60);
+    CHECK_EQ(t.hybrid, 0);           /* the decode switch stays off */
+    REQUIRE(parse("30", "400", &t, &why));
+    CHECK_EQ(t.hybrid, 30);
+    CHECK_EQ(t.hybrid_prefill, 400);
+    CHECK(!parse(nullptr, "401", &t, &why));
+    CHECK(why.find(ds41p1::kHybridPrefillEnv) != std::string::npos);
+    CHECK(!parse(nullptr, "-1", &t, &why));
+    CHECK(!parse(nullptr, "x", &t, &why));
+}
+
 /* ---- the stager's hybrid layer ---------------------------------------------------------------------------- */
 
 namespace rad {
@@ -263,7 +388,7 @@ struct P1HybridProbe {
     Mover mover;
     FileStager fs;
     std::vector<int32_t> counts = std::vector<int32_t>(96, 0);
-    static constexpr int R = 16;   /* the pass's rows at most */
+    const int R;                   /* the pass's rows at most */
     int AR = 0;
     std::vector<float> w;          /* the gather's weights, [AR][6] */
     std::vector<int32_t> slot_of;  /* [AR][6]: the sorted slot of token t's pick k, -1 another rank's */
@@ -295,7 +420,7 @@ struct P1HybridProbe {
         return u >= 0 && u < 96 && p->cached[(size_t)u];
     }
 
-    P1HybridProbe() {
+    explicit P1HybridProbe(int rows_max = 16) : R(rows_max) {
         plan.rank = 0;
         plan.world_size = 4;
         plan.units.resize(96);
@@ -443,7 +568,11 @@ struct P1HybridProbe {
         fs.want_.clear();
         for (int e = 0; e < 96; ++e)
             if (counts[(size_t)e] > 0) fs.want_.push_back(e);
-        fs.p1_hyb_share_.init(pct, false);
+        fs.p1_hyb_shr().init(pct, false);   /* the share of the pass's kind (p1_decode_pass_) */
+        /* ..._P1_HYBRID_CAL: the coupled share at the same value, and the calibrated rate back at the model's, so
+         * every share's choice is made at the same rate (the samples still count). */
+        if (fs.p1_hyb_coupled()) p1hyb::coupled_share(fs.p1_hyb_kind()).init(pct, false);
+        if (fs.p1_hyb_calibrated()) p1hyb::rate_cal().init(fs.hx_pool_->cpu_bytes_per_ns());
         fs.p1_hyb_cpu_.clear();
         const int64_t backlog0 = fs.hx_pool_->backlog();
         const bool split = fs.p1_hyb_pick(0) > 0;
@@ -452,6 +581,7 @@ struct P1HybridProbe {
             if (split && fs.p1_hyb_to_[i] && fs.p1_hyb_borrow(u, counts[(size_t)u], true)) continue;
             L.card.push_back(u);
         }
+        fs.p1_hyb_release_pre();   /* as p1_layer does after the borrows */
         L.cpu = fs.p1_hyb_cpu_;
         if (fs.hx_n_ > 0) REQUIRE_OK(fs.p1_hyb_submit(0));
         const int32_t* const off = fs.hx_idx_ + fs.hx_sorted_max();
@@ -481,7 +611,34 @@ struct P1HybridProbe {
         L.backlog_after = fs.hx_pool_->backlog() - backlog0;
     }
 
-    void splits_are_exact() {
+    /* Only the choice of a decode layer at share `pct` (every unit cached): the units it takes, and what it left
+     * reserved in the pool (backlog() - before). The caller gives the reservation back (p1_hyb_release_pre). */
+    int pick_only(int pct, int cal, int64_t* reserved) {
+        fs.p1_decode_pass_ = true;
+        fs.p1_tun_.hybrid_cal = cal;
+        std::fill(cached.begin(), cached.end(), 1);
+        std::fill(refuse.begin(), refuse.end(), 0);
+        fs.want_.clear();
+        for (int e = 0; e < 96; ++e)
+            if (counts[(size_t)e] > 0) fs.want_.push_back(e);
+        fs.p1_hyb_shr().init(pct, false);
+        if (fs.p1_hyb_coupled()) p1hyb::coupled_share(0).init(pct, false);
+        const int64_t before = fs.hx_pool_->backlog();
+        const int n = fs.p1_hyb_pick(0);
+        *reserved = fs.hx_pool_->backlog() - before;
+        return n;
+    }
+    int64_t pre() const { return fs.p1_hyb_pre_; }
+    void    release() { fs.p1_hyb_release_pre(); }
+    /* Which armed passes may split (FileStager::p1_hyb_arms, as begin_pass asks it). */
+    static bool arms(bool armed, bool decode, int hy, int pf, bool ev) {
+        return FileStager::p1_hyb_arms(armed, decode, hy, pf, ev);
+    }
+    /* `prefill`: the layer of an armed prefill pass (p1_decode_pass_ false: the prefill share and counts) with
+     * passes of 96 and 61 tokens; else an armed decode pass of 16 and 9. */
+    void splits_are_exact(bool prefill = false, int cal = 0) {
+        fs.p1_decode_pass_ = !prefill;
+        fs.p1_tun_.hybrid_cal = cal;
         REQUIRE(experts().size() == (size_t)kPacked);
         RadStream s = nullptr;
         RadEvent ev = nullptr;
@@ -490,16 +647,26 @@ struct P1HybridProbe {
         fs.hx_out_ev_ = ev;
         uint16_t* y = (uint16_t*)rad_dev_alloc((int64_t)R * 6 * 5120 * 2, RAD_MEM_DEVICE);
         REQUIRE(y);
-        int splits_seen = 0;
+        int splits_seen = 0, max_cpu_rows = 0;
         for (uint32_t seed : { 11u, 12u }) {
-            REQUIRE(pass(seed == 11u ? 16 : 9, seed));
+            REQUIRE(pass(prefill ? (seed == 11u ? 96 : 61) : (seed == 11u ? 16 : 9), seed));
+            REQUIRE(AR <= R);
             const int32_t* const off = fs.hx_idx_ + fs.hx_sorted_max();
             const int T = off[96];
             /* Most units cached; a few drive units (not cached), and one cached unit refused at borrow time. */
             std::fill(cached.begin(), cached.end(), 1);
             std::fill(refuse.begin(), refuse.end(), 0);
             cached[2] = cached[17] = 0;
-            refuse[5] = 1;
+            /* The refused unit: 5 in the decode passes; in the taller prefill passes the fewest-rows cached unit, which
+             * every share above 0 picks first (unit 5 has too many rows there to be picked at all). */
+            int refused = prefill ? -1 : 5;
+            if (prefill)
+                for (int e = 0; e < 96; ++e)
+                    if (cached[(size_t)e] && counts[(size_t)e] > 0 &&
+                        (refused < 0 || counts[(size_t)e] < counts[(size_t)refused]))
+                        refused = e;
+            REQUIRE(refused >= 0);
+            refuse[(size_t)refused] = 1;
             const std::vector<float> base = combine(ref.data());
             int last_cpu = -1;
             for (int pct : { 0, 2, 10, 40, 100, 400 }) {
@@ -527,12 +694,28 @@ struct P1HybridProbe {
                 CHECK((int)L.cpu.size() >= last_cpu);   /* a larger share takes no fewer */
                 last_cpu = (int)L.cpu.size();
                 if (!L.cpu.empty() && !L.card.empty()) ++splits_seen;
+                for (int32_t u : L.cpu) max_cpu_rows = std::max(max_cpu_rows, (int)counts[(size_t)u]);
             }
             CHECK(last_cpu > 0);
         }
         CHECK(splits_seen > 0);
-        CHECK(fs.p1_hyb_st_.fell_back > 0);   /* unit 5, refused at its borrow */
-        CHECK(fs.p1_hyb_st_.layers > 0);
+        const FileStager::HybStats& mine = prefill ? fs.p1_hyb_pf_st_ : fs.p1_hyb_st_;
+        const FileStager::HybStats& other = prefill ? fs.p1_hyb_st_ : fs.p1_hyb_pf_st_;
+        CHECK(mine.fell_back > 0);   /* the refused unit, at its borrow */
+        CHECK(mine.layers > 0);
+        CHECK(mine.cpu_units > 0);
+        CHECK_EQ(other.layers, (uint64_t)0);   /* the other kind's counts untouched */
+        CHECK_EQ(other.cpu_units, (uint64_t)0);
+        /* In the prefill passes some CPU unit held more rows than a job takes: its rows went as several jobs. */
+        if (prefill) CHECK(max_cpu_rows > HostExpertPool::max_rows());
+        /* The pool's own finish was read at each split layer's gather, within the submit-to-gather span. */
+        CHECK(mine.pool_layers > 0);
+        CHECK(mine.pool_ns <= mine.cpu_ns);
+        CHECK(mine.cost_bytes > 0);
+        /* ..._P1_HYBRID_CAL's rate bit: each split layer's completion was a sample of its kind, none of the other's. */
+        CHECK_EQ(fs.p1_hyb_cal_n_[prefill ? 1 : 0], (cal & ds41p1::kHybridCalRate) ? mine.pool_layers : (uint64_t)0);
+        CHECK_EQ(fs.p1_hyb_cal_n_[prefill ? 0 : 1], (uint64_t)0);
+        CHECK_EQ(fs.p1_hyb_pre_, (int64_t)0);
         fs.hx_out_ev_ = nullptr;
         rad_event_destroy(ev);
         rad_stream_destroy(s);
@@ -648,6 +831,185 @@ TEST(a_hybrid_layer_leaves_every_row_and_the_combine_as_the_base_at_every_share)
     if (!pool()) SKIP("no AVX2 or no CPU pool");
     rad::P1HybridProbe p;
     p.splits_are_exact();
+}
+
+TEST(an_armed_pass_splits_by_its_kinds_switch) {
+    for (int armed = 0; armed < 2; ++armed)
+        for (int decode = 0; decode < 2; ++decode)
+            for (int hy : { 0, 60 })
+                for (int pf : { 0, 30 })
+                    for (int ev = 0; ev < 2; ++ev) {
+                        const bool want = armed && ev && (decode ? hy > 0 : pf > 0);
+                        CHECK_EQ(rad::P1HybridProbe::arms(armed, decode, hy, pf, ev), want);
+                    }
+}
+
+TEST(a_hybrid_prefill_layer_leaves_every_row_and_the_combine_as_the_base_at_every_share) {
+    if (!pool()) SKIP("no AVX2 or no CPU pool");
+    rad::P1HybridProbe p(96);
+    p.splits_are_exact(true);
+}
+
+/* ---- ..._P1_HYBRID_CAL (p1_hybrid.h "calibration") -------------------------------------------------------- */
+
+TEST(rate_cal_learns_the_pools_rate_from_completions_per_kind) {
+    rad::p1hyb::RateCal r;
+    r.init(78.0);
+    CHECK_NEAR(r.bytes_per_ns(0), 78.0, 1e-9);
+    CHECK_NEAR(r.bytes_per_ns(1), 78.0, 1e-9);
+    /* A fake clock: prefill layers that drain 0.5-1.5 GB at a real 30 B/ns (2.6x below the model). */
+    std::mt19937 rng(5);
+    for (int i = 0; i < 300; ++i) {
+        const int64_t bytes = 500000000 + (int64_t)(rng() % 1000000000);
+        r.sample(1, bytes, (int64_t)((double)bytes / 30.0));
+    }
+    CHECK_NEAR(r.bytes_per_ns(1), 30.0, 0.3);
+    CHECK_NEAR(r.bytes_per_ns(0), 78.0, 1e-9);   /* decode untouched */
+    CHECK_EQ(r.samples(1), (uint64_t)300);
+    CHECK_EQ(r.samples(0), (uint64_t)0);
+    /* One stalled layer (1000x slow) moves it by at most kAlpha of the clamp, not to the stall's rate. */
+    const double npb0 = 1.0 / r.bytes_per_ns(1);
+    r.sample(1, 1000000000, (int64_t)1000000000 * 1000 / 30);
+    const double npb1 = 1.0 / r.bytes_per_ns(1);
+    CHECK(npb1 <= npb0 + rad::p1hyb::RateCal::kAlpha * (rad::p1hyb::RateCal::kHi / 78.0 - npb0) + 1e-12);
+    CHECK(r.bytes_per_ns(1) > 10.0);
+    /* Nothing to learn from: no change. */
+    const double before = r.bytes_per_ns(0);
+    r.sample(0, 0, 100);
+    r.sample(0, 100, 0);
+    CHECK_NEAR(r.bytes_per_ns(0), before, 1e-12);
+    CHECK_EQ(r.samples(0), (uint64_t)0);
+    /* Then back to the model rate when the pool speeds up: it follows. */
+    for (int i = 0; i < 400; ++i) r.sample(1, 1000000000, (int64_t)(1e9 / 78.0));
+    CHECK_NEAR(r.bytes_per_ns(1), 78.0, 0.8);
+}
+
+TEST(choose_at_the_calibrated_rate_keeps_the_real_cpu_time_within_the_share) {
+    /* A prefill-sized layer: 60 cached units of 1-8 rows, 20 GB/s link, share 0.6; the pool runs at 30 B/ns, the
+     * model says 78. At the model rate the choice overcommits the real pool; at the calibrated one it does not. */
+    std::mt19937 rng(9);
+    std::vector<Cand> c(60);
+    for (auto& x : c) {
+        x.rows = 1 + (int)(rng() % 8);
+        x.bytes = kB;
+        x.cached = true;
+    }
+    std::vector<uint8_t> to(60);
+    std::vector<int> order;
+    const auto cost = &cost_mr32_kernel;
+    const Split model = rad::p1hyb::choose(c.data(), 60, 0, 78.0, 20.0, 0.6, to.data(), &order, true, cost);
+    const Split cal = rad::p1hyb::choose(c.data(), 60, 0, 30.0, 20.0, 0.6, to.data(), &order, true, cost);
+    CHECK(model.n_cpu > cal.n_cpu);
+    CHECK(cal.n_cpu > 0);
+    const double real_model = (double)model.cpu_cost / 30.0, real_cal = (double)cal.cpu_cost / 30.0;
+    CHECK(real_model > 0.6 * model.card_ns);
+    CHECK(real_cal <= 0.6 * cal.card_ns + 1e-6);
+}
+
+TEST(a_calibrated_share_may_grow_to_its_ceiling_and_still_backs_off) {
+    CHECK_EQ(rad::p1hyb::cal_ceiling(60, 400), 240);
+    CHECK_EQ(rad::p1hyb::cal_ceiling(150, 400), 400);
+    CHECK_EQ(rad::p1hyb::cal_ceiling(400, 400), 400);
+    rad::p1hyb::Share s;
+    s.init(60, true, 240);
+    CHECK_NEAR(s.share(), 0.6, 1e-12);   /* starts at P */
+    CHECK_NEAR(s.ceiling(), 2.4, 1e-12);
+    for (int i = 0; i < 100; ++i) s.layer(true, false);
+    CHECK_NEAR(s.share(), 2.4, 1e-12);
+    s.layer(false, true);
+    CHECK_NEAR(s.share(), 2.4 * 0.8, 1e-12);
+    rad::p1hyb::Share d;   /* without a ceiling: P, as before */
+    d.init(60, true);
+    for (int i = 0; i < 100; ++i) d.layer(true, false);
+    CHECK_NEAR(d.share(), 0.6, 1e-12);
+}
+
+TEST(a_coupled_share_moves_with_every_ranks_outcomes) {
+    rad::p1hyb::CoupledShare& c = rad::p1hyb::coupled_share(1);
+    c.init(60, true);
+    /* Rank 3 alone is late five times: every rank's share is lower, not rank 3's alone. */
+    for (int i = 0; i < 5; ++i) c.layer(false, true);
+    CHECK_NEAR(c.share(), 0.6 * std::pow(0.8, 5), 1e-12);
+    CHECK_NEAR(rad::p1hyb::coupled_share(1).share(), c.share(), 1e-15);
+    /* Four ranks' outcomes at once: as many updates as outcomes, none lost. */
+    c.init(60, true, 400);
+    for (int i = 0; i < 20; ++i) c.layer(false, true);   /* down to 0.6 * 0.8^20 */
+    const double low = c.share();
+    std::vector<std::thread> th;
+    for (int r = 0; r < 4; ++r)
+        th.emplace_back([&] {
+            for (int i = 0; i < 250; ++i) c.layer(true, false);
+        });
+    for (auto& t : th) t.join();
+    CHECK_NEAR(c.share(), std::min(4.0, low * std::pow(1.05, 1000)), 1e-9);
+    CHECK_NEAR(c.min_seen(), low, 1e-12);
+    c.init(60, true);
+}
+
+TEST(tunables_take_the_hybrid_calibration_mask) {
+    auto parse = [](const char* v, rad::p1::Tunables* t, std::string* why) {
+        return rad::p1::parse_tunables([&](const char* k) -> const char* {
+            if (!std::strcmp(k, ds41p1::kHybridCalEnv)) return v;
+            return nullptr;
+        }, t, why);
+    };
+    rad::p1::Tunables t;
+    std::string why;
+    REQUIRE(parse(nullptr, &t, &why));
+    CHECK_EQ(t.hybrid_cal, 0);   /* off by default */
+    REQUIRE(parse("", &t, &why));
+    CHECK_EQ(t.hybrid_cal, 0);
+    for (int m = 0; m <= 3; ++m) {
+        const std::string v = std::to_string(m);
+        REQUIRE(parse(v.c_str(), &t, &why));
+        CHECK_EQ(t.hybrid_cal, m);
+    }
+    CHECK(!parse("4", &t, &why));
+    CHECK(why.find(ds41p1::kHybridCalEnv) != std::string::npos);
+    CHECK(!parse("-1", &t, &why));
+    CHECK(!parse("x", &t, &why));
+}
+
+TEST(a_coupled_choice_reserves_its_cost_so_the_next_rank_sees_it) {
+    if (!pool()) SKIP("no AVX2 or no CPU pool");
+    /* Two ranks' stagers on the one pool, the same decode layer, deciding one after the other before either borrows
+     * (as two rank threads past their counts wait at once). */
+    rad::P1HybridProbe a, b;
+    REQUIRE(a.pass(16, 21));
+    REQUIRE(b.pass(16, 21));
+    const int64_t base = pool()->backlog();
+    int64_t ra = 0, rb = 0;
+    /* Choose-then-reserve: the first choice reserves nothing, so the second fits into the same backlog. */
+    const int a0 = a.pick_only(30, 0, &ra);
+    const int b0 = b.pick_only(30, 0, &rb);
+    CHECK(a0 > 0);
+    CHECK_EQ(ra, (int64_t)0);
+    CHECK_EQ(b0, a0);
+    a.release();
+    b.release();
+    CHECK_EQ(pool()->backlog(), base);
+    /* Coupled: the first choice's whole cost is reserved at the choice, and the second sees it. */
+    const int a1 = a.pick_only(30, ds41p1::kHybridCalCouple, &ra);
+    const int b1 = b.pick_only(30, ds41p1::kHybridCalCouple, &rb);
+    CHECK_EQ(a1, a0);
+    CHECK(ra > 0);
+    CHECK_EQ(a.pre(), ra);
+    CHECK(b1 < b0);
+    /* What no borrow drew goes back whole. */
+    a.release();
+    b.release();
+    CHECK_EQ(a.pre(), (int64_t)0);
+    CHECK_EQ(pool()->backlog(), base);
+}
+
+TEST(a_calibrated_and_coupled_hybrid_layer_leaves_every_row_as_the_base) {
+    if (!pool()) SKIP("no AVX2 or no CPU pool");
+    for (int cal = 1; cal <= ds41p1::kMaxHybridCal; ++cal) {
+        rad::P1HybridProbe p;
+        p.splits_are_exact(false, cal);
+        rad::P1HybridProbe q(96);
+        q.splits_are_exact(true, cal);
+    }
 }
 
 RAD_TEST_MAIN()

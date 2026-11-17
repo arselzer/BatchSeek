@@ -36,8 +36,15 @@ int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1(const RadArgs*, RadStream);
  * of staged activation rows (by default 36, or two whole rows where 36 holds one: gate_up; at most 56). Same bits. */
 int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_opts(const RadArgs*, RadStream, int grid, int item_kib, int fill, int lds_kib);
 /* Checker-only: the P1 twin in form `form` for the call whatever RADIANCE_EXPERIMENTAL_DS41_P1_TILED says (0 the
- * twin's kernel, 1 the register-tiled kernel), on `grid` blocks (0: the launcher's choice). Same bits. */
+ * twin's kernel, 1 the register-tiled kernel, 2 the WMMA kernel), on `grid` blocks (0: the launcher's choice). Forms 0
+ * and 1 give the same bits; form 2 differs by f32 summation order (and gives its own bits on any grid). */
 int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_form(const RadArgs*, RadStream, int form, int grid);
+/* Checker-only: 1 when the served P1 twin takes the WMMA kernel (RADIANCE_EXPERIMENTAL_DS41_P1_WMMA=1 beside P1, read
+ * once; inexact by design), else 0. Form 2 of _p1_form is that kernel. */
+int r4d_ds41_p1_wmma_on(void);
+/* Checker-only: the WMMA P1 twin on `grid` blocks (0: the launcher's), its outputs also as f32 into y32 ([T, N],
+ * contiguous) before the bf16 rounding. */
+int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_wmma_f32(const RadArgs*, RadStream, float* y32, int grid);
 /* Checker-only: 1 when the served P1 twin takes the register-tiled kernel (RADIANCE_EXPERIMENTAL_DS41_P1_TILED=1
  * beside P1, read once), else 0. */
 int r4d_ds41_p1_tiled_on(void);

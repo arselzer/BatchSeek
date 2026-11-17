@@ -27,6 +27,10 @@ constexpr uint64_t kNativeDecodeProfileMaxMetadata=256ull<<20;
 struct NativeDecodeProfile {
     std::vector<RadFileProfile> rows;
     uint64_t decode_tokens=0,nonzero_rows=0;
+    /* Portable: container "" and device/inode/mtime_ns/ctime_ns all 0. Such a profile names the model
+     * only by file size, metadata size and the metadata-prefix sha256 (a byte-identical rebuild of the
+     * container on another machine matches); the strict form also pins this machine's path and stat. */
+    bool portable=false;
 };
 struct NativeProfileIdentity {
     uint64_t file_bytes=0,metadata_bytes=0,device=0,inode=0,mtime_ns=0,ctime_ns=0;
@@ -72,16 +76,22 @@ inline int parse_native_decode_profile(std::string_view text,const NativeProfile
         const auto doc=J::parse(text.begin(),text.end());
         require(doc.is_object()&&doc.at("format")=="radiance-expert-stats/1"&&
             doc.at("final").is_boolean()&&doc.at("final").get<bool>(),"complete expert-stats/1 required");
+        const auto&identity=doc.at("source_identity");
+        require(doc.at("container").is_string(),"container path string required");
+        const bool portable=doc.at("container").get<std::string>().empty()&&
+            integer(identity.at("device"))==0&&integer(identity.at("inode"))==0&&
+            integer(identity.at("mtime_ns"))==0&&integer(identity.at("ctime_ns"))==0;
         require(doc.at("arch")=="deepseek41"&&doc.at("model")==expected.model&&
-            doc.at("container")==expected.container&&integer(doc.at("tp"))==4&&
+            (portable||doc.at("container")==expected.container)&&integer(doc.at("tp"))==4&&
             integer(doc.at("n_trunk_layers"))==40&&integer(doc.at("n_experts"))==384,
             "exact native DS4.1 EP4 source/model geometry required");
-        const auto&identity=doc.at("source_identity");
         require(identity.at("format")=="rad-metadata-prefix-sha256/1"&&
             integer(identity.at("file_bytes"))==expected.file_bytes&&
             integer(identity.at("metadata_bytes"))==expected.metadata_bytes&&
-            integer(identity.at("device"))==expected.device&&integer(identity.at("inode"))==expected.inode&&
-            integer(identity.at("mtime_ns"))==expected.mtime_ns&&integer(identity.at("ctime_ns"))==expected.ctime_ns&&
+            (portable||(integer(identity.at("device"))==expected.device&&
+                        integer(identity.at("inode"))==expected.inode&&
+                        integer(identity.at("mtime_ns"))==expected.mtime_ns&&
+                        integer(identity.at("ctime_ns"))==expected.ctime_ns))&&
             expected.metadata_sha256.size()==64&&identity.at("sha256")==expected.metadata_sha256,
             "profile source identity differs from held model generation/metadata");
         const uint64_t layers=integer(doc.at("n_layers"));
@@ -100,7 +110,7 @@ inline int parse_native_decode_profile(std::string_view text,const NativeProfile
             for(const auto&n:row)require(std::strcmp(kind,"credited")==0?integer(n)>0:integer(n)==0,
                                        "lost/unmapped/unclassified routing is not calibration data");
         }
-        NativeDecodeProfile value;value.decode_tokens=integer(doc.at("tokens").at("decode"));
+        NativeDecodeProfile value;value.portable=portable;value.decode_tokens=integer(doc.at("tokens").at("decode"));
         require(value.decode_tokens>0&&value.decode_tokens<=UINT64_MAX/6&&
                 integer(doc.at("steps").at("decode"))>0,"positive bounded pure decode coverage");
         value.rows.reserve(40*384);

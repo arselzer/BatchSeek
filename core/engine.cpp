@@ -1790,6 +1790,8 @@ int Engine::step_loop() {
     sched_.draft_conf_report();
     /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_ADMIT: the steps that admitted whole prompts together. */
     sched_.batch_admit_report();
+    /* RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN: decode steps it took ahead of prefill, the mean decode batch. */
+    sched_.decode_min_report();
     sched_.shared_head_report();
     dmeasure_report();
     eors_report();
@@ -2458,6 +2460,10 @@ void Engine::post_stop_report() {
  * A request that cannot wait for a shrink takes the blocks at once through a callback into every
  * slab (KVManager::set_reclaim, installed in start()). */
 void Engine::loan_tick(bool idle) {
+    if (kv_lend_) {   /* ..._KV_LEND: the P1 lender's KV slots (engine_bringup.cpp kv_lend_tick) */
+        kv_lend_tick();
+        return;
+    }
     if (!lending_) return;
     const uint64_t now = rad_mono_ns();
     if (now - loan_last_ns_ < 100000000ull) return;    /* 100 ms */
@@ -3113,6 +3119,7 @@ std::string Engine::engine_info() const {
     e["n_vocab"]     = meta_.n_vocab;
     e["n_ctx_train"] = meta_.n_ctx_train;
     e["container"]   = cfg_.model;
+    if (engram_file_) e["engram_file"] = engram_file_->describe();
 
     e["tensor_parallel"]        = cfg_.tp;
     e["tp_wire"]                = cfg_.tp > 1 ? (cfg_.tp_wire_exact ? "exact" : "wht6") : "n/a";

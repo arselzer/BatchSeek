@@ -237,6 +237,20 @@ int Scheduler::batch_admit_init(const Config& cfg) {
     batch_split_ = false;
     batch_join_ = 0;
     batch_p1_rows_ = 0;
+    pack_w_ = 0;
+    /* RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD (pack_w_, scheduler.h): 0..kPackLookaheadMax, 0 / unset /
+     * empty off; anything else refuses to start. */
+    int64_t pack = 0;
+    if (const char* pv = std::getenv(kPackLookaheadEnv); pv && *pv) {
+        char* pe = nullptr;
+        const long long w = std::strtoll(pv, &pe, 10);
+        if (pe == pv || *pe || w < 0 || w > kPackLookaheadMax) {
+            RAD_ERR("%s=%s: the waiting prompts a batch may look past a refused one for, 0 to %lld (0 or unset: "
+                    "off)", kPackLookaheadEnv, pv, (long long)kPackLookaheadMax);
+            return RAD_E_INVAL;
+        }
+        pack = w;
+    }
     /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT (batch_split_, scheduler.h): 1 on, 0 / unset / empty off. */
     const char* sv = std::getenv(kBatchSplitEnv);
     const bool split = sv && *sv && std::strcmp(sv, "0");
@@ -249,6 +263,9 @@ int Scheduler::batch_admit_init(const Config& cfg) {
         if (split)
             RAD_WARN("batch split: refused (%s=1) -- it needs batch admission (%s) beside the prefix cache; "
                      "nothing changes", kBatchSplitEnv, kBatchAdmitEnv);
+        if (pack > 0)
+            RAD_WARN("pack lookahead: refused (%s=%lld) -- it needs batch admission (%s); nothing changes",
+                     kPackLookaheadEnv, (long long)pack, kBatchAdmitEnv);
         return RAD_OK;
     }
     char* end = nullptr;
@@ -311,6 +328,9 @@ int Scheduler::batch_admit_init(const Config& cfg) {
                  kBatchAdmitEnv, v, why.c_str());
         if (split)
             RAD_WARN("batch split: refused (%s=1) -- batch admission is off; nothing changes", kBatchSplitEnv);
+        if (pack > 0)
+            RAD_WARN("pack lookahead: refused (%s=%lld) -- batch admission is off; nothing changes",
+                     kPackLookaheadEnv, (long long)pack);
         batch_p1_rows_ = 0;
         return RAD_OK;
     }
@@ -342,6 +362,16 @@ int Scheduler::batch_admit_init(const Config& cfg) {
                  "step with the snapshot it writes alone: every prompt's chunk boundaries and snapshot "
                  "positions are the unbatched run's; two entries of a step writing one snapshot write it once",
                  kBatchSplitEnv);
+    }
+    if (pack > 0) {
+        pack_w_ = pack;
+        RAD_INFO("pack lookahead: on (%s=%lld) -- when the next waiting prompt cannot join an open batch (its "
+                 "chunk past the rows left, or not the one it takes alone), the next %lld waiting prompts are "
+                 "asked in order for one that can, under the same join rules; a prompt that starts with the "
+                 "tokens before a snapshot another entry of the step writes is not taken ahead (it resumes "
+                 "there a step later); the prompts passed keep their places and the next step opens with the "
+                 "first of them. Every prompt's chunks and snapshots stay the ones it takes alone",
+                 kPackLookaheadEnv, (long long)pack, (long long)pack);
     }
     return RAD_OK;
 }
@@ -1067,6 +1097,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     /* Whole prompts admitted together (batch_rows_): after prefill alone, large-chunk prefill and the
      * consumer skip, whose decisions it reads. */
     RAD_TRY(batch_admit_init(cfg));
+    /* Decode first above N ready rows (decode_min_): after prefill alone, which it stands beside. */
+    RAD_TRY(decode_min_init(cfg));
     /* Shared heads (sh_floor_): after the geometry and the prefix cache it reads. */
     RAD_TRY(shared_head_init(cfg));
 
@@ -2469,6 +2501,18 @@ bool Scheduler::batch_split_covered(const SchedReq& s, const StepEntry& e, int64
     return alone == e.n_tokens && ck == (ckpt > 0 ? ckpt : -1);
 }
 
+bool Scheduler::pack_head_conflict(const SchedReq& s) const {
+    if (!s.req) return false;
+    const std::vector<int32_t>& p = s.req->prompt;
+    for (const StepEntry& o : plan_.e) {
+        if (!o.req || o.ckpt_slot < 0 || o.ckpt_tok < 0) continue;
+        const int64_t at = (int64_t)o.ctx_len + o.ckpt_tok + 1;
+        if (at <= 0 || (int64_t)p.size() <= at || (int64_t)o.req->prompt.size() < at) continue;
+        if (std::equal(p.begin(), p.begin() + at, o.req->prompt.begin())) return true;
+    }
+    return false;
+}
+
 bool Scheduler::batch_whole(const SchedReq& s, bool fresh) {
     if (!fresh || !s.req) return false;
     const Request& r = *s.req;
@@ -2483,6 +2527,15 @@ void Scheduler::batch_admit_report() const {
              "step); %lld prefill-only steps in all",
              (long long)m.batch_admit_steps, (long long)m.batch_admit_prompts, (long long)m.batch_admit_rows,
              (long long)batch_rows_, (long long)m.steps_prefill);
+    RAD_INFO("pack lookahead: %lld steps held an open batch, %lld rows of %lld room (mean %.1f of %.1f a step, "
+             "%.1f%% full); %lld prompts taken past a refused one of %lld asked, %lld passed for a head another "
+             "entry snapshots (%s=%lld)",
+             (long long)m.pack_steps, (long long)m.pack_rows, (long long)m.pack_room,
+             m.pack_steps ? (double)m.pack_rows / (double)m.pack_steps : 0.0,
+             m.pack_steps ? (double)m.pack_room / (double)m.pack_steps : 0.0,
+             m.pack_room ? 100.0 * (double)m.pack_rows / (double)m.pack_room : 0.0,
+             (long long)m.pack_picks, (long long)m.pack_asked, (long long)m.pack_head_skips, kPackLookaheadEnv,
+             (long long)pack_w_);
     if (batch_p1_rows_ > 0)
         RAD_INFO("batch admission: %lld of those steps of %lld rows or more (Phase 1's card path)",
                  (long long)m.batch_admit_p1_steps, (long long)batch_p1_rows_);
@@ -2504,6 +2557,57 @@ void Scheduler::batch_admit_report() const {
                  "running prompt's next chunk, %lld joins left for a step because another entry snapshots their "
                  "head (%s=1)", (long long)m.batch_split_joins, (long long)m.batch_split_opens,
                  (long long)m.batch_split_head_waits, kBatchSplitEnv);
+}
+
+/* RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN=<N> (decode_min_). Prefill alone (prefill_alone_) gives a ready
+ * prefill chunk or admission the step whenever there is one, so under continuous serving (more prompts
+ * than --max-num-seqs, refilled as requests finish) new prompts keep the steps and the decode rows wait.
+ * With N: a step whose running set holds at least N sequences ready to decode (prompt computed, no row
+ * left before the next token) is planned as a --prefill-interleave hold plans it: the running walk skips
+ * every prefill chunk and the admission pass is skipped, so the step carries those decode rows and
+ * nothing else; below N, or with no prefill work ready, the step is planned exactly as before. Not while
+ * a preempted request waits overdue (its recompute is the step's). Every step stays one of the two pure
+ * kinds prefill alone already runs (a prefill-only step, a decode-only step), each row computed as in a
+ * step of that kind today: only which steps run, and in which order, changes. Each prompt's chunks are
+ * still the ones it takes alone (batch admission and split decide them from the prompt and the prefix
+ * cache's hit, never from the step's neighbours), and the exact kernels give a row the same bytes
+ * whatever else shares its pass (batch invariance), so every reply is byte for byte the same. Refused,
+ * with the reason, without prefill alone (a step there may carry a chunk beside decode rows already). */
+int Scheduler::decode_min_init(const Config& cfg) {
+    decode_min_ = 0;
+    const char* v = std::getenv(kDecodeMinEnv);
+    if (!v || !*v || !std::strcmp(v, "0")) return RAD_OK;
+    char* end = nullptr;
+    const long long n = std::strtoll(v, &end, 10);
+    if (end == v || *end || n < 1 || n > (1ll << 20)) {
+        RAD_ERR("%s=%s: the decode-ready sequences that take a step ahead of prefill, 1 or more (0 or unset: "
+                "off)", kDecodeMinEnv, v);
+        return RAD_E_INVAL;
+    }
+    if (!prefill_alone_) {
+        RAD_WARN("decode min: refused (%s=%s) -- it needs RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1 (without "
+                 "it a step carries a chunk beside decode rows already); nothing changes", kDecodeMinEnv, v);
+        return RAD_OK;
+    }
+    decode_min_ = n;
+    RAD_INFO("decode min: on (%s=%lld) -- a step with %lld or more sequences ready to decode carries their "
+             "decode rows only, ahead of any prefill chunk or admission; below it steps are planned as "
+             "before (prefill first). Steps stay pure (prefill-only or decode-only); replies are unchanged%s",
+             kDecodeMinEnv, n, n,
+             n > cfg.max_seqs ? fmt(" (above --max-num-seqs %lld: it never applies)", (long long)cfg.max_seqs).c_str()
+                              : "");
+    return RAD_OK;
+}
+
+void Scheduler::decode_min_report() const {
+    if (decode_min_ <= 0) return;
+    const SchedMetrics m = metrics();
+    RAD_INFO("decode min: %lld decode steps taken ahead of ready prefill work (%s=%lld); %lld decode steps of "
+             "%lld rows in all (mean %.1f), %lld prefill steps, %lld mixed",
+             (long long)m.decode_min_forced, kDecodeMinEnv, (long long)decode_min_, (long long)m.steps_decode,
+             (long long)m.decode_step_rows,
+             m.steps_decode > 0 ? (double)m.decode_step_rows / (double)m.steps_decode : 0.0,
+             (long long)m.steps_prefill, (long long)m.steps_mixed);
 }
 
 /* ------------------------------------------------------------------ admission */
@@ -2766,6 +2870,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
         join_refused = want != alone || ckpt != ck_alone ||
                        (!batch_split_ && r.n_computed + want != target) || want > batch_join_;
         batch_join_rows_ = join_refused && alone > batch_join_;
+        batch_join_refused_ = join_refused;
         /* Nor a keep point another entry of this step already snapshots (the same tokens before it): the
          * prompt would compute that head again beside it, where a step later it resumes from it. */
         if (!join_refused && batch_split_ && ckpt > 0 && ckpt < target)
@@ -2774,6 +2879,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
                     (int64_t)o.ctx_len + o.ckpt_tok + 1 == ckpt && (int64_t)o.req->prompt.size() >= ckpt &&
                     std::equal(r.prompt.begin(), r.prompt.begin() + ckpt, o.req->prompt.begin())) {
                     join_refused = true;
+                    batch_join_refused_ = true;
                     ++m_.batch_split_head_waits;
                     break;
                 }
@@ -3024,6 +3130,7 @@ const RadBatch* Scheduler::step_locked() {
      * a chunk of the quantum needs; if no chunk could be planned after all (the pool refused the
      * admission), the step is planned again as it is without the switch. */
     bool pf_alone_tried = false;
+    bool dm_tried = false;   /* RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN: its decode-only plan came out empty */
 replan:
     plan_.reset();
     plan_.spec_is_tree = tree_;
@@ -3130,6 +3237,25 @@ replan:
         }
         if (!any_decoding) interleave_left_ = 0;
         hold_prefill = interleave_left_ > 0;
+    }
+    /* RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN (decode_min_init): N or more sequences ready to decode take
+     * this step, decode rows only, ahead of the prefill work that is ready; held as above. */
+    bool dm_forced = false;
+    if (decode_min_ > 0 && !dm_tried && !hold_prefill && !overdue) {
+        int64_t ready = 0;
+        bool pf_running = false;
+        for (int32_t slot : running_) {
+            const SchedReq& g = *reqs_[(size_t)slot];
+            if (!g.req || !g.running) continue;
+            const Request& gr = *g.req;
+            if (gr.n_computed < (int64_t)gr.prompt.size() || gr.n_computed + 1 < g.seq_len())
+                pf_running = true;
+            else
+                ++ready;
+        }
+        const bool admit_possible = !waiting_.empty() && !free_cards_.empty() &&
+                                    (int64_t)running_.size() < cfg_.max_seqs;
+        if (ready >= decode_min_ && (pf_running || admit_possible)) hold_prefill = dm_forced = true;
     }
 
     /* A span is for a prefill alone in its step (ChunkGeometry::span). A spanned step takes as
@@ -3482,20 +3608,38 @@ replan:
         /* Why a prefill-only step beside the prefix cache stopped taking prompts (the shutdown line). */
         enum class Close { Waiting, Rows, Alone, Opener, Seqs } close = Close::Waiting;
         const size_t pf_before = plan_.e.size();
+        /* RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD (pack_w_): the last queue index the lookahead may ask,
+         * set at the first prompt refused a join to an open batch (-1: none refused yet); the step's close
+         * reason is that prompt's. */
+        int64_t pack_end = -1;
         while (at < waiting_.size() &&
                (int64_t)plan_.e.size() < cfg_.max_seqs && budget > 0) {
             /* A step planned for one prefill holds that one (span_now_ above). */
             if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
+            if (pack_end >= 0 && (int64_t)at > pack_end) break;
             int32_t slot = waiting_[at];
             SchedReq& s = *reqs_[(size_t)slot];
             /* Prefill alone: an admission's chunk is never beside another chunk or decode rows, but
              * for whole prompts admitted together into a step of nothing else (batch_fits; never
              * with the switch off). */
             const bool batched = prefill_alone_ && !plan_.e.empty();
+            /* A prompt the lookahead asks past a refused one: one that would resume from a snapshot an
+             * entry of this step writes waits for it (pack_head_conflict). */
+            if (pack_end >= 0) {
+                ++m_.pack_asked;
+                if (pack_head_conflict(s)) { ++m_.pack_head_skips; ++at; continue; }
+            }
             if (batched && !batch_fits(s, batch_used, budget)) {
-                close = batch_used < 0 ? Close::Opener
+                const Close c = batch_used < 0 ? Close::Opener
                         : std::min<int64_t>(batch_rows_ - batch_used, budget) < std::max<int64_t>(geo_.quantum, 1)
                             ? Close::Rows : Close::Alone;
+                /* An open batch with room left: ask the next pack_w_ waiting prompts (the lookahead). */
+                if (pack_w_ > 0 && c == Close::Alone) {
+                    if (pack_end < 0) { pack_end = (int64_t)at + pack_w_; close = c; }
+                    ++at;
+                    continue;
+                }
+                if (pack_end < 0) close = c;
                 break;
             }
             const bool fresh = s.req->state != ReqState::Preempted && s.req->n_computed == 0;
@@ -3528,9 +3672,18 @@ replan:
             const int as = admit_one(s, batched ? std::min(budget, batch_rows_ - batch_used) : budget,
                                      areserve);
             batch_join_ = 0;
-            if (as == kAdmitWait) { ++at; continue; }
-            if (as < 0 && batched) close = batch_join_rows_ ? Close::Rows : Close::Alone;
+            const bool join_refused = batch_join_refused_;
+            batch_join_refused_ = false;
+            if (as == kAdmitWait) { batch_join_rows_ = false; ++at; continue; }
+            if (as < 0 && batched && pack_end < 0) close = batch_join_rows_ ? Close::Rows : Close::Alone;
             batch_join_rows_ = false;
+            /* A join admit_one refused (its chunk past the rows left, or not the one it takes alone; it took
+             * no block and its hit went back): the lookahead asks the prompts behind it. */
+            if (as < 0 && batched && join_refused && pack_w_ > 0 && batch_used >= 0) {
+                if (pack_end < 0) pack_end = (int64_t)at + pack_w_;
+                ++at;
+                continue;
+            }
             /* An overdue preempted prefill on an idle engine that still cannot be admitted will
              * not become admissible by waiting: nothing is running to finish and free the pool.
              * Fail it (spec §17) and ask the next request, instead of parking the step loop. */
@@ -3584,6 +3737,7 @@ replan:
             plan_.n_tok += s.sched_tokens;
             budget -= s.sched_tokens;
             took_.push_back(at);
+            if (pack_end >= 0) ++m_.pack_picks;
             ++at;
             /* The batch: opened by a whole short prompt that is the step's first entry (the running
              * requests planned nothing), grown by each prompt batch_fits let in. One that did not
@@ -3638,6 +3792,12 @@ replan:
                 }
             }
         }
+        /* The open batch's fill against its room (the shutdown's pack lookahead line, either way). */
+        if (batch_rows_ > 0 && batch_used >= 0 && !plan_.e.empty()) {
+            ++m_.pack_steps;
+            m_.pack_rows += batch_used;
+            m_.pack_room += std::min<int64_t>(batch_rows_, batch_used + std::max<int64_t>(budget, 0));
+        }
         if (batch_n > 0 && batch_opened_running) ++m_.batch_split_opens;
         if (batch_n > 0) {
             /* A step of batch_n + 1 whole prompts (the counters' and the debug line's view). */
@@ -3665,6 +3825,11 @@ replan:
      * it was for): plan the step again as without the switch, so the decode rows run. */
     if (pf_alone && plan_.e.empty()) {
         pf_alone_tried = true;
+        goto replan;
+    }
+    /* Decode min found no decode row to run after all (the pool refused them): planned as before. */
+    if (dm_forced && plan_.e.empty()) {
+        dm_tried = true;
         goto replan;
     }
 
@@ -3737,7 +3902,9 @@ replan:
     switch (plan_.phase) {
         case RAD_PHASE_PREFILL: ++m_.steps_prefill; break;
         case RAD_PHASE_MIXED:   ++m_.steps_mixed;   break;
-        default:                ++m_.steps_decode;  break;
+        default:                ++m_.steps_decode;  m_.decode_step_rows += n_dec;
+                                if (dm_forced) ++m_.decode_min_forced;
+                                break;
     }
     if (cfg_.prefill_interleave > 0) {
         /* Armed only while a prompt continues past this step: after a last chunk nothing is left
@@ -4129,6 +4296,7 @@ void Scheduler::promote_next() {
         }
     }
     ++m_.steps_decode;
+    m_.decode_step_rows += (int64_t)plan_.e.size();
     /* A step issued ahead during a hold is one of its decode-only steps. */
     if (interleave_left_ > 0) {
         --interleave_left_;

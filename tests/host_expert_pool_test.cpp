@@ -131,9 +131,17 @@ TEST(host_expert_pool_four_submitters_match_the_reference) {
                     j[e].y = got[(size_t)(r * 3 + e)].data();
                 }
                 p->reserve(3 * HostExpertPool::kExpertBytes);
+                const int64_t t0 = (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch()).count();
+                CHECK_EQ(t.last_ns.load(), (int64_t)0);
                 CHECK_EQ(p->submit(j, 3, &t), 0);
                 p->wait(&t);
                 CHECK(p->done(&t));
+                /* Ticket::last_ns: the latest job's finish, on the caller's clock, between the submit and now */
+                const int64_t t1 = (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch()).count();
+                CHECK(t.last_ns.load() >= t0);
+                CHECK(t.last_ns.load() <= t1);
             });
         for (auto& t : th) t.join();
         for (size_t i = 0; i < want.size(); ++i) CHECK(got[i] == want[i]);

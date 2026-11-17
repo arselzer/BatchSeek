@@ -10906,6 +10906,160 @@ ShRun sh_run(const char* floor, int n, int conc, std::string* log = nullptr) {
 
 }  /* namespace */
 
+/* ================================================================== decode first above N ready rows */
+/* RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN (Scheduler::decode_min_) beside prefill alone and batch admission
+ * in DeepSeek-V4.1's shape (lcp_fixture, C = 2,048, R = 256), under continuous serving: more prompts than
+ * --max-num-seqs, each slot refilled from the queue as a request ends. Each request's token at a position
+ * is a function of the request and the position only (as the exact kernels make it), so a reply depends
+ * on the step order only if the policy moved a chunk or a token. */
+namespace {
+
+struct DmRun {
+    std::map<uint64_t, std::vector<int32_t>> out;                               /* replies */
+    std::map<uint64_t, std::vector<std::pair<int32_t, int32_t>>> chunks;        /* (ctx_len, n_tokens) */
+    std::vector<std::pair<int, int>> steps;                                     /* (prefill, decode) entries */
+    bool pure = true;                                                           /* no step carries both */
+    int decode_before_last_admit = 0;   /* decode-only steps run while a prompt still waited */
+    SchedMetrics m{};
+    std::string report;
+};
+
+int dm_start(Fixture& f, const char* dm, int64_t seqs, bool alone = true) {
+    f.cfg.max_seqs = seqs;
+    if (alone) setenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE", "1", 1);
+    setenv(Scheduler::kBatchAdmitEnv, "256", 1);
+    if (dm) setenv(Scheduler::kDecodeMinEnv, dm, 1);
+    else unsetenv(Scheduler::kDecodeMinEnv);
+    const int rc = f.start();
+    unsetenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE");
+    unsetenv(Scheduler::kBatchAdmitEnv);
+    unsetenv(Scheduler::kDecodeMinEnv);
+    return rc;
+}
+
+/* 24 prompts (the held-out wave three times) at --max-num-seqs `seqs`, request i asking 3 + i % 7 tokens. */
+DmRun dm_run(const char* dm, int64_t seqs) {
+    DmRun r;
+    LcpOn on(2048, 1);
+    Fixture f;
+    lcp_fixture(f, 2048, 2048);
+    /* Not REQUIRE_EQ: its bare `return;` does not fit a function returning DmRun. A failed start is
+     * reported and the empty run returned, which the caller's checks then fail on. */
+    const int started = dm_start(f, dm, seqs);
+    CHECK_EQ(started, RAD_OK);
+    if (started != RAD_OK) return r;
+    std::vector<uint64_t> ids;
+    for (int w = 0; w < 3; ++w)
+        for (size_t i = 0; i < kHeldOut.size(); ++i) {
+            auto q = f.request(kHeldOut[i], 3 + (int)(ids.size() % 7));
+            ids.push_back(f.add(std::move(q)));
+        }
+    for (int k = 0; k < 2000; ++k) {
+        const bool waiting = f.sch.metrics().queue_depth > 0;
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        const StepPlan& p = f.sch.plan();
+        int pf = 0, dec = 0;
+        std::vector<int32_t> t(p.e.size());
+        for (size_t i = 0; i < p.e.size(); ++i) {
+            const StepEntry& e = p.e[i];
+            if (e.is_prefill) { ++pf; r.chunks[e.seq].emplace_back(e.ctx_len, e.n_tokens); }
+            else ++dec;
+            t[i] = (int32_t)(100 + (e.seq * 131 + (uint64_t)(e.ctx_len + e.n_tokens) * 17) % 5000);
+        }
+        if (pf && dec) r.pure = false;
+        if (!pf && waiting) ++r.decode_before_last_admit;
+        r.steps.emplace_back(pf, dec);
+        std::vector<int32_t> a(p.e.size(), 0);
+        std::vector<uint8_t> eos(p.e.size(), 0);
+        Scheduler::StepResult res;
+        res.n_seq = (int)p.e.size();
+        res.n_accepted = a.data();
+        res.token = t.data();
+        res.eos = eos.data();
+        for (uint64_t id : ids)
+            if (const Request* q = f.sch.find(id)) r.out[id] = q->output;
+        CHECK_OK(f.sch.commit(res));
+        for (uint64_t id : ids)
+            if (const Request* q = f.sch.find(id)) r.out[id] = q->output;
+    }
+    for (size_t i = 0; i < ids.size(); ++i) CHECK_EQ(r.out[ids[i]].size(), (size_t)(3 + i % 7));
+    r.m = f.sch.metrics();
+    r.report = info_of([&] { f.sch.decode_min_report(); });
+    return r;
+}
+
+}  /* namespace */
+
+/* Off, a decode step runs only when no prompt can be admitted; at N = 4 of --max-num-seqs 8 decode steps
+ * run while prompts wait, and every one of them is one the policy chose. Each prompt's chunks (its whole
+ * prompt from 0) and every reply are the same; every step is prefill-only or decode-only. At N above
+ * --max-num-seqs (or unset, or 0) the steps are the unset run's, one for one. */
+TEST(decode_min_runs_decode_ahead_of_waiting_prompts_with_the_same_replies) {
+    const DmRun off = dm_run(nullptr, 8);
+    const DmRun zero = dm_run("0", 8);
+    const DmRun big = dm_run("9", 8);
+    const DmRun on = dm_run("4", 8);
+    CHECK(off.pure);
+    CHECK(on.pure);
+    CHECK(zero.steps == off.steps);
+    CHECK(big.steps == off.steps);
+    CHECK_EQ(off.m.decode_min_forced, (int64_t)0);
+    CHECK_EQ(big.m.decode_min_forced, (int64_t)0);
+    CHECK(on.m.decode_min_forced > 0);
+    CHECK(on.decode_before_last_admit > off.decode_before_last_admit);
+    CHECK(on.steps != off.steps);
+    CHECK(on.out == off.out);
+    CHECK(on.chunks == off.chunks);
+    CHECK(big.out == off.out);
+    for (const auto& kv : on.chunks) {
+        REQUIRE_EQ(kv.second.size(), (size_t)1);      /* whole, from position 0, as alone */
+        CHECK_EQ(kv.second[0].first, 0);
+    }
+    CHECK_EQ(on.m.steps_mixed, (int64_t)0);
+    int64_t rows = 0, dsteps = 0;
+    for (const auto& s : on.steps) if (!s.first) { rows += s.second; ++dsteps; }
+    CHECK_EQ(on.m.decode_step_rows, rows);
+    CHECK_EQ(on.m.steps_decode, dsteps);
+    CHECK(has(on.report, "decode min: "));
+    CHECK(has(on.report, "decode steps taken ahead of ready prefill work"));
+    CHECK(off.report.empty());
+}
+
+/* The switch's values: 0 / unset off, a bad value refuses to start, and without prefill alone it is
+ * refused with the reason and nothing changes. */
+TEST(decode_min_switch_values_and_refusal) {
+    for (const char* bad : { "-1", "x", "4x" }) {
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        int rc = 0;
+        const std::string err = info_of([&] { rc = dm_start(f, bad, 8); });
+        CHECK_EQ(rc, (int)RAD_E_INVAL);
+        CHECK(has(err, Scheduler::kDecodeMinEnv));
+    }
+    {
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        int rc = 0;
+        const std::string err = info_of([&] { rc = dm_start(f, "4", 8, /*alone=*/false); });
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(has(err, "decode min: refused"));
+        CHECK_EQ(f.sch.decode_min(), (int64_t)0);
+    }
+    {
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        int rc = 0;
+        const std::string err = info_of([&] { rc = dm_start(f, "384", 512); });
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(has(err, "decode min: on (RADIANCE_EXPERIMENTAL_SCHED_DECODE_MIN=384)"));
+        CHECK_EQ(f.sch.decode_min(), (int64_t)384);
+    }
+}
+
 /* Without the switch (as measured: prompts that find their head's blocks and no snapshot), and with it
  * at 64 tokens: each prompt's chunks are its prefill from where its hit resumes to its end, split only
  * at its own keep point. With the switch every prompt after the first two of its system prompt resumes
@@ -11010,6 +11164,7 @@ struct NlRun {
 struct NlOpt {
     const char* batch = "2048";     /* null: off */
     const char* split = nullptr;    /* RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT */
+    const char* pack = nullptr;     /* RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD */
     int n = 128;
     int conc = 128;
 };
@@ -11035,6 +11190,7 @@ NlRun nl_run(const NlOpt& o) {
     setenv(Scheduler::kSharedHeadEnv, "64", 1);
     if (o.batch) setenv(Scheduler::kBatchAdmitEnv, o.batch, 1);
     if (o.split) setenv("RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT", o.split, 1);
+    if (o.pack) setenv(Scheduler::kPackLookaheadEnv, o.pack, 1);
     std::vector<BatchBuilder::RankIO> rio;
     rio.push_back({ 0, nullptr, &f.prog });
     int rc = 0;
@@ -11043,6 +11199,7 @@ NlRun nl_run(const NlOpt& o) {
     unsetenv(Scheduler::kSharedHeadEnv);
     unsetenv(Scheduler::kBatchAdmitEnv);
     unsetenv("RADIANCE_EXPERIMENTAL_SCHED_BATCH_SPLIT");
+    unsetenv(Scheduler::kPackLookaheadEnv);
     CHECK_EQ(rc, (int)RAD_OK);
     if (rc != RAD_OK) return out;
     std::map<uint64_t, int> idx;
@@ -11173,6 +11330,120 @@ TEST(batch_split_shares_steps_and_keeps_every_prompt_s_chunks) {
         CHECK(ba.m.batch_close_opener > 0);
         CHECK(has(sp.report, "batch split: "));
         CHECK(has(sp.report, "prefill-only steps closed by"));
+    }
+}
+
+/* RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD beside Ba2048, the prefix cache, shared heads and batch split (the
+ * N512 arm's setting) on the NL-to-SQL host model: the lookahead fills the open batches fuller and takes fewer
+ * prefill steps, while every prompt's chunks are still the ones it takes alone from where it stood, with the
+ * snapshots it writes alone, every keep point ends in its snapshot, and the hits are those without it. */
+TEST(pack_lookahead_fills_batches_and_keeps_every_prompt_s_chunks) {
+    /* (N512 overruns the fixture's 65,536-token pool: nothing finishes there, with or without the switch.) */
+    for (int n : { 128, 256 }) {
+        NlOpt o;
+        o.n = n;
+        o.conc = n;
+        o.split = "1";
+        const NlRun base = nl_run(o);
+        o.pack = "16";
+        const NlRun pk = nl_run(o);
+        char w[64];
+        std::snprintf(w, sizeof w, "N%d Ba2048 split", n);
+        nl_print(w, base);
+        std::snprintf(w, sizeof w, "N%d Ba2048 split Bp16", n);
+        nl_print(w, pk);
+        fprintf(stderr, "      fill: base %lld of %lld rows in %lld steps, Bp16 %lld of %lld in %lld (picks %lld, "
+                        "asked %lld, head skips %lld)\n",
+                (long long)base.m.pack_rows, (long long)base.m.pack_room, (long long)base.m.pack_steps,
+                (long long)pk.m.pack_rows, (long long)pk.m.pack_room, (long long)pk.m.pack_steps,
+                (long long)pk.m.pack_picks, (long long)pk.m.pack_asked, (long long)pk.m.pack_head_skips);
+        CHECK(has(pk.report, "pack lookahead: on (RADIANCE_EXPERIMENTAL_SCHED_PACK_LOOKAHEAD=16)"));
+        CHECK(!has(base.report, "pack lookahead: on"));
+        CHECK(has(base.report, "pack lookahead: "));
+        CHECK(has(pk.report, "prompts taken past a refused one"));
+        for (const NlRun* r : { &base, &pk }) {
+            CHECK_EQ(r->done.size(), (size_t)n);
+            CHECK_EQ(r->bad_plan, 0);
+            CHECK_EQ(r->bad_cover, 0);
+            CHECK_EQ(r->m.batch_admit_outside, (int64_t)0);
+            CHECK_EQ(r->m.shared_head_keep_missed, (int64_t)0);
+            CHECK_EQ(r->m.shared_head_keeps, r->m.shared_head_snapshots + r->m.shared_head_snapshot_shared);
+            CHECK(r->m.pack_rows <= r->m.pack_room);
+        }
+        CHECK_EQ(base.m.pack_picks, (int64_t)0);
+        CHECK_EQ(base.m.pack_asked, (int64_t)0);
+        CHECK(pk.m.pack_picks > 0);
+        CHECK(pk.steps.size() <= base.steps.size());
+        /* every prompt's own chunk list is the same whichever steps it shares */
+        CHECK(pk.chunks.size() == base.chunks.size());
+        CHECK(pk.m.linear_cached_tokens * 100 >= base.m.linear_cached_tokens * 99);
+    }
+}
+
+/* Without the prefix cache: Ba256, prompts 200 150 40 16 100. Off, the 150 ends the first batch (200) and the 100
+ * the second (150 40 16): three prefill steps. At W 16 the first takes 200 40 16 (256 rows) past the 150, which
+ * opens the next with the 100: two. At W 1 only the prompt right behind the refused one is asked. Each prompt is
+ * one chunk from 0 either way. Bounds: outside 0..256 refuses to start; without batch admission it is refused
+ * with the reason and nothing changes. */
+TEST(pack_lookahead_takes_a_prompt_that_fits_past_one_that_does_not) {
+    auto run = [](const char* pack, BaRun* out) -> SchedMetrics {
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        if (pack) setenv(Scheduler::kPackLookaheadEnv, pack, 1);
+        int rc = 0;
+        const std::string l = info_of([&] { rc = batch_start(f, "256", 8); });
+        unsetenv(Scheduler::kPackLookaheadEnv);
+        CHECK_EQ(rc, (int)RAD_OK);
+        if (rc != RAD_OK) return SchedMetrics{};
+        CHECK_EQ(has(l, "pack lookahead: on"), pack && std::strcmp(pack, "0") != 0);
+        const std::vector<uint64_t> ids = submit_all(f, { 200, 150, 40, 16, 100 }, 3);
+        *out = batch_run(f, ids);
+        return f.sch.metrics();
+    };
+    BaRun off, w16, w1;
+    const SchedMetrics m0 = run(nullptr, &off);
+    const SchedMetrics m16 = run("16", &w16);
+    const SchedMetrics m1 = run("1", &w1);
+    CHECK_EQ(ba_prefill_steps(off), 3);
+    CHECK_EQ(ba_prefill_steps(w16), 2);
+    REQUIRE(w16.steps.size() >= 2);
+    CHECK_EQ(w16.steps[0].pf, 3);
+    CHECK_EQ(w16.steps[0].n_tok, (int64_t)256);
+    CHECK_EQ(w16.steps[1].pf, 2);
+    CHECK_EQ(w16.steps[1].n_tok, (int64_t)250);
+    REQUIRE(!w1.steps.empty());
+    CHECK_EQ(w1.steps[0].n_tok, (int64_t)240);
+    CHECK(w16.chunks == off.chunks);
+    CHECK(w1.chunks == off.chunks);
+    CHECK(w16.out == off.out);
+    CHECK_EQ(m0.pack_picks, (int64_t)0);
+    CHECK_EQ(m16.pack_picks, (int64_t)2);
+    CHECK_EQ(m1.pack_picks, (int64_t)1);
+    CHECK_EQ(m0.pack_rows, (int64_t)506);
+    CHECK_EQ(m16.pack_rows, (int64_t)506);
+    CHECK(m16.pack_steps < m0.pack_steps);
+    for (const char* bad : { "-1", "257", "16x", "on" }) {
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        setenv(Scheduler::kPackLookaheadEnv, bad, 1);
+        int rc = 0;
+        (void)info_of([&] { rc = batch_start(f, "256", 8); });
+        unsetenv(Scheduler::kPackLookaheadEnv);
+        CHECK_EQ(rc, (int)RAD_E_INVAL);
+    }
+    {
+        LcpOn on(2048, 1);
+        Fixture f;
+        lcp_fixture(f, 2048, 2048);
+        setenv(Scheduler::kPackLookaheadEnv, "16", 1);
+        int rc = 0;
+        const std::string l = info_of([&] { rc = batch_start(f, nullptr, 8); });
+        unsetenv(Scheduler::kPackLookaheadEnv);
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(has(l, "pack lookahead: refused"));
+        CHECK_EQ(f.sch.pack_lookahead(), (int64_t)0);
     }
 }
 
