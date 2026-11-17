@@ -91,13 +91,14 @@ revision's official prompts for reasoning before the SQL (replies up to 2,048 to
 | 64 | 53 | 50 | 2.9 |
 | 256 | 101 | 94 | 1.83 |
 | 500 | 155 | 137 | 1.34 |
+| Dev set, 1,534 through 512 slots (continuous) | 197 | 154 | 1.20 |
 
 "Generating": output tokens over the server's generation time; "whole job": over the time from the first request to the
 last reply, prompts included. Wh/1k: watt-hours per 1,000 output tokens. The 1, 8 and 64 rows use the first 8 or 64 questions of each set; the 8 row sent them in eight waves of 8 (the
 harness without refill). Power (GPUs + CPU, from
 their own sensors) stays between 520 and 700 W; energy is integrated over each run's request phase. All 500 original questions at once take 3.5 minutes (31,643 output
 tokens); BIRD 2026's take 39 minutes (316,824 output tokens), most of it a shrinking group of long answers. With a continuous queue the batch stays full: BIRD's dev set, 1,534
-questions in the 2026 prompt format (`batch/bird/make_birddev26_set.py`), sent through 512 slots and refilled 16 at a
+questions (including 496 of the original mini-dev's 500) in the 2026 prompt format (`batch/bird/make_birddev26_set.py`), sent through 512 slots and refilled 16 at a
 time, keeps about 500 requests running for 32 minutes at about 210 output tokens/s, new prompts included; the whole
 52-minute job averages 154 tokens/s at 1.2 Wh per 1,000 tokens.
 
