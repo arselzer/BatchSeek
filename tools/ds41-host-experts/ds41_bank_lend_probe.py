@@ -22,7 +22,7 @@ import urllib.parse
 import ab_requests
 
 SCHEMA = "ds41-bank-lend-probe-v1"
-LOCK_ROOT = Path("/home/as/radiance-setup/research/deepseek-v41-1017-20261024")
+LOCK_ROOT = Path.home() / "radiance-setup/research/deepseek-v41-1017-20261024"
 LOCKS = [LOCK_ROOT / "research-compiler.lock", LOCK_ROOT / "research-heavy-runtime.lock"]
 NAMES = ["anchor", "burst-1", "burst-2", "burst-3"]
 ACTIVE = {"waiting", "prefill", "decode", "preempted"}

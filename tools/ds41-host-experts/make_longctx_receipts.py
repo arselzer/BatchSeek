@@ -2,7 +2,7 @@
 prefill-hash references (<name>-khref.json) the window holds Kh arms to.
 
   make_longctx_receipts.py OUTDIR      (run with a python that has the `tokenizers` package, e.g.
-                                        /home/as/venvs/embed/bin/python -I; writes OUTDIR/*.json)
+                                        ~/venvs/embed/bin/python -I; writes OUTDIR/*.json)
 
 fill32k   the 32,768-token prompt of the only filled long-context run so far (M16 on the stable e184
           build, filled32k-common0118-base-window2: all-ranks prefill hash 71eaab9a74338840) and its
@@ -35,9 +35,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ab_requests  # noqa: E402  (hash_log: the window's own parser of the prefill hash lines)
 
-R = "/home/as/radiance-setup/research/deepseek-v41-1017-20261024"
-W = "/home/as/ds41-claude-build/work"
-AB = "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build"
+R = os.path.expanduser("~/radiance-setup/research/deepseek-v41-1017-20261024")
+W = os.path.expanduser("~/ds41-claude-build/work")
+AB = os.path.expanduser("~/radiance-ds41-claude/tools/ds41-host-experts/build")
 FILL = W + "/autonomous-20261101/filled32k-common0118-base-window2/inner"
 SEED_ARM = ("all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-"
             "Rb-Vp-Cs-Kh-Lm8192-Ulong8k")
@@ -159,7 +159,7 @@ def main():
     try:
         from tokenizers import Tokenizer
     except ImportError:
-        die("needs the `tokenizers` package (e.g. /home/as/venvs/embed/bin/python -I)")
+        die("needs the `tokenizers` package (e.g. ~/venvs/embed/bin/python -I)")
     for k, want in PINNED.items():
         got = sha256_file(getattr(a, k))
         if got != want:

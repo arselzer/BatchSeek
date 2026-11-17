@@ -10,7 +10,7 @@ a merged `radiance convert` feature. Commands refer to the research server and e
 Start from the DSpark bank extracted from this project's native-MXFP4 1017 import:
 
 ```text
-/home/as/radiance-setup/research/deepseek-v41-1017-20261024/native-models/ds41-dspark-bank-20261028T140400Z/draft.rad
+~/radiance-setup/research/deepseek-v41-1017-20261024/native-models/ds41-dspark-bank-20261028T140400Z/draft.rad
 SHA256 a497bbf97997a179ce3e08fb8908f16ba70e14ad8a4c432f361cbcbef20f1bdd
 ```
 
@@ -47,7 +47,7 @@ with bounded F32 scratch rather than a full F32 bank. Native source decoding, ou
 hashing, error diagnostics and readback stayed on the CPU. The complete DN conversion, including
 these costs, took 414.41 seconds. That is not GPU kernel time or a forecast for another bank.
 
-Frozen source locations under `/home/as/ds41-claude-build/work/`:
+Frozen source locations under `~/ds41-claude-build/work/`:
 
 | Component | Source packet / file |
 |---|---|
@@ -82,7 +82,7 @@ Old receipts cannot be replayed. The owner sets the matching `RADIANCE_DS41_*` r
 and inherited FD9. On this server, launch a freshly prepared DN configuration through:
 
 ```bash
-W=/home/as/ds41-claude-build/work
+W=~/ds41-claude-build/work
 bash "$W/draft-iq2s-dn-conversion-window-source-20261108/native-owner.sh" \
   "$FRESH_CONFIG" "$FRESH_CONFIG_SHA256" "$NEW_RUN_DIRECTORY"
 ```
@@ -129,4 +129,4 @@ bank dequantization/structural checks have different scopes. Separate four-card 
 MoE tests and all 80 CODE pilot reply/count checks passed. The remaining broad/state/hash model
 gates and reverse-order timing checks are still required before adoption. No error metric is
 substituted for exact target replies. Full local evidence and historical controls are in
-`/home/as/ds41-decode-review-20261028/DRAFTER-PLACEMENT-RESULTS-20261108.md`.
+`~/ds41-decode-review-20261028/DRAFTER-PLACEMENT-RESULTS-20261108.md`.

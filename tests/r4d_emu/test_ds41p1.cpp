@@ -167,7 +167,7 @@ int g_r_layers = 0, g_r_rows = 0;
 
 bool load_routes() {
     const char* path = std::getenv("DS41_P1_ROUTES");
-    if (!path || !*path) path = "/home/as/ds41-claude-build/work/p0/routes-long3086.bin";
+    if (!path || !*path) path = "work/p0/routes-long3086.bin";
     FILE* f = std::fopen(path, "rb");
     int32_t h[3];
     bool ok = f && std::fread(h, 4, 3, f) == 3 && h[2] == kTop && h[0] > 0 && h[1] > 0;

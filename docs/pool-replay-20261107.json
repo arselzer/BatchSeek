@@ -21,26 +21,26 @@
   ],
   "runtime_inputs": {
     "old": {
-      "cohort": "/home/as/ds41-claude-build/work/ordinary-accepted-tuple-auth-root1-20261106/cohort",
+      "cohort": "~/ds41-claude-build/work/ordinary-accepted-tuple-auth-root1-20261106/cohort",
       "artifacts_sha256": "20888c7317af12f5ceb932665f14ed4ac61127bd4c2ec988323c750cdeb3d485",
       "all_files_sha256": "39f2d699024e42394210b75001e0bec6c07edf52ba3e8ff0d8e2b077e4b0a61d",
       "engine_sha256": "ed9a6be3f4263bb0906a17cc263427023142fb9569fd9a88a08ca25c5f428274",
       "tuple_authority": {
-        "path": "/home/as/ds41-claude-build/work/ordinary-accepted-tuple-auth-root1-20261106/ROOT-tuple-authority.json",
+        "path": "~/ds41-claude-build/work/ordinary-accepted-tuple-auth-root1-20261106/ROOT-tuple-authority.json",
         "sha256": "d8db46077a07bfc4b8cd3465780aa298341e2d992f93acbc6eac581bd3f5257a"
       }
     },
     "new": {
-      "cohort": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-c2-root1",
+      "cohort": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-c2-root1",
       "artifacts_sha256": "c86d4a8699b92c74a2bde06e5656bc79f31784895b51dca17eae7ef78ffae38d",
       "all_files_sha256": "13cfcc2c922e6954db0e8d2ab4992121f020f41a0ced4541739b87ecf7956f3c",
       "engine_sha256": "70f126a131bb21d1b957e574c12e5b86f1ca231888668c22ef90761c6dd4d721",
       "original33": {
-        "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/c2-token-finalize-root1/original33/root-chat-prompt-ids.json",
+        "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/c2-token-finalize-root1/original33/root-chat-prompt-ids.json",
         "sha256": "1b895f8cc41b6dea86630094e7ff05c442a36995a527796588e521dc5e71ea42"
       },
       "long_ids": {
-        "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/c2-token-finalize-root1/long99987/root-long-prompt-ids.json",
+        "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/c2-token-finalize-root1/long99987/root-long-prompt-ids.json",
         "sha256": "9c9d364a4721b22d5408391f74e0a4e66fb23c1c562282db190e9ddbb275c248"
       }
     }
@@ -88,7 +88,7 @@
     {
       "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-N1-C1-Lm131072-r701",
       "group": "old256",
-      "cohort": "/home/as/ds41-claude-build/work/ordinary-accepted-tuple-auth-root1-20261106/cohort",
+      "cohort": "~/ds41-claude-build/work/ordinary-accepted-tuple-auth-root1-20261106/cohort",
       "engine_sha256": "ed9a6be3f4263bb0906a17cc263427023142fb9569fd9a88a08ca25c5f428274",
       "canonical_mean_tps": 28.973731394476086,
       "token_weighted_tps": 28.899688892644356,
@@ -122,7 +122,7 @@
         "I[3] placement: 'token_embd.weight' (315.62 MiB) in the pinned host pool, read in place (--embedding-placement ram)",
         "I[3] expert profile: rank 3 planned units VRAM=630 pinned=3 SSD=3207; decode calibration mass 6.456773/0.013870/3.617661; two file buffers 215.16 MiB; calibration coverage is not held-out performance",
         "I kv: KV layer bundles 40/2/3/3/3/1/1 (53 real layers)",
-        "I[0] host experts: 40 CPU threads compute RAM-resident DeepSeek-V4.1 experts (silu table /home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin; scheduling at 78 GB/s against 20 GB/s a copy link)",
+        "I[0] host experts: 40 CPU threads compute RAM-resident DeepSeek-V4.1 experts (silu table ~/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin; scheduling at 78 GB/s against 20 GB/s a copy link)",
         "I[0] host experts: jobs of up to 32 token rows of one expert (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS); four or more through the many-row kernel",
         "I[0] host experts: idle workers sleep on a futex and a submit wakes them without a lock (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX)",
         "I[0] host experts: side store: the planes of up to 7 units a rank whose inserts the packed RAM cache refuses are kept and handed to their later misses, which read nothing (~18 MiB a unit; RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE)",
@@ -238,7 +238,7 @@
     {
       "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-N1-C1-Lm131072-r702",
       "group": "new256",
-      "cohort": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-c2-root1",
+      "cohort": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-c2-root1",
       "engine_sha256": "70f126a131bb21d1b957e574c12e5b86f1ca231888668c22ef90761c6dd4d721",
       "canonical_mean_tps": 29.24311522804627,
       "token_weighted_tps": 29.258533359269503,
@@ -272,7 +272,7 @@
         "I[3] placement: 'token_embd.weight' (315.62 MiB) in the pinned host pool, read in place (--embedding-placement ram)",
         "I[3] expert profile: rank 3 planned units VRAM=630 pinned=3 SSD=3207; decode calibration mass 6.456773/0.013870/3.617661; two file buffers 215.16 MiB; calibration coverage is not held-out performance",
         "I kv: KV layer bundles 40/2/3/3/3/1/1 (53 real layers)",
-        "I[0] host experts: 40 CPU threads compute RAM-resident DeepSeek-V4.1 experts (silu table /home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin; scheduling at 78 GB/s against 20 GB/s a copy link)",
+        "I[0] host experts: 40 CPU threads compute RAM-resident DeepSeek-V4.1 experts (silu table ~/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin; scheduling at 78 GB/s against 20 GB/s a copy link)",
         "I[0] host experts: jobs of up to 32 token rows of one expert (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS); four or more through the many-row kernel",
         "I[0] host experts: idle workers sleep on a futex and a submit wakes them without a lock (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX)",
         "I[0] host experts: side store: the planes of up to 7 units a rank whose inserts the packed RAM cache refuses are kept and handed to their later misses, which read nothing (~18 MiB a unit; RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE)",
@@ -388,7 +388,7 @@
     {
       "arm": "all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-N1-C1-Lm131072-r703",
       "group": "new2048",
-      "cohort": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-c2-root1",
+      "cohort": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-c2-root1",
       "engine_sha256": "70f126a131bb21d1b957e574c12e5b86f1ca231888668c22ef90761c6dd4d721",
       "canonical_mean_tps": 26.34998982737268,
       "token_weighted_tps": 25.522307838787768,
@@ -422,7 +422,7 @@
         "I[3] placement: 'token_embd.weight' (315.62 MiB) in the pinned host pool, read in place (--embedding-placement ram)",
         "I[3] expert profile: rank 3 planned units VRAM=630 pinned=103 SSD=3107; decode calibration mass 6.456773/0.446140/3.185391; two file buffers 215.16 MiB; calibration coverage is not held-out performance",
         "I kv: KV layer bundles 40/2/3/3/3/1/1 (53 real layers)",
-        "I[0] host experts: 40 CPU threads compute RAM-resident DeepSeek-V4.1 experts (silu table /home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin; scheduling at 78 GB/s against 20 GB/s a copy link)",
+        "I[0] host experts: 40 CPU threads compute RAM-resident DeepSeek-V4.1 experts (silu table ~/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin; scheduling at 78 GB/s against 20 GB/s a copy link)",
         "I[0] host experts: jobs of up to 32 token rows of one expert (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS); four or more through the many-row kernel",
         "I[0] host experts: idle workers sleep on a futex and a submit wakes them without a lock (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX)",
         "I[0] host experts: side store: the planes of up to 7 units a rank whose inserts the packed RAM cache refuses are kept and handed to their later misses, which read nothing (~18 MiB a unit; RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE)",
@@ -538,7 +538,7 @@
     {
       "arm": "all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N1-C1-Lm131072-r704",
       "group": "recommended2048",
-      "cohort": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-c2-root1",
+      "cohort": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-c2-root1",
       "engine_sha256": "70f126a131bb21d1b957e574c12e5b86f1ca231888668c22ef90761c6dd4d721",
       "canonical_mean_tps": 27.33291757385729,
       "token_weighted_tps": 27.39356223823802,
@@ -572,7 +572,7 @@
         "I[3] placement: 'token_embd.weight' (315.62 MiB) in the pinned host pool, read in place (--embedding-placement ram)",
         "I[3] expert profile: rank 3 planned units VRAM=630 pinned=103 SSD=3107; decode calibration mass 6.456773/0.446140/3.185391; two file buffers 215.16 MiB; calibration coverage is not held-out performance",
         "I kv: KV layer bundles 40/2/3/3/3/1/1 (53 real layers)",
-        "I[0] host experts: 40 CPU threads compute RAM-resident DeepSeek-V4.1 experts (silu table /home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin; scheduling at 78 GB/s against 20 GB/s a copy link)",
+        "I[0] host experts: 40 CPU threads compute RAM-resident DeepSeek-V4.1 experts (silu table ~/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin; scheduling at 78 GB/s against 20 GB/s a copy link)",
         "I[0] host experts: jobs of up to 32 token rows of one expert (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS); four or more through the many-row kernel",
         "I[0] host experts: idle workers sleep on a futex and a submit wakes them without a lock (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX)",
         "I[0] host experts: side store: the planes of up to 7 units a rank whose inserts the packed RAM cache refuses are kept and handed to their later misses, which read nothing (~18 MiB a unit; RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE)",
@@ -688,7 +688,7 @@
     {
       "arm": "all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-Ada-Li64-N1-C1-Lm131072-r705",
       "group": "recommended2048",
-      "cohort": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-c2-root1",
+      "cohort": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-c2-root1",
       "engine_sha256": "70f126a131bb21d1b957e574c12e5b86f1ca231888668c22ef90761c6dd4d721",
       "canonical_mean_tps": 26.91761991389506,
       "token_weighted_tps": 26.534030187504634,
@@ -722,7 +722,7 @@
         "I[3] placement: 'token_embd.weight' (315.62 MiB) in the pinned host pool, read in place (--embedding-placement ram)",
         "I[3] expert profile: rank 3 planned units VRAM=630 pinned=103 SSD=3107; decode calibration mass 6.456773/0.446140/3.185391; two file buffers 215.16 MiB; calibration coverage is not held-out performance",
         "I kv: KV layer bundles 40/2/3/3/3/1/1 (53 real layers)",
-        "I[0] host experts: 40 CPU threads compute RAM-resident DeepSeek-V4.1 experts (silu table /home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin; scheduling at 78 GB/s against 20 GB/s a copy link)",
+        "I[0] host experts: 40 CPU threads compute RAM-resident DeepSeek-V4.1 experts (silu table ~/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin; scheduling at 78 GB/s against 20 GB/s a copy link)",
         "I[0] host experts: jobs of up to 32 token rows of one expert (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS); four or more through the many-row kernel",
         "I[0] host experts: idle workers sleep on a futex and a submit wakes them without a lock (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX)",
         "I[0] host experts: side store: the planes of up to 7 units a rank whose inserts the packed RAM cache refuses are kept and handed to their later misses, which read nothing (~18 MiB a unit; RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE)",
@@ -838,7 +838,7 @@
     {
       "arm": "all-t40-f-M2048-H-p2048-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-N1-C1-Lm131072-r706",
       "group": "new2048",
-      "cohort": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-c2-root1",
+      "cohort": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-c2-root1",
       "engine_sha256": "70f126a131bb21d1b957e574c12e5b86f1ca231888668c22ef90761c6dd4d721",
       "canonical_mean_tps": 26.83457824620226,
       "token_weighted_tps": 26.611789892990952,
@@ -872,7 +872,7 @@
         "I[3] placement: 'token_embd.weight' (315.62 MiB) in the pinned host pool, read in place (--embedding-placement ram)",
         "I[3] expert profile: rank 3 planned units VRAM=630 pinned=103 SSD=3107; decode calibration mass 6.456773/0.446140/3.185391; two file buffers 215.16 MiB; calibration coverage is not held-out performance",
         "I kv: KV layer bundles 40/2/3/3/3/1/1 (53 real layers)",
-        "I[0] host experts: 40 CPU threads compute RAM-resident DeepSeek-V4.1 experts (silu table /home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin; scheduling at 78 GB/s against 20 GB/s a copy link)",
+        "I[0] host experts: 40 CPU threads compute RAM-resident DeepSeek-V4.1 experts (silu table ~/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin; scheduling at 78 GB/s against 20 GB/s a copy link)",
         "I[0] host experts: jobs of up to 32 token rows of one expert (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS); four or more through the many-row kernel",
         "I[0] host experts: idle workers sleep on a futex and a submit wakes them without a lock (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX)",
         "I[0] host experts: side store: the planes of up to 7 units a rank whose inserts the packed RAM cache refuses are kept and handed to their later misses, which read nothing (~18 MiB a unit; RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE)",
@@ -988,7 +988,7 @@
     {
       "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-N1-C1-Lm131072-r707",
       "group": "new256",
-      "cohort": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-c2-root1",
+      "cohort": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-c2-root1",
       "engine_sha256": "70f126a131bb21d1b957e574c12e5b86f1ca231888668c22ef90761c6dd4d721",
       "canonical_mean_tps": 29.252290666490858,
       "token_weighted_tps": 29.287679655773488,
@@ -1022,7 +1022,7 @@
         "I[3] placement: 'token_embd.weight' (315.62 MiB) in the pinned host pool, read in place (--embedding-placement ram)",
         "I[3] expert profile: rank 3 planned units VRAM=630 pinned=3 SSD=3207; decode calibration mass 6.456773/0.013870/3.617661; two file buffers 215.16 MiB; calibration coverage is not held-out performance",
         "I kv: KV layer bundles 40/2/3/3/3/1/1 (53 real layers)",
-        "I[0] host experts: 40 CPU threads compute RAM-resident DeepSeek-V4.1 experts (silu table /home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin; scheduling at 78 GB/s against 20 GB/s a copy link)",
+        "I[0] host experts: 40 CPU threads compute RAM-resident DeepSeek-V4.1 experts (silu table ~/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin; scheduling at 78 GB/s against 20 GB/s a copy link)",
         "I[0] host experts: jobs of up to 32 token rows of one expert (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS); four or more through the many-row kernel",
         "I[0] host experts: idle workers sleep on a futex and a submit wakes them without a lock (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX)",
         "I[0] host experts: side store: the planes of up to 7 units a rank whose inserts the packed RAM cache refuses are kept and handed to their later misses, which read nothing (~18 MiB a unit; RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE)",
@@ -1138,7 +1138,7 @@
     {
       "arm": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Mb1-Rb-Vp-Cs-N1-C1-Lm131072-r708",
       "group": "old256",
-      "cohort": "/home/as/ds41-claude-build/work/ordinary-accepted-tuple-auth-root1-20261106/cohort",
+      "cohort": "~/ds41-claude-build/work/ordinary-accepted-tuple-auth-root1-20261106/cohort",
       "engine_sha256": "ed9a6be3f4263bb0906a17cc263427023142fb9569fd9a88a08ca25c5f428274",
       "canonical_mean_tps": 29.200925667159904,
       "token_weighted_tps": 29.230891188908767,
@@ -1172,7 +1172,7 @@
         "I[3] placement: 'token_embd.weight' (315.62 MiB) in the pinned host pool, read in place (--embedding-placement ram)",
         "I[3] expert profile: rank 3 planned units VRAM=630 pinned=3 SSD=3207; decode calibration mass 6.456773/0.013870/3.617661; two file buffers 215.16 MiB; calibration coverage is not held-out performance",
         "I kv: KV layer bundles 40/2/3/3/3/1/1 (53 real layers)",
-        "I[0] host experts: 40 CPU threads compute RAM-resident DeepSeek-V4.1 experts (silu table /home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin; scheduling at 78 GB/s against 20 GB/s a copy link)",
+        "I[0] host experts: 40 CPU threads compute RAM-resident DeepSeek-V4.1 experts (silu table ~/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin; scheduling at 78 GB/s against 20 GB/s a copy link)",
         "I[0] host experts: jobs of up to 32 token rows of one expert (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS); four or more through the many-row kernel",
         "I[0] host experts: idle workers sleep on a futex and a submit wakes them without a lock (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX)",
         "I[0] host experts: side store: the planes of up to 7 units a rank whose inserts the packed RAM cache refuses are kept and handed to their later misses, which read nothing (~18 MiB a unit; RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE)",

@@ -19,7 +19,7 @@ quantization; the audit does not turn this into an untouched official-precision 
 
 On the loop's eight held-out prompts (64 tokens, greedy, TP4) the path takes decode from 5.03 to
 about 17 tok/s and the time to first token summed over the prompts from 64.0 to about 15.5 s. Every
-step was measured as an A/B window; the log is `/home/as/ds41-decode-review-20261028/NIGHT-LOG.md`.
+step was measured as an A/B window; the log is `~/ds41-decode-review-20261028/NIGHT-LOG.md`.
 
 ## Batch jobs: quickstart
 
@@ -527,7 +527,7 @@ chunks above (`..._LCP=4096` with its companions, parts `M4096` `Lc4096` `Pci409
 prefill 1.34-1.5x faster at 48K-100K tokens, at the cost of the 4- and 8-stream decode deficit described there; and
 `L1024` or another small `--max-model-len` for decode-heavy concurrency. Growing KV is not the route: it refuses Phase
 1, the lent arena and more than one sequence, funds its full maximum at startup anyway, and its re-commit corruption is
-still open (`/home/as/ds41-decode-review-20261028/LONGCTX-FIFTHCARD-20261103.md`, 3.3-3.4). Measured on four RX 9070
+still open (`~/ds41-decode-review-20261028/LONGCTX-FIFTHCARD-20261103.md`, 3.3-3.4). Measured on four RX 9070
 XT with the block above, one run each (ab-20261103T230607Z, the 524,288 row ab-20261104T003545Z; claude/ds41-batch-admit
 f4fe2ff1 and abe09503, libr4d f1b1507a in both):
 
@@ -881,7 +881,7 @@ in the same RAM (~1424 instead of 1364 a rank at 24 GiB). Seven experts do not f
 E250, L39 E007/E087/E188/E313/E382: 0.042% of the decode profile's selections); they are never
 cached and stay misses, computed from their planes. 256/256 would give x1.0451 with 15 left out
 (0.087%), 600/3400 x1.0378 with none. `..._PACKED_CACHE_RAW=<gate_up>,<down>` sets other budgets.
-The scan, budget and profile scripts are in `/home/as/ds41-claude-build/work/packed/run2/`.
+The scan, budget and profile scripts are in `~/ds41-claude-build/work/packed/run2/`.
 
 Every path that fills the cache writes the packed form: the misses' background inserts and the
 warm-up (both `Mover::insert_unit_planes`, which counts a unit's raw rounds first, then packs each
@@ -1308,7 +1308,7 @@ swaps, releases and reacquires), the `aux_stager_test` additions, `ab_window_aux
 ## The lossy track: routing trace and quality harness
 
 Exact past ~18-19 tok/s means more RAM, a second drive, or giving up exactness on misses
-(`/home/as/ds41-decode-review-20261028/RESEARCH-3-LOSSY.md`). Before any lossy change, two measuring
+(`~/ds41-decode-review-20261028/RESEARCH-3-LOSSY.md`). Before any lossy change, two measuring
 tools, both exact (every reply stays the base engine's):
 
 **The routing trace** (`RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=<prefix>`, arm part `Rt`). Per
@@ -1364,7 +1364,7 @@ every position bit-identical: KL 0, top-1 100%.
 - `ab_window.sh OUT`: waits for 30 s of QFN idleness, stops the QFN container, runs each arm of
   `$ARMS` as its own server with the eight held-out prompts, compares the replies with the first
   arm's, and always restarts QFN and checks it answers. Hold both research locks first. Run it from
-  a snapshot (`/home/as/ds41-claude-build/work/launch_window.sh`), never edit it while it runs, and
+  a snapshot (`~/ds41-claude-build/work/launch_window.sh`), never edit it while it runs, and
   never launch it from a shell that hides the cards (`ROCR_VISIBLE_DEVICES`). An arm is
   `POLICY[-part...]`; the parts are listed in the script (threads `tN`, cache `mMIB`, misses `MR`,
   pool `pMIB`, pregrow `G`, mirror `R`/`RNN`, file buffer cap `BN`, warm `W`, async `A`/`AN`, fault
@@ -1385,7 +1385,7 @@ every position bit-identical: KL 0, top-1 100%.
   synthetic trace with known answers, and on the C++ writer's own file when
   `RTRACE_CPP_PREFIX=<dir>/rt` (made by `RTRACE_DUMP=<dir> route_trace_test`).
 - `make_prefix_receipt.py OUT MPL-2.0 core/mem/prefix.cpp` and `make_prefix_receipt.py --long OUT
-  long-receipt.json`: the prefix-cache receipts in `/home/as/ds41-claude-build/work/extra-prompts/`
+  long-receipt.json`: the prefix-cache receipts in `~/ds41-claude-build/work/extra-prompts/`
   (`pfxchat-receipt.json`, part `Upfxchat`; `pfxlong-receipt.json`, part `Upfxlong`).
 - `cache_sim.py`: replays an access trace against LRU, SLRU, 2Q, aged LFU and Belady.
 - `router_score_eval MODEL.rad [RECORD] [--synth N] [--k K] [--max N] [--time N]` (`make router-eval

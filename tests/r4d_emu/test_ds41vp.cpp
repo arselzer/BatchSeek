@@ -420,7 +420,7 @@ void sample_rows(Expert& x, int r0, int rows, const std::vector<uint8_t>& sc, co
 }
 int real_sample(std::mt19937_64& rng) {
     const char* e = std::getenv("DS41_HX_SAMPLE");
-    const std::string dir = e && *e ? e : "/home/as/.claude/jobs/635603c1/tmp/research/sample";
+    const std::string dir = e && *e ? e : "research/sample";
     std::vector<std::pair<int, int>> ids;
     if (DIR* d = opendir(dir.c_str())) {
         while (dirent* ent = readdir(d)) {

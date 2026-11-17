@@ -650,7 +650,7 @@ bool load_expert(const std::string& dir, int L, int E, SampleExpert* x) {
 std::string sample_dir(int argc, char** argv, int at) {
     if (argc > at) return argv[at];
     const char* e = std::getenv("DS41_HX_SAMPLE");
-    return e && *e ? e : "/home/as/.claude/jobs/635603c1/tmp/research/sample";
+    return e && *e ? e : "research/sample";
 }
 
 /* The packing API's refusals and the view's checks, each on its own copy of a slot. */

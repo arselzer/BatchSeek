@@ -7,7 +7,7 @@
 set -u
 OUT=${1:?output directory}
 HERE=$(cd "$(dirname "$0")" && pwd)
-PLUGIN=/home/as/radiance-setup/research/deepseek-v41-1017-20261024/ds41-pack-tail-dev-window-tail1-heldout-20261028T085400Z/native-variant-home/kernels/libr4d.so
+PLUGIN=$HOME/radiance-setup/research/deepseek-v41-1017-20261024/ds41-pack-tail-dev-window-tail1-heldout-20261028T085400Z/native-variant-home/kernels/libr4d.so
 DOCKER=(/usr/bin/sudo -n /usr/bin/docker)
 NAME=radiance-flashnext
 URL=http://127.0.0.1:8078

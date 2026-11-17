@@ -331,7 +331,7 @@ HX_THREADS=${HX_THREADS:-16}
 VERIFY_REQUESTS=${VERIFY_REQUESTS:-3}
 HERE=$(cd "$(dirname "$0")" && pwd)
 SB_TOOLS=${SB_TOOLS:-$HERE}   # Sb arms: serve-batch.sh, serve_batch_match.py, batch_client.py
-R=/home/as/radiance-setup/research/deepseek-v41-1017-20261024
+R=$HOME/radiance-setup/research/deepseek-v41-1017-20261024
 MODEL=$R/native-models/ds41-native-mxfp4-v3-20261027T121600Z/model.rad
 MIRROR=${MIRROR:-}   # the checkpoint's model-*.safetensors for R arms; no default
 DRAFT_BANK=${DRAFT_BANK:-}   # a DSpark draft bank (draft.rad) bound to $MODEL, for Ds arms; no default
@@ -356,7 +356,7 @@ PROFILE=$R/ds41-dev-window-profile-calibration-20261028T034300Z/sealed-decode-pr
 PROMPTS=${PROMPTS:-$R/ds41-pack-tail-dev-window-tail1-heldout-20261028T085400Z/receipt.json}
 # The U parts' receipts (U<name>: <name>-receipt.json), the Kld corpus's and the prefill-hash
 # references some of them have (<name>-khref.json; make_longctx_receipts.py).
-EXTRA_PROMPTS=${EXTRA_PROMPTS:-/home/as/ds41-claude-build/work/extra-prompts}
+EXTRA_PROMPTS=${EXTRA_PROMPTS:-$HOME/ds41-claude-build/work/extra-prompts}
 PORT=18089
 DOCKER=(/usr/bin/sudo -n /usr/bin/docker)
 NAME=radiance-flashnext
@@ -512,7 +512,7 @@ restore() {
   stop_server
   power_restore
   # Whatever radiance of ours is still up (LEFTOVER_ROOT), so QFN can always get the cards.
-  local left; left=$(bin_pids under "${LEFTOVER_ROOT:-/home/as/ds41-claude-build/}")
+  local left; left=$(bin_pids under "${LEFTOVER_ROOT:-$HOME/ds41-claude-build/}")
   # shellcheck disable=SC2086
   [[ -n "$left" ]] && reap_pids "before $NAME restarts" $left
   # QFN_KEEP_STOPPED=1 (a night of back-to-back windows): production stays stopped for the next window; the
@@ -530,7 +530,7 @@ restore() {
   local r; r=$(curl -s -m 120 "$URL/v1/completions" -H 'Content-Type: application/json' \
       -d '{"model":"qwen-vllm","prompt":"The capital of France is","max_tokens":4,"temperature":0}')
   log "QFN up after ${t}s; completion: $(echo "$r" | head -c 300)"
-  rm -f /home/as/ds41-claude-build/work/qfn_stopped_by
+  rm -f $HOME/ds41-claude-build/work/qfn_stopped_by
   "${DOCKER[@]}" inspect "$NAME" --format '{{.Id}} {{.State.Status}} {{.State.StartedAt}} {{.Config.Image}}' >>"$OUT/window.log" 2>&1
 }
 
@@ -2290,7 +2290,7 @@ elif ! idle_for 30 600; then log "QFN not idle within 10 min; no window"; exit 3
 "${DOCKER[@]}" inspect "$NAME" --format 'before: {{.Id}} {{.State.Status}} {{.State.StartedAt}} {{.Config.Image}}' >>"$OUT/window.log" 2>&1
 trap restore EXIT
 trap 'exit 130' INT TERM HUP
-echo $$ > /home/as/ds41-claude-build/work/qfn_stopped_by   # the QFN watchdog leaves a live owner's stop alone
+echo $$ > $HOME/ds41-claude-build/work/qfn_stopped_by   # the QFN watchdog leaves a live owner's stop alone
 if [[ -z "$QFN_WAS_STOPPED" ]]; then
   log "stopping $NAME"
   "${DOCKER[@]}" stop -t 60 "$NAME" >>"$OUT/window.log" 2>&1
@@ -3591,7 +3591,7 @@ if [[ -x ${SELFTEST_AR_AG_SHARED:-} ]]; then
 fi
 
 HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
-CANCEL=${CANCEL_FILE:-/home/as/ds41-claude-build/work/cancel_window}
+CANCEL=${CANCEL_FILE:-$HOME/ds41-claude-build/work/cancel_window}
 
 
 # A chain trace's file base: chain-<arm>, or chain-<sha1 of the arm, 16 hex> when chain-<arm>.stamps.csv would pass the
@@ -4107,7 +4107,7 @@ for a in $ARMS; do
       Xwp)     ARGS+=(--weight-prefetch off) ;;                        # no weight reads beside the collectives (core/config.cpp; exact)
       Sb)      ARM_SB=1 ;;                                            # the server through serve-batch.sh (sb_check), and batch_client.py after the requests
       Xnp)     ARM_NOPROF=1 ;;                                        # no --expert-profile: the container's own activation profile
-      Xq?*)    ARM_PROFILE=${EXTRA_PROFILES:-/home/as/ds41-claude-build/work/extra-profiles}/${p#Xq}.json   # this arm's --expert-profile
+      Xq?*)    ARM_PROFILE=${EXTRA_PROFILES:-$HOME/ds41-claude-build/work/extra-profiles}/${p#Xq}.json   # this arm's --expert-profile
                [[ -f "$ARM_PROFILE" ]] || { log "arm $a: $p: no profile $ARM_PROFILE; the arm is skipped"; skip=1; } ;;
       Ctp|Ctp[0-9]*)                                                   # one armed card-path prefill pass in N traced
                ctp=${p#Ctp}; ctp=${ctp:-4}

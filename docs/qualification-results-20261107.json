@@ -4,7 +4,7 @@
   "note": "Selected fields from unchanged closed local results; source_result_sha256 hashes the original complete file, not this extract. Reduced cache tests used a256GB host; no whole128GB validation.",
   "results": {
     "C2_DSpark": {
-      "source_result": "/home/as/ds41-claude-build/work/public-c2-quiet-dspark-window-source-20261107/run-root1/root-post-20261107T050805Z/result.json",
+      "source_result": "~/ds41-claude-build/work/public-c2-quiet-dspark-window-source-20261107/run-root1/root-post-20261107T050805Z/result.json",
       "source_result_sha256": "5df8256f6b10d3195c04fe244a129f18c76e93fda97d13aa95d7aea49b25dfef",
       "source_manifest_sha256": "101bbde32db042dc5437c1dd03ea7bd7d9a3223c234b59a2da5a48ebce4c3b15",
       "extract": {
@@ -1457,7 +1457,7 @@
       }
     },
     "Qwf_192": {
-      "source_result": "/home/as/ds41-claude-build/work/p1-flush-quiet-long-reuse-window-source-v2-20261107/run-root1/root-post-20261107T074756Z/result.json",
+      "source_result": "~/ds41-claude-build/work/p1-flush-quiet-long-reuse-window-source-v2-20261107/run-root1/root-post-20261107T074756Z/result.json",
       "source_result_sha256": "a1ae892dd856d0e2a2c0d1d2462907abb946e75ac5d37096c0a27a8b784c2cbe",
       "source_manifest_sha256": "19f5cb9f39ef53aa80d015c9e947a67e98c70f509e5e221e756f9d9cd0a0b74f",
       "extract": {
@@ -1822,28 +1822,28 @@
         "numerical_evidence": {
           "mode": "REUSED_CLOSED_SAME_COHORT",
           "receipt": {
-            "path": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261107T072223Z/numerical-reuse/receipt.json",
+            "path": "~/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261107T072223Z/numerical-reuse/receipt.json",
             "sha256": "03d80a232305d0dddf4c4849641e04a88c36b4975ad4c7775410f5b6bee243cc"
           },
           "origin": {
             "source": {
-              "path": "/home/as/ds41-claude-build/work/p1-flush-native-first-window-source-20261107/SOURCE.sha256",
+              "path": "~/ds41-claude-build/work/p1-flush-native-first-window-source-20261107/SOURCE.sha256",
               "sha256": "d36d47c21f71d56fb19839c60ed0fd2d78b6ba4f970f607780df552fc06c6a12"
             },
             "result": {
-              "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/read-root1/result.json",
+              "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/read-root1/result.json",
               "sha256": "871b4150693b483b17ceeeef0a701ccd4c0725fc9a8877c0256764008ecdeadb"
             },
             "artifacts": {
-              "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/read-root1/artifacts.sha256",
+              "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/read-root1/artifacts.sha256",
               "sha256": "a7514ccfc1e7b402cf8f94b024500d8060c16b9ef25f2df8cabd6264f73c5d8c"
             },
             "context": {
-              "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/native-origin-after-p1-native-root1/origin.json",
+              "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/native-origin-after-p1-native-root1/origin.json",
               "sha256": "7ba6dbea91d07749884ff0149402b38cf0a6fa317b659aebfa9b673c263fb998"
             },
             "context_writer": {
-              "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/capture-native-origin-root.py",
+              "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/capture-native-origin-root.py",
               "sha256": "c2f50777732c8ee28a8355c15490596c2efea9a3a38404bbd270bf9c7718eac4"
             }
           },
@@ -1851,35 +1851,35 @@
             "numeric_checks": {
               "devcheck-lcp-lcp.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-lcp-lcp.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-lcp-lcp.log",
                   "sha256": "6f2b03ff487f8fc935da1b44952d95f9b98b180373304e9aef841701943e43d8"
                 },
                 "original_exit_marker": "lcp exit 0"
               },
               "devcheck-lcp-sweep.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-lcp-sweep.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-lcp-sweep.log",
                   "sha256": "23bd8a292cd502de68e43d572d49afd86bac93d19fca732037b2da54ae44d36a"
                 },
                 "original_exit_marker": "sweep exit 0"
               },
               "devcheck-lcp-sweep0.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-lcp-sweep0.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-lcp-sweep0.log",
                   "sha256": "4b03702937ec3e6821e81b2cf0190a1b8ad261a6ecd90bc38f76e7844093815b"
                 },
                 "original_exit_marker": "sweep0 exit 0"
               },
               "devcheck-bal.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-bal.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-bal.log",
                   "sha256": "9b90f8688b34373a47d332880ecc45c8638ac4732fc03d951044bf7965f86679"
                 },
                 "original_exit_marker": "bal exit 0"
               },
               "p1-2048": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-p1.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-p1.log",
                   "sha256": "edf6cd928f4007ffae0487725caa4951cc1f9a5213e4c5f8c50c5a73f9ec7b67"
                 },
                 "cases": 49,
@@ -1888,7 +1888,7 @@
               },
               "p1-4096": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/full4096/devcheck-p1.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/full4096/devcheck-p1.log",
                   "sha256": "31bbcd950365ec6110a83e5476fdae99a9f796a2dcb811cdfaa9544cd8adbf4e"
                 },
                 "cases": 52,
@@ -1897,77 +1897,77 @@
               },
               "swiglu_proof.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/swiglu_proof.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/swiglu_proof.log",
                   "sha256": "7b06e465ada4999553d86db6f04a00fec7c48a84aba2bf0c37eddf072dabf1ab"
                 },
                 "original_exit_marker": "swiglu exit 0"
               },
               "chain_check.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/chain_check.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/chain_check.log",
                   "sha256": "ed929da82061402644152ff4fe04ab6bcf18e0167ad34cf1e8853229ae1801ce"
                 },
                 "original_exit_marker": "chain exit 0"
               },
               "draft_check.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/draft_check.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/draft_check.log",
                   "sha256": "d6ef48c22d0d802f8d4ac23619364ac2e46f55d02919fd2ce7dcd4f7460c0b1d"
                 },
                 "original_exit_marker": "draft check exit 0"
               },
               "f32bf16_check.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/f32bf16_check.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/f32bf16_check.log",
                   "sha256": "7749ec6e6c596f0f7a58bea53afe02607a7bd06285e1312df148b2dcd6573023"
                 },
                 "original_exit_marker": "check exit 0"
               },
               "Rb-forms": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/f32bf16_perf.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/f32bf16_perf.log",
                   "sha256": "91c08463944bf95a4a21e11d1eed11a5b3f5455f87422f75af6877babeac8679"
                 },
                 "comparisons": 36
               },
               "n128-off.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/n128-off.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/n128-off.log",
                   "sha256": "46e2d0433f960aa1a4514411c8399fe6d1c92c416db77fde7241aa419b41d8fa"
                 },
                 "original_exit_marker": "n128 off exit 0"
               },
               "n128-on.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/n128-on.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/n128-on.log",
                   "sha256": "df7b6e29cd7cac26bf34e4bae4568677f75b92876af6b9c9441a6ef945215e4a"
                 },
                 "original_exit_marker": "n128 on exit 0"
               },
               "n128-lcp.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/n128-lcp.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/n128-lcp.log",
                   "sha256": "492b39f5951a1fcaa8948e631d40f9e74ee646c6a48020dbfeaae187db94cafd"
                 },
                 "original_exit_marker": "n128 lcp exit 0"
               },
               "vpack-e5fe1dd2.check.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/vpack-e5fe1dd2.check.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/vpack-e5fe1dd2.check.log",
                   "sha256": "b5ba54c7620c5b4e58ee2ff0a21070b2fee4d89d02725b8c5bb7f42f2d3a03e8"
                 },
                 "original_exit_marker": "vpack check exit 0"
               },
               "vpack-e5fe1dd2.tail.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/vpack-e5fe1dd2.tail.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/vpack-e5fe1dd2.tail.log",
                   "sha256": "295dfb135d331e39d73af83213901c4cf7d1a2a3ff29a50df120024af039f159"
                 },
                 "original_exit_marker": "vpack check exit 0"
               },
               "vpack-e5fe1dd2.time.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/vpack-e5fe1dd2.time.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/vpack-e5fe1dd2.time.log",
                   "sha256": "3fb12e6686f91d7a66ae105de17925c0a3793d1b514e01181867ad3283aff68a"
                 },
                 "original_exit_marker": "vpack time exit 0"
@@ -1988,19 +1988,19 @@
             "exit": 0,
             "strict714_stop0_PID0_global5empty": true,
             "whole_owned_native_session_joined": true,
-            "window": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261107T072223Z",
+            "window": "~/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261107T072223Z",
             "runtime": {
-              "cohort": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-p1-flush-root1",
+              "cohort": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-p1-flush-root1",
               "artifacts_sha256": "5eb3d3db33a319d4f0306dcf625be081cdb392e3775b075a13cdf2f4b193e0b0",
               "all_files_sha256": "bc2724424a4709af93c4f5566b07952dacabf5c9a547f9bb6676ad7416ff44d6",
               "engine_sha256": "68b3e0a9c6c40a533e93367afce0424cbf0fa46745c3ac689a1deed1f796ad50"
             },
             "raw": {
-              "path": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261107T072223Z/numerical-reuse/registry.stderr",
+              "path": "~/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261107T072223Z/numerical-reuse/registry.stderr",
               "sha256": "17026e6bbc4e6dad843badc531f65ee2b8af31fd2a0873b3ef1432cc47209a20"
             },
             "stop_receipt": {
-              "path": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261107T072223Z/qfn-gate-stopped.json",
+              "path": "~/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261107T072223Z/qfn-gate-stopped.json",
               "sha256": "4734381f85150ee5f7a3b6e8c0a54f2d079decec3ec2fa81422b01b610695c79"
             },
             "providers": [
@@ -2088,7 +2088,7 @@
       }
     },
     "Qwf_96": {
-      "source_result": "/home/as/ds41-claude-build/work/p1-flush-quiet96-long-reuse-window-source-20261107/run-root1/root-post-20261107T081829Z/result.json",
+      "source_result": "~/ds41-claude-build/work/p1-flush-quiet96-long-reuse-window-source-20261107/run-root1/root-post-20261107T081829Z/result.json",
       "source_result_sha256": "ff343521cd7e43ef025487ea7c9cfb90d7478d56cd092179d812f5249a4b1989",
       "source_manifest_sha256": "51cc210fa788fa99883986e6f0a86184634bb3799f7f8d1b1c2ac92bd807db35",
       "extract": {
@@ -2455,28 +2455,28 @@
         "numerical_evidence": {
           "mode": "REUSED_CLOSED_SAME_COHORT",
           "receipt": {
-            "path": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261107T075513Z/numerical-reuse/receipt.json",
+            "path": "~/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261107T075513Z/numerical-reuse/receipt.json",
             "sha256": "8f0c08669ebe064c32ca1347ea6dcf08005554bd9e29a8fca70e2ba07d14256e"
           },
           "origin": {
             "source": {
-              "path": "/home/as/ds41-claude-build/work/p1-flush-native-first-window-source-20261107/SOURCE.sha256",
+              "path": "~/ds41-claude-build/work/p1-flush-native-first-window-source-20261107/SOURCE.sha256",
               "sha256": "d36d47c21f71d56fb19839c60ed0fd2d78b6ba4f970f607780df552fc06c6a12"
             },
             "result": {
-              "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/read-root1/result.json",
+              "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/read-root1/result.json",
               "sha256": "871b4150693b483b17ceeeef0a701ccd4c0725fc9a8877c0256764008ecdeadb"
             },
             "artifacts": {
-              "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/read-root1/artifacts.sha256",
+              "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/read-root1/artifacts.sha256",
               "sha256": "a7514ccfc1e7b402cf8f94b024500d8060c16b9ef25f2df8cabd6264f73c5d8c"
             },
             "context": {
-              "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/native-origin-after-p1-native-root1/origin.json",
+              "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/native-origin-after-p1-native-root1/origin.json",
               "sha256": "7ba6dbea91d07749884ff0149402b38cf0a6fa317b659aebfa9b673c263fb998"
             },
             "context_writer": {
-              "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/capture-native-origin-root.py",
+              "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/capture-native-origin-root.py",
               "sha256": "c2f50777732c8ee28a8355c15490596c2efea9a3a38404bbd270bf9c7718eac4"
             }
           },
@@ -2484,35 +2484,35 @@
             "numeric_checks": {
               "devcheck-lcp-lcp.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-lcp-lcp.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-lcp-lcp.log",
                   "sha256": "6f2b03ff487f8fc935da1b44952d95f9b98b180373304e9aef841701943e43d8"
                 },
                 "original_exit_marker": "lcp exit 0"
               },
               "devcheck-lcp-sweep.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-lcp-sweep.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-lcp-sweep.log",
                   "sha256": "23bd8a292cd502de68e43d572d49afd86bac93d19fca732037b2da54ae44d36a"
                 },
                 "original_exit_marker": "sweep exit 0"
               },
               "devcheck-lcp-sweep0.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-lcp-sweep0.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-lcp-sweep0.log",
                   "sha256": "4b03702937ec3e6821e81b2cf0190a1b8ad261a6ecd90bc38f76e7844093815b"
                 },
                 "original_exit_marker": "sweep0 exit 0"
               },
               "devcheck-bal.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-bal.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-bal.log",
                   "sha256": "9b90f8688b34373a47d332880ecc45c8638ac4732fc03d951044bf7965f86679"
                 },
                 "original_exit_marker": "bal exit 0"
               },
               "p1-2048": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-p1.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/devcheck-p1.log",
                   "sha256": "edf6cd928f4007ffae0487725caa4951cc1f9a5213e4c5f8c50c5a73f9ec7b67"
                 },
                 "cases": 49,
@@ -2521,7 +2521,7 @@
               },
               "p1-4096": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/full4096/devcheck-p1.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/full4096/devcheck-p1.log",
                   "sha256": "31bbcd950365ec6110a83e5476fdae99a9f796a2dcb811cdfaa9544cd8adbf4e"
                 },
                 "cases": 52,
@@ -2530,77 +2530,77 @@
               },
               "swiglu_proof.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/swiglu_proof.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/swiglu_proof.log",
                   "sha256": "7b06e465ada4999553d86db6f04a00fec7c48a84aba2bf0c37eddf072dabf1ab"
                 },
                 "original_exit_marker": "swiglu exit 0"
               },
               "chain_check.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/chain_check.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/chain_check.log",
                   "sha256": "ed929da82061402644152ff4fe04ab6bcf18e0167ad34cf1e8853229ae1801ce"
                 },
                 "original_exit_marker": "chain exit 0"
               },
               "draft_check.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/draft_check.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/draft_check.log",
                   "sha256": "d6ef48c22d0d802f8d4ac23619364ac2e46f55d02919fd2ce7dcd4f7460c0b1d"
                 },
                 "original_exit_marker": "draft check exit 0"
               },
               "f32bf16_check.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/f32bf16_check.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/f32bf16_check.log",
                   "sha256": "7749ec6e6c596f0f7a58bea53afe02607a7bd06285e1312df148b2dcd6573023"
                 },
                 "original_exit_marker": "check exit 0"
               },
               "Rb-forms": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/f32bf16_perf.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/f32bf16_perf.log",
                   "sha256": "91c08463944bf95a4a21e11d1eed11a5b3f5455f87422f75af6877babeac8679"
                 },
                 "comparisons": 36
               },
               "n128-off.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/n128-off.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/n128-off.log",
                   "sha256": "46e2d0433f960aa1a4514411c8399fe6d1c92c416db77fde7241aa419b41d8fa"
                 },
                 "original_exit_marker": "n128 off exit 0"
               },
               "n128-on.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/n128-on.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/n128-on.log",
                   "sha256": "df7b6e29cd7cac26bf34e4bae4568677f75b92876af6b9c9441a6ef945215e4a"
                 },
                 "original_exit_marker": "n128 on exit 0"
               },
               "n128-lcp.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/n128-lcp.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/n128-lcp.log",
                   "sha256": "492b39f5951a1fcaa8948e631d40f9e74ee646c6a48020dbfeaae187db94cafd"
                 },
                 "original_exit_marker": "n128 lcp exit 0"
               },
               "vpack-e5fe1dd2.check.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/vpack-e5fe1dd2.check.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/vpack-e5fe1dd2.check.log",
                   "sha256": "b5ba54c7620c5b4e58ee2ff0a21070b2fee4d89d02725b8c5bb7f42f2d3a03e8"
                 },
                 "original_exit_marker": "vpack check exit 0"
               },
               "vpack-e5fe1dd2.tail.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/vpack-e5fe1dd2.tail.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/vpack-e5fe1dd2.tail.log",
                   "sha256": "295dfb135d331e39d73af83213901c4cf7d1a2a3ff29a50df120024af039f159"
                 },
                 "original_exit_marker": "vpack check exit 0"
               },
               "vpack-e5fe1dd2.time.log": {
                 "raw": {
-                  "path": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/vpack-e5fe1dd2.time.log",
+                  "path": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/p1-native-root1/numerics/vpack-e5fe1dd2.time.log",
                   "sha256": "3fb12e6686f91d7a66ae105de17925c0a3793d1b514e01181867ad3283aff68a"
                 },
                 "original_exit_marker": "vpack time exit 0"
@@ -2621,19 +2621,19 @@
             "exit": 0,
             "strict714_stop0_PID0_global5empty": true,
             "whole_owned_native_session_joined": true,
-            "window": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261107T075513Z",
+            "window": "~/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261107T075513Z",
             "runtime": {
-              "cohort": "/home/as/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-p1-flush-root1",
+              "cohort": "~/ds41-claude-build/work/gpu-resume-kv-j1-20261106/cohort-public-p1-flush-root1",
               "artifacts_sha256": "5eb3d3db33a319d4f0306dcf625be081cdb392e3775b075a13cdf2f4b193e0b0",
               "all_files_sha256": "bc2724424a4709af93c4f5566b07952dacabf5c9a547f9bb6676ad7416ff44d6",
               "engine_sha256": "68b3e0a9c6c40a533e93367afce0424cbf0fa46745c3ac689a1deed1f796ad50"
             },
             "raw": {
-              "path": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261107T075513Z/numerical-reuse/registry.stderr",
+              "path": "~/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261107T075513Z/numerical-reuse/registry.stderr",
               "sha256": "17026e6bbc4e6dad843badc531f65ee2b8af31fd2a0873b3ef1432cc47209a20"
             },
             "stop_receipt": {
-              "path": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261107T075513Z/qfn-gate-stopped.json",
+              "path": "~/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261107T075513Z/qfn-gate-stopped.json",
               "sha256": "54f887fc18c09bb6608a0ff287e99f562e8ff6c911db15b2d11a5092fb0c44c8"
             },
             "providers": [

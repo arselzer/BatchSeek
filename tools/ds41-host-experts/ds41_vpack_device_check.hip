@@ -197,7 +197,7 @@ bool read_file(const std::string& path, std::vector<uint8_t>* out) {
 int load_sample(std::vector<std::unique_ptr<Weight>>* gus, std::vector<std::unique_ptr<Weight>>* dns,
                 std::mt19937_64& rng, int most) {
     const char* e = std::getenv("DS41_HX_SAMPLE");
-    const std::string dir = e && *e ? e : "/home/as/.claude/jobs/635603c1/tmp/research/sample";
+    const std::string dir = e && *e ? e : "research/sample";
     std::vector<std::pair<int, int>> ids;
     if (DIR* d = opendir(dir.c_str())) {
         while (dirent* ent = readdir(d)) {

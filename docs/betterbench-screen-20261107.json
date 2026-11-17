@@ -789,7 +789,7 @@
     "schema": "ds41-betterbench-warmup-reset-reader-recovery-v1",
     "source_manifest_sha256": "e6212549923d21093f704937b17b5c0cebcf67fb410b0154e2b46d670914d292",
     "original_failed_result": {
-      "path": "/home/as/ds41-claude-build/work/betterbench-c2-full-window-source-20261107/run-root1/root-post-20261107T102427Z/result.json",
+      "path": "~/ds41-claude-build/work/betterbench-c2-full-window-source-20261107/run-root1/root-post-20261107T102427Z/result.json",
       "sha256": "5968687025fe8c4d42c5135a424e5cdd4978044bd5b058ca1fa06ffafbe649cb"
     },
     "original_error": [
