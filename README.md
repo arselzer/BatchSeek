@@ -78,23 +78,24 @@ revision's official prompts for reasoning before the SQL (replies up to 2,048 to
 
 | Original BIRD, at once | Generating, tok/s | Whole job, tok/s | Wh/1k |
 |---:|---:|---:|---:|
-| 1 | 34 | 14 | 12.0 |
-| 8 | 59 | 33 | 4.8 |
-| 64 | 79 | 46 | 3.3 |
-| 256 | 164 | 108 | 1.69 |
-| 500 | 228 | 152 | 1.28 |
+| 1 | 34 | 14 | 12.8 |
+| 8 | 59 | 33 | 5.0 |
+| 64 | 79 | 46 | 3.5 |
+| 256 | 164 | 108 | 1.72 |
+| 500 | 228 | 151 | 1.29 |
 
 | BIRD 2026, at once | Generating, tok/s | Whole job, tok/s | Wh/1k |
 |---:|---:|---:|---:|
-| 1 | 25 | 21 | 8.5 |
+| 1 | 25 | 21 | 8.6 |
 | 8 | 37 | 35 | 4.1 |
-| 64 | 53 | 50 | 2.8 |
-| 256 | 101 | 94 | 1.91 |
+| 64 | 53 | 50 | 2.9 |
+| 256 | 101 | 94 | 1.83 |
 | 500 | 155 | 137 | 1.34 |
 
 "Generating": output tokens over the server's generation time; "whole job": over the time from the first request to the
-last reply, prompts included. Wh/1k: watt-hours per 1,000 output tokens. The 1, 8 and 64 rows use the first 8 or 64 questions of each set. Power (GPUs + CPU, from
-their own sensors) stays between 520 and 710 W. All 500 original questions at once take 3.5 minutes (31,643 output
+last reply, prompts included. Wh/1k: watt-hours per 1,000 output tokens. The 1, 8 and 64 rows use the first 8 or 64 questions of each set; the 8 row sent them in eight waves of 8 (the
+harness without refill). Power (GPUs + CPU, from
+their own sensors) stays between 520 and 700 W; energy is integrated over each run's request phase. All 500 original questions at once take 3.5 minutes (31,643 output
 tokens); BIRD 2026's take 39 minutes (316,824 output tokens), most of it a shrinking group of long answers. With a continuous queue the batch stays full: BIRD's dev set, 1,534
 questions in the 2026 prompt format (`batch/bird/make_birddev26_set.py`), sent through 512 slots and refilled 16 at a
 time, keeps about 500 requests running for 32 minutes at about 210 output tokens/s, new prompts included; the whole
@@ -117,7 +118,8 @@ accepts it), and the cost of each job:
 | Claude Haiku 5.5 | 62.0% | €0.10 | 53.4% | €0.28 |
 | GPT-6 Luna | 55.8% | €0.063 | 43.0% | €0.17 |
 
-This box's cost is its electricity at €0.30/kWh; API costs as billed through OpenRouter on 16 November 2026, at $1.12
+This box's cost is the electricity of its GPUs and CPU (from their own sensors; RAM, board and power supply
+losses come on top) at €0.30/kWh; API costs as billed through OpenRouter on 16 November 2026, at $1.12
 per euro. Haiku and Luna ran at their default
 sampling, as they don't accept temperature 0. Differences of a few points are noise.
 
@@ -199,7 +201,7 @@ send the set, score it. The runs in the results tables used `--profile profiles/
 | Original BIRD, 500 at once | `--streams 512 --ctx-per-stream 1280 --max-seq-len 4096` | `sets/bird500-receipt.json out.jsonl --receipt --concurrency 512` |
 | BIRD 2026, 500 at once | `--streams 512 --ctx-per-stream 1408 --max-seq-len 8192` | `sets/birdhf500-receipt.json out.jsonl --receipt --concurrency 512` |
 | BIRD dev, 1,534 through 512 slots | `--streams 512 --ctx-per-stream 1408 --max-seq-len 8192` | `sets/birddev26-receipt.json out.jsonl --receipt --concurrency 512` |
-| Smaller rows (1, 8, 64, 256) | as for the set | add `--first N --concurrency N` (256: `bird256-receipt.json`) |
+| Smaller rows (1, 8, 64, 256) | as for the set | add `--first N --concurrency N` (256: `bird256-receipt.json`); the measured 8 row ran in waves of 8, the client refills instead |
 
 The client keeps each receipt's own reply limit (2,048 tokens for BIRD 2026). It refills slots one at a time as
 replies finish; the measured dev run refilled 16 at a time, which keeps prompt steps larger.
