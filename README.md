@@ -112,7 +112,7 @@ API costs as billed through OpenRouter on 16 November 2026, at $1.12 per euro. H
 sampling, as they don't accept temperature 0. Differences of a few points are noise.
 
 The model file carries no profile. Without one, the experts kept on the GPUs are an arbitrary fixed set; the RAM cache
-adapts either way, filling with the experts the job uses while it runs. The same 256 BIRD questions without a profile and with a recorded one:
+adapts either way, filling with the experts the job uses while it runs. The same 256 questions of the original BIRD set (an earlier run) without a profile and with a recorded one:
 
 | Expert usage profile | Job time |
 |---|---:|
