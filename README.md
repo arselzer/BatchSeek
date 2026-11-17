@@ -76,7 +76,7 @@ Engram tables (`--engram-file`), the BIRD training profile, a KV pool of 655,360
 (BIRD 2026). Both versions of BIRD's 500-question mini-dev set: the original prompts ask for the SQL only, the 2026
 revision's official prompts for reasoning before the SQL (replies up to 2,048 tokens).
 
-| Questions at once | Original BIRD: tokens/s generating | whole job | Wh per 1,000 tokens | BIRD 2026: tokens/s generating | whole job | Wh per 1,000 tokens |
+| At once | Original BIRD: generating | whole job | Wh/1k | BIRD 2026: generating | whole job | Wh/1k |
 |---:|---:|---:|---:|---:|---:|---:|
 | 1 | 34 | 14 | 12.0 | 25 | 21 | 8.5 |
 | 8 | 59 | 33 | 4.8 | 37 | 35 | 4.1 |
@@ -85,7 +85,7 @@ revision's official prompts for reasoning before the SQL (replies up to 2,048 to
 | 500 | 228 | 152 | 1.28 | 155 | 137 | 1.34 |
 
 "Generating": output tokens over the server's generation time; "whole job": over the time from the first request to the
-last reply, prompts included. The 1, 8 and 64 rows use the first 8 or 64 questions of each set. Power (GPUs + CPU, from
+last reply, prompts included. Wh/1k: watt-hours per 1,000 output tokens. The 1, 8 and 64 rows use the first 8 or 64 questions of each set. Power (GPUs + CPU, from
 their own sensors) stays between 520 and 710 W. All 500 original questions at once take 3.5 minutes (31,643 output
 tokens); BIRD 2026's take 39 minutes (316,824 output tokens), most of it a shrinking group of long answers. With a continuous queue the batch stays full: BIRD's dev set, 1,534
 questions in the 2026 prompt format (`batch/bird/make_birddev26_set.py`), sent through 512 slots and refilled 16 at a
@@ -99,7 +99,7 @@ time, keeps about 500 requests running for 32 minutes at about 210 output tokens
 Execution accuracy on both versions of BIRD's 500-question mini-dev set (thinking off, temperature 0 where a model
 accepts it), and the cost of the 2026 job:
 
-| Who runs the model | BIRD 2026 accuracy | BIRD 2026 cost | BIRD original accuracy | BIRD original cost |
+| Who runs the model | BIRD 2026 accuracy | cost | Original accuracy | cost |
 |---|---:|---:|---:|---:|
 | **This box** (default mode, BIRD training profile) | **50.6%** | **€0.13** at €0.30/kWh | **61.8%** | **€0.012** |
 | DeepSeek API | 50.8% | €0.22 | 59.8% | €0.031 |
